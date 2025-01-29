@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import sys
 import time
 import logging
 import requests
@@ -26,32 +27,103 @@ def configure_logging():
     )
     logging.info(f"Log level set to {log_level_str}.")
 
+def parse_env():
+    """
+    Reads and validates the necessary environment variables. 
+    Returns a dictionary of configuration parameters or terminates the script if invalid.
+    """
+    token = os.environ.get("CF_DDNS_TOKEN")
+    zone_id = os.environ.get("CF_DDNS_ZONE_ID")
+    host = os.environ.get("CF_DDNS_HOST")
+
+    if not all([token, zone_id, host]):
+        logging.error(
+            "Environment variables CF_DDNS_TOKEN, CF_DDNS_ZONE_ID, and CF_DDNS_HOST must be set."
+        )
+        sys.exit(1)
+
+    interval_str = os.environ.get("CF_DDNS_INTERVAL", "10")
+    ttl_str = os.environ.get("CF_DDNS_TTL", "120")
+    proxied_str = os.environ.get("CF_DDNS_PROXIED", "False")
+
+    try:
+        interval = int(interval_str)
+    except ValueError:
+        logging.error(f"Invalid value for CF_DDNS_INTERVAL: {interval_str}.")
+        sys.exit(1)
+
+    try:
+        ttl = int(ttl_str)
+    except ValueError:
+        logging.error(f"Invalid value for CF_DDNS_TTL: {ttl_str}.")
+        sys.exit(1)
+
+    proxied = proxied_str.lower() == "true"
+
+    return {
+        "token": token,
+        "zone_id": zone_id,
+        "host": host,
+        "interval": interval,
+        "ttl": ttl,
+        "proxied": proxied
+    }
+
 def get_external_ip():
     """
-    Tries to retrieve the external IP address from checkip.amazonaws.com.
-    If that fails, it attempts to retrieve it from ipify (api.ipify.org).
-    Returns the IP address as a string or None if both attempts fail.
+    Attempts to retrieve the external IP address from two different services.
+    Returns the IP address as a string, or None if both attempts fail.
     """
-    # First attempt: checkip.amazonaws.com
     try:
         response = requests.get("http://checkip.amazonaws.com/", timeout=10)
         response.raise_for_status()
         return response.text.strip()
     except requests.exceptions.RequestException as e:
         logging.error(f"Error retrieving external IP from checkip.amazonaws.com: {e}")
-        # Second attempt: ipify.org
-        try:
-            response = requests.get("https://api.ipify.org?format=text", timeout=10)
-            response.raise_for_status()
-            return response.text.strip()
-        except requests.exceptions.RequestException as e2:
-            logging.error(f"Error retrieving external IP from ipify.org: {e2}")
+
+    try:
+        response = requests.get("https://api.ipify.org?format=text", timeout=10)
+        response.raise_for_status()
+        return response.text.strip()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error retrieving external IP from ipify.org: {e}")
+
+    return None
+
+def get_record_id(token, zone_id, host):
+    """
+    Retrieves the record ID for a specific A-type DNS record from Cloudflare.
+    Returns the record ID as a string or None if not found or on error.
+    """
+    url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type=A&name={host}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        if not data.get("success"):
+            logging.error(f"Cloudflare API returned an error: {data}")
             return None
+
+        results = data.get("result", [])
+        if not results:
+            logging.error(f"No DNS record found for host '{host}' in Cloudflare response.")
+            return None
+
+        record_id = results[0].get("id")
+        return record_id
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error retrieving Cloudflare DNS record ID: {e}")
+        return None
 
 def update_cloudflare_record(token, zone_id, record_id, host, new_ip, ttl, proxied):
     """
     Updates an A record in Cloudflare via the API.
-    Returns True on success and False on failure.
+    Returns True on success and False otherwise.
     """
     url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
     headers = {
@@ -62,15 +134,15 @@ def update_cloudflare_record(token, zone_id, record_id, host, new_ip, ttl, proxi
         "type": "A",
         "name": host,
         "content": new_ip,
-        "ttl": ttl,        # Configurable TTL
-        "proxied": proxied # Whether to enable Cloudflare proxy
+        "ttl": ttl,
+        "proxied": proxied
     }
 
     try:
         response = requests.put(url, json=data, headers=headers, timeout=10)
         response.raise_for_status()
-
         result = response.json()
+
         if result.get("success"):
             logging.info(f"DNS record for host {host} successfully updated to IP {new_ip}.")
             return True
@@ -82,81 +154,54 @@ def update_cloudflare_record(token, zone_id, record_id, host, new_ip, ttl, proxi
         return False
 
 def main():
-    # Configure logging first
     configure_logging()
+    config = parse_env()
 
-    # Read parameters from environment variables
-    CF_DDNS_TOKEN = os.environ.get("CF_DDNS_TOKEN")
-    CF_DDNS_ZONE_ID = os.environ.get("CF_DDNS_ZONE_ID")
-    CF_DDNS_RECORD_ID = os.environ.get("CF_DDNS_RECORD_ID")
-    CF_DDNS_HOST = os.environ.get("CF_DDNS_HOST")
-    
-    # Interval defaults to 120 if not specified
-    CF_DDNS_INTERVAL = os.environ.get("CF_DDNS_INTERVAL", "10")
-    
-    # Cloudflare proxy setting defaults to "False"
-    CF_DDNS_PROXIED_STR = os.environ.get("CF_DDNS_PROXIED", "False")
-    
-    # TTL defaults to 120 if not specified
-    CF_DDNS_TTL = os.environ.get("CF_DDNS_TTL", "120")
-
-    # Check if all required environment variables are set
-    if not all([CF_DDNS_TOKEN, CF_DDNS_ZONE_ID, CF_DDNS_RECORD_ID, CF_DDNS_HOST]):
-        logging.error(
-            "Not all required environment variables are set: "
-            "CF_DDNS_TOKEN, CF_DDNS_ZONE_ID, CF_DDNS_RECORD_ID, CF_DDNS_HOST"
-        )
-        return
-
-    try:
-        interval = int(CF_DDNS_INTERVAL)
-    except ValueError:
-        logging.error(f"Invalid value for CF_DDNS_INTERVAL: {CF_DDNS_INTERVAL}.")
-        return
-    
-    # Convert TTL to int
-    try:
-        ttl = int(CF_DDNS_TTL)
-    except ValueError:
-        logging.error(f"Invalid value for CF_DDNS_TTL: {CF_DDNS_TTL}.")
-        return
-    
-    # Convert proxied to boolean
-    proxied = CF_DDNS_PROXIED_STR.lower() == "true"
+    record_id = get_record_id(config["token"], config["zone_id"], config["host"])
+    if not record_id:
+        logging.error(f"Failed to retrieve record ID for host '{config['host']}'. Exiting.")
+        sys.exit(1)
 
     last_ip = None
 
-    # Main infinite loop for checking
-    while True:
-        current_ip = get_external_ip()
-        if current_ip is None:
-            logging.error("Could not retrieve external IP from any service. Waiting until the next attempt...")
-        else:
-            # If this is the first check, update DNS record right away
-            if last_ip is None:
-                logging.info("First check. Updating DNS record...")
-                success = update_cloudflare_record(
-                    CF_DDNS_TOKEN, CF_DDNS_ZONE_ID, CF_DDNS_RECORD_ID,
-                    CF_DDNS_HOST, current_ip, ttl, proxied
-                )
-                if success:
-                    last_ip = current_ip
-            else:
-                # If the IP has changed, update
-                if current_ip != last_ip:
-                    logging.info(f"IP address changed from {last_ip} to {current_ip}. Updating DNS record...")
-                    success = update_cloudflare_record(
-                        CF_DDNS_TOKEN, CF_DDNS_ZONE_ID, CF_DDNS_RECORD_ID,
-                        CF_DDNS_HOST, current_ip, ttl, proxied
-                    )
-                    if success:
-                        last_ip = current_ip
+    try:
+        while True:
+            try:
+                current_ip = get_external_ip()
+                if current_ip is None:
+                    logging.error("Could not retrieve external IP. Will try again later.")
                 else:
-                    logging.debug("External IP address has not changed. No update needed.")
+                    # Consolidate the logic for deciding when to update
+                    update_needed = (last_ip is None) or (current_ip != last_ip)
+                    if update_needed:
+                        if last_ip is None:
+                            logging.info("Performing the first DNS record update.")
+                        else:
+                            logging.info(f"IP changed from {last_ip} to {current_ip}. Updating DNS record.")
 
-        # Wait the specified interval before the next check
-        logging.debug(f"Waiting {interval} seconds until the next check...")
-        time.sleep(interval)
+                        success = update_cloudflare_record(
+                            config["token"],
+                            config["zone_id"],
+                            record_id,
+                            config["host"],
+                            current_ip,
+                            config["ttl"],
+                            config["proxied"]
+                        )
+                        if success:
+                            last_ip = current_ip
+                    else:
+                        logging.debug("External IP remains the same. No update required.")
+            except Exception as loop_error:
+                logging.exception(f"An error occurred in the main loop: {loop_error}")
+
+            logging.debug(f"Waiting {config['interval']} seconds before the next check...")
+            time.sleep(config["interval"])
+    except KeyboardInterrupt:
+        logging.info("Caught KeyboardInterrupt. Exiting gracefully.")
+    except Exception as e:
+        logging.exception(f"Unhandled exception in main: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
