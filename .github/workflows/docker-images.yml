@@ -1,0 +1,84 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set_matrix.outputs.matrix }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Get list of directories
+        id: get_dirs
+        run: |
+          # List top-level directories, remove trailing slashes, exclude those starting with a dot
+          DIRS=$(ls -d */ 2>/dev/null | sed 's:/*$::' | grep -v '^\.')
+
+          # Convert the list of directories to a JSON array
+          JSON=$(echo "$DIRS" | jq -R -s -c 'split("\n")[:-1]')
+
+          # Write JSON array as 'dirs' output
+          echo "dirs=$JSON" >> $GITHUB_OUTPUT
+
+      - name: Debug JSON
+        run: echo "DIRS_OUTPUT = ${{ steps.get_dirs.outputs.dirs }}"
+
+      - name: Set matrix
+        id: set_matrix
+        run: |
+          # Safely create {"folders": [...]} in one line
+          MATRIX_JSON=$(jq -c -n --argjson folders '${{ steps.get_dirs.outputs.dirs }}' \
+            '{folders: $folders}')
+      
+          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+
+      - name: Debug matrix
+        run: echo "MATRIX_OUTPUT = ${{ steps.set_matrix.outputs.matrix }}"
+
+  build_and_push:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        folder: ${{ fromJson(needs.prepare.outputs.matrix).folders }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/${{ matrix.folder }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.folder }}
+          push: true
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          tags: ghcr.io/${{ github.repository }}/${{ matrix.folder }}:latest
