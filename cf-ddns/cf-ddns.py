@@ -6,6 +6,26 @@ import time
 import logging
 import requests
 
+from prometheus_client import start_http_server, Counter, Gauge
+
+# Prometheus metrics map
+prometheus_metrics = {
+    "ip_update_counter": Counter(
+        "cf_ddns_ip_updates_total",
+        "Number of times the IP address was updated."
+    ),
+    "ip_info_gauge": Gauge(
+        "cf_ddns_ip_info",
+        "Indicator for IP addresses used per domain (1 for current IP, 0 for old IPs).",
+        ["domain", "ip"]
+    ),
+    "ip_retrieval_error_counter": Counter(
+        "cf_ddns_ip_retrieval_errors_total",
+        "Number of times external IP retrieval from specific service failed.",
+        ["service_domain"]
+    )
+}
+
 def configure_logging():
     """
     Configures the logging level based on the CF_DDNS_LOGLEVEL environment variable.
@@ -29,7 +49,7 @@ def configure_logging():
 
 def parse_env():
     """
-    Reads and validates the necessary environment variables. 
+    Reads and validates the necessary environment variables.
     Returns a dictionary of configuration parameters or terminates the script if invalid.
     """
     token = os.environ.get("CF_DDNS_TOKEN")
@@ -60,13 +80,22 @@ def parse_env():
 
     proxied = proxied_str.lower() == "true"
 
+    # Prometheus metrics endpoint port
+    metrics_port_str = os.environ.get("CF_DDNS_METRICS_PORT", "9101")
+    try:
+        metrics_port = int(metrics_port_str)
+    except ValueError:
+        logging.error(f"Invalid value for CF_DDNS_METRICS_PORT: {metrics_port_str}.")
+        sys.exit(1)
+
     return {
         "token": token,
         "zone_id": zone_id,
         "host": host,
         "interval": interval,
         "ttl": ttl,
-        "proxied": proxied
+        "proxied": proxied,
+        "metrics_port": metrics_port
     }
 
 def get_external_ip():
@@ -74,19 +103,25 @@ def get_external_ip():
     Attempts to retrieve the external IP address from two different services.
     Returns the IP address as a string, or None if both attempts fail.
     """
+    # First service
+    domain = "checkip.amazonaws.com"
     try:
-        response = requests.get("http://checkip.amazonaws.com/", timeout=10)
+        response = requests.get(f"https://{domain}/", timeout=10)
         response.raise_for_status()
         return response.text.strip()
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error retrieving external IP from checkip.amazonaws.com: {e}")
+        logging.error(f"Error retrieving external IP from {domain}: {e}")
+        prometheus_metrics["ip_retrieval_error_counter"].labels(service_domain=domain).inc()
 
+    # Second service
+    domain = "api.ipify.org"
     try:
-        response = requests.get("https://api.ipify.org?format=text", timeout=10)
+        response = requests.get(f"https://{domain}?format=text", timeout=10)
         response.raise_for_status()
         return response.text.strip()
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error retrieving external IP from ipify.org: {e}")
+        logging.error(f"Error retrieving external IP from {domain}: {e}")
+        prometheus_metrics["ip_retrieval_error_counter"].labels(service_domain=domain).inc()
 
     return None
 
@@ -157,6 +192,10 @@ def main():
     configure_logging()
     config = parse_env()
 
+    # Start Prometheus metrics server
+    start_http_server(config["metrics_port"])
+    logging.info(f"Prometheus metrics server started on port {config['metrics_port']}")
+
     record_id = get_record_id(config["token"], config["zone_id"], config["host"])
     if not record_id:
         logging.error(f"Failed to retrieve record ID for host '{config['host']}'. Exiting.")
@@ -171,7 +210,6 @@ def main():
                 if current_ip is None:
                     logging.error("Could not retrieve external IP. Will try again later.")
                 else:
-                    # Consolidate the logic for deciding when to update
                     update_needed = (last_ip is None) or (current_ip != last_ip)
                     if update_needed:
                         if last_ip is None:
@@ -189,6 +227,16 @@ def main():
                             config["proxied"]
                         )
                         if success:
+                            # Increment counter for IP updates
+                            prometheus_metrics["ip_update_counter"].inc()
+
+                            # Invalidate old IP gauge if we had one
+                            if last_ip is not None:
+                                prometheus_metrics["ip_info_gauge"].labels(domain=config["host"], ip=last_ip).set(0)
+
+                            # Set new IP gauge
+                            prometheus_metrics["ip_info_gauge"].labels(domain=config["host"], ip=current_ip).set(1)
+
                             last_ip = current_ip
                     else:
                         logging.debug("External IP remains the same. No update required.")
