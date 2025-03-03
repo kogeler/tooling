@@ -17,9 +17,7 @@ WORKDIR /app
 COPY cf-ddns.py .
 
 # Install dependencies without caching
-# If you have a requirements.txt, copy and use the following:
-# RUN pip install -r requirements.txt --no-cache-dir
-RUN pip install --no-cache-dir requests
+RUN pip install --no-cache-dir requests prometheus_client
 
 # Switch to the non-privileged user
 USER pyuser
