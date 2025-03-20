@@ -1,3 +1,6 @@
+# Copyright © 2025 kogeler
+# SPDX-License-Identifier: Apache-2.0
+
 # Use the official Python image based on Alpine
 FROM python:3.13-alpine
 

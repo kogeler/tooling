@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# Copyright © 2025 kogeler
+# SPDX-License-Identifier: Apache-2.0
 
 import os
 import sys

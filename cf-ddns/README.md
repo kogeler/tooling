@@ -93,8 +93,7 @@ Access the metrics at:
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0.  
-See [https://www.gnu.org/licenses/gpl-3.0.html](https://www.gnu.org/licenses/gpl-3.0.html) for details.
+This project is licensed under the [Apache License 2.0](../LICENSE).
 
 ---
 
