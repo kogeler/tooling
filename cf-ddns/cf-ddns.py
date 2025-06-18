@@ -27,7 +27,7 @@ prometheus_metrics = {
     "ip_info_gauge": Gauge(
         "cf_ddns_ip_info",
         "Indicator for IP addresses used per host (1 for current IP, 0 for old IPs).",
-        ["host", "ip"]
+        ["cf_host", "ip"]
     ),
     "ip_retrieval_error_counter": Counter(
         "cf_ddns_ip_retrieval_errors_total",
@@ -236,10 +236,10 @@ def main():
 
                             # Invalidate old IP gauge if we had one
                             if last_ip is not None:
-                                prometheus_metrics["ip_info_gauge"].labels(host=config["host"], ip=last_ip).set(0)
+                                prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=last_ip).set(0)
 
                             # Set new IP gauge
-                            prometheus_metrics["ip_info_gauge"].labels(host=config["host"], ip=current_ip).set(1)
+                            prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=current_ip).set(1)
 
                             last_ip = current_ip
                     else:
