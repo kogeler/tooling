@@ -9,8 +9,14 @@ import sys
 import time
 import logging
 import requests
+from urllib.parse import urlparse
 
 from prometheus_client import start_http_server, Counter, Gauge
+
+check_ip_services =  [
+    "https://checkip.amazonaws.com",
+    "https://api.ipify.org/?format=text"
+]
 
 # Prometheus metrics map
 prometheus_metrics = {
@@ -20,13 +26,13 @@ prometheus_metrics = {
     ),
     "ip_info_gauge": Gauge(
         "cf_ddns_ip_info",
-        "Indicator for IP addresses used per domain (1 for current IP, 0 for old IPs).",
-        ["domain", "ip"]
+        "Indicator for IP addresses used per host (1 for current IP, 0 for old IPs).",
+        ["host", "ip"]
     ),
     "ip_retrieval_error_counter": Counter(
         "cf_ddns_ip_retrieval_errors_total",
         "Number of times external IP retrieval from specific service failed.",
-        ["service_domain"]
+        ["check_ip_service_host"]
     )
 }
 
@@ -104,28 +110,18 @@ def parse_env():
 
 def get_external_ip():
     """
-    Attempts to retrieve the external IP address from two different services.
-    Returns the IP address as a string, or None if both attempts fail.
+    Attempts to retrieve the external IP address from ip check services.
+    Returns the IP address as a string, or None if all attempts fail.
     """
-    # First service
-    domain = "checkip.amazonaws.com"
-    try:
-        response = requests.get(f"https://{domain}/", timeout=10)
-        response.raise_for_status()
-        return response.text.strip()
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error retrieving external IP from {domain}: {e}")
-        prometheus_metrics["ip_retrieval_error_counter"].labels(service_domain=domain).inc()
-
-    # Second service
-    domain = "api.ipify.org"
-    try:
-        response = requests.get(f"https://{domain}?format=text", timeout=10)
-        response.raise_for_status()
-        return response.text.strip()
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error retrieving external IP from {domain}: {e}")
-        prometheus_metrics["ip_retrieval_error_counter"].labels(service_domain=domain).inc()
+    for service in check_ip_services:
+        try:
+            response = requests.get(service, timeout=10)
+            response.raise_for_status()
+            return response.text.strip()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error retrieving external IP from {service}: {e}")
+            prometheus_metrics["ip_retrieval_error_counter"].labels(
+                check_ip_service_host=urlparse(service).hostname).inc()
 
     return None
 
@@ -196,6 +192,10 @@ def main():
     configure_logging()
     config = parse_env()
 
+    for service in check_ip_services:
+        prometheus_metrics["ip_retrieval_error_counter"].labels(
+            check_ip_service_host=urlparse(service).hostname).inc(0)
+
     # Start Prometheus metrics server
     start_http_server(config["metrics_port"])
     logging.info(f"Prometheus metrics server started on port {config['metrics_port']}")
@@ -236,10 +236,10 @@ def main():
 
                             # Invalidate old IP gauge if we had one
                             if last_ip is not None:
-                                prometheus_metrics["ip_info_gauge"].labels(domain=config["host"], ip=last_ip).set(0)
+                                prometheus_metrics["ip_info_gauge"].labels(host=config["host"], ip=last_ip).set(0)
 
                             # Set new IP gauge
-                            prometheus_metrics["ip_info_gauge"].labels(domain=config["host"], ip=current_ip).set(1)
+                            prometheus_metrics["ip_info_gauge"].labels(host=config["host"], ip=current_ip).set(1)
 
                             last_ip = current_ip
                     else:
