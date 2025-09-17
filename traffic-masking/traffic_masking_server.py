@@ -148,6 +148,11 @@ class MaskingTrafficServer:
             'packets_sent': 0,
             'start_time': time.time()
         }
+        self.last_stats = {
+            'bytes_sent': 0,
+            'packets_sent': 0,
+            'time': time.time()
+        }
         self.stats_interval = float(stats_interval)
         # Advanced masking options
         self.advanced = bool(advanced)
@@ -232,68 +237,56 @@ class MaskingTrafficServer:
         last_send_time = time.time()
         bytes_accumulator = 0
 
+        # Rate control for advanced mode
+        rate_window_bytes = 0
+        rate_window_start = time.time()
+
         while self.running:
             if not self.clients:
                 time.sleep(0.1)
                 continue
 
-            # Advanced generator-driven mode
+            # Advanced generator-driven mode with proper rate limiting
             if getattr(self, 'advanced', False) and self.generator is not None:
-                # Track rate for adjustment
-                batch_start = time.time()
-                batch_bytes = 0
-                batch_count = 0
+                try:
+                    frags, base_delay = next(self.generator)
+                except StopIteration:
+                    # Recreate generator if it ever stops
+                    self.generator = stream_generator(
+                        self.profile,
+                        target_mbps=self.target_mbps if not (self.min_mbps and self.max_mbps) else None,
+                        min_mbps=self.min_mbps,
+                        max_mbps=self.max_mbps,
+                        obfuscator=self.obfuscator,
+                        entropy=self.entropy,
+                    )
+                    frags, base_delay = next(self.generator)
 
-                # Send multiple packets in a batch for better throughput
-                while batch_count < 10:  # Send 10 packets per batch
-                    try:
-                        frags, delay = next(self.generator)
-                    except StopIteration:
-                        # Recreate generator if it ever stops
-                        self.generator = stream_generator(
-                            self.profile,
-                            target_mbps=self.target_mbps,
-                            obfuscator=self.obfuscator,
-                            entropy=self.entropy,
-                        )
-                        frags, delay = next(self.generator)
+                # Send fragments and track bytes
+                packet_bytes = 0
+                for frag in frags:
+                    for addr in list(self.clients.keys()):
+                        try:
+                            self.socket.sendto(frag, addr)
+                            self.stats['bytes_sent'] += len(frag)
+                            self.stats['packets_sent'] += 1
+                            packet_bytes += len(frag)
+                        except Exception as e:
+                            print(f"[!] Send error to client {addr}: {e}", flush=True)
 
-                    for frag in frags:
-                        for addr in list(self.clients.keys()):
-                            try:
-                                self.socket.sendto(frag, addr)
-                                self.stats['bytes_sent'] += len(frag)
-                                self.stats['packets_sent'] += 1
-                                batch_bytes += len(frag)
-                            except Exception as e:
-                                print(f"[!] Send error to client {addr}: {e}", flush=True)
+                # Update rate window
+                rate_window_bytes += packet_bytes
+                now = time.time()
+                window_elapsed = now - rate_window_start
 
-                    batch_count += 1
+                # Reset window every second
+                if window_elapsed > 1.0:
+                    rate_window_bytes = 0
+                    rate_window_start = now
+                    window_elapsed = 0
 
-                    # Small sleep between packets in batch
-                    if batch_count < 10:
-                        time.sleep(min(0.001, delay * 0.1))
-
-                # Calculate actual rate and adjust sleep
-                batch_duration = time.time() - batch_start
-                if batch_duration > 0 and batch_bytes > 0:
-                    current_mbps = (batch_bytes * 8) / (batch_duration * 1024 * 1024)
-                    target_mbps = self.target_mbps
-
-                    # Adaptive sleep based on rate difference
-                    if current_mbps < target_mbps * 0.8:
-                        # Too slow, reduce sleep
-                        sleep_time = max(0, delay * 0.1)
-                    elif current_mbps > target_mbps * 1.2:
-                        # Too fast, increase sleep
-                        sleep_time = delay * 2
-                    else:
-                        # Close to target
-                        sleep_time = delay
-
-                    time.sleep(max(0, min(0.01, sleep_time)))
-                else:
-                    time.sleep(0.001)
+                # Use the delay from generator which already implements rate limiting
+                time.sleep(base_delay)
 
                 continue
 
@@ -361,10 +354,18 @@ class MaskingTrafficServer:
         """Print runtime statistics"""
         while self.running:
             time.sleep(self.stats_interval)
-            elapsed = time.time() - self.stats['start_time']
-            if elapsed > 0:
-                mbps = (self.stats['bytes_sent'] * 8) / (elapsed * 1024 * 1024)
-                pps = self.stats['packets_sent'] / elapsed
+            now = time.time()
+
+            # Calculate instantaneous rates based on delta since last stats
+            time_delta = now - self.last_stats['time']
+            bytes_delta = self.stats['bytes_sent'] - self.last_stats['bytes_sent']
+            packets_delta = self.stats['packets_sent'] - self.last_stats['packets_sent']
+
+            if time_delta > 0:
+                # Instantaneous rate (not cumulative average)
+                mbps = (bytes_delta * 8) / (time_delta * 1024 * 1024)
+                pps = packets_delta / time_delta
+
                 pattern_desc = (self.pattern_gen.current_pattern.__name__
                                 if not getattr(self, 'advanced', False)
                                 else f"advanced:{getattr(self, 'profile', None).value}/{getattr(self, 'obfuscator', None).header_mode}")
@@ -372,6 +373,11 @@ class MaskingTrafficServer:
                       f"Rate: {mbps:.2f} Mbps | "
                       f"PPS: {pps:.0f} | "
                       f"Pattern: {pattern_desc}", flush=True)
+
+            # Update last stats for next iteration
+            self.last_stats['bytes_sent'] = self.stats['bytes_sent']
+            self.last_stats['packets_sent'] = self.stats['packets_sent']
+            self.last_stats['time'] = now
 
     def stop(self):
         """Stop the server"""
