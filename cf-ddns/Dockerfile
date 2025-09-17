@@ -18,9 +18,10 @@ WORKDIR /app
 
 # Copy the Python script (or any other necessary files) into the container
 COPY cf-ddns.py .
+COPY requirements.txt .
 
 # Install dependencies without caching
-RUN pip install --no-cache-dir requests prometheus_client
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Switch to the non-privileged user
 USER pyuser

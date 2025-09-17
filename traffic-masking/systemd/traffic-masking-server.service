@@ -1,0 +1,55 @@
+[Unit]
+Description=Traffic Masking Server (Maximum Configuration)
+Documentation=https://github.com/traffic-masking/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+
+# Working directory
+WorkingDirectory=/opt/traffic-masking
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+
+# Maximum configuration with floating rate
+ExecStart=/usr/bin/python3 /opt/traffic-masking/traffic_masking_server.py \
+    --host 0.0.0.0 \
+    --port 8888 \
+    --min-mbps 3 \
+    --max-mbps 10 \
+    --advanced \
+    --profile mixed \
+    --header rtp \
+    --padding random \
+    --mtu 1200 \
+    --entropy 1.0 \
+    --stats-interval 10
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log
+
+# Resource limits
+LimitNOFILE=65536
+Nice=-10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=traffic-masking-server
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,55 @@
+[Unit]
+Description=Traffic Masking Client (Maximum Configuration)
+Documentation=https://github.com/traffic-masking/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+
+# Working directory
+WorkingDirectory=/opt/traffic-masking
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+Environment="SERVER_IP=127.0.0.1"  # Override with drop-in file
+
+# Maximum configuration with advanced features
+ExecStart=/usr/bin/python3 /opt/traffic-masking/traffic_masking_client.py \
+    --server ${SERVER_IP} \
+    --port 8888 \
+    --response 0.3 \
+    --advanced \
+    --uplink-profile mixed \
+    --header rtp \
+    --padding random \
+    --mtu 1200 \
+    --entropy 1.0 \
+    --stats-interval 10
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log
+
+# Resource limits
+LimitNOFILE=65536
+Nice=-10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=traffic-masking-client
+
+[Install]
+WantedBy=multi-user.target
