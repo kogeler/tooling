@@ -84,3 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Enhanced machine learning evasion techniques
 - Built-in traffic analysis tools
 - GUI for configuration and monitoring
+
+
+## [1.0.1] - 2024-12-20
+
+### Added
+- Rate limiting patterns
+- A test script for rate limiting patterns

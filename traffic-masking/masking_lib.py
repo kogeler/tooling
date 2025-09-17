@@ -425,9 +425,9 @@ def stream_generator(
 
     # Setup rate control
     if min_mbps is not None and max_mbps is not None:
-        # Floating rate mode
-        current_mbps = (min_mbps + max_mbps) / 2  # Start at midpoint
-        rate_velocity = 0.0  # Rate of change
+        # Floating rate mode - start at a random position for variety
+        current_mbps = random.uniform(min_mbps, max_mbps)
+        rate_velocity = random.uniform(-0.5, 0.5) * (max_mbps - min_mbps)  # Initial velocity
         rate_acceleration = 0.0  # Acceleration
         last_rate_update = time.time()
         use_floating_rate = True
@@ -439,6 +439,10 @@ def stream_generator(
         # No rate control
         current_mbps = None
         use_floating_rate = False
+
+    # Rate tracking for proper limiting
+    rate_window_bytes = 0
+    rate_window_start = time.time()
 
     # Use enhanced features if available
     enhanced_generator = None
@@ -454,35 +458,32 @@ def stream_generator(
     if not steps:
         steps = [PatternStep(size=1200, delay=0.001)]
 
-    # For high throughput, generate larger packets with smaller delays
-    if target_mbps and target_mbps > 0:
-        # Calculate required packet rate
-        target_bps = target_mbps * 1024 * 1024 / 8.0
-        avg_packet_size = 1200  # Target average packet size
-        packets_per_second = target_bps / avg_packet_size
-        base_delay = 1.0 / packets_per_second if packets_per_second > 0 else 0.001
-
-        # Adjust steps for target rate
-        adjusted_steps = []
-        for step in steps:
-            # Scale delay to achieve target rate
-            new_delay = min(base_delay * 2, max(base_delay * 0.5, step.delay * 0.1))
-            # Prefer larger packets for efficiency
-            new_size = max(800, min(1400, step.size))
-            adjusted_steps.append(PatternStep(size=new_size, delay=new_delay))
-        steps = adjusted_steps
+    # Adjust packet sizes for better rate control
+    # Use consistent packet sizes for more predictable rate control
+    adjusted_steps = []
+    for step in steps:
+        # Use medium-sized packets for better control
+        new_size = max(800, min(1400, step.size))
+        # Base delay will be calculated dynamically based on current rate
+        new_delay = 0.001  # Minimal base delay
+        adjusted_steps.append(PatternStep(size=new_size, delay=new_delay))
+    steps = adjusted_steps
 
     if obfuscator is None:
         obfuscator = DynamicObfuscator()
 
     idx = 0
-    packet_count = 0
-    start_time = time.time()
-    bytes_sent = 0
 
     # For floating rate mode - pattern tracking
     pattern_change_interval = random.uniform(2.0, 8.0)  # Change pattern every 2-8 seconds
     last_pattern_change = time.time()
+
+    # Floating rate pattern selection - include more extreme patterns
+    rate_pattern_type = random.choice(['wave', 'random_walk', 'bursty', 'steady_drift', 'oscillating', 'extreme'])
+    rate_pattern_phase = random.uniform(0, 2 * math.pi)  # Random starting phase
+    dwell_at_boundary = False
+    dwell_remaining = 0
+    last_boundary_visited = 'none'  # Track last boundary
 
     while True:
         # Update floating rate if enabled
@@ -490,71 +491,192 @@ def stream_generator(
             now = time.time()
             dt = now - last_rate_update
 
-            if dt > 0.1:  # Update rate every 100ms
-                # Simulate natural traffic variations
+            if dt > 0.05:  # Update rate every 50ms for smoother transitions
+                rate_range = max_mbps - min_mbps
+                rate_center = (min_mbps + max_mbps) / 2
+
+                # Check for pattern change
                 if now - last_pattern_change > pattern_change_interval:
-                    # Major pattern change - like switching to different activity
-                    rate_acceleration = random.uniform(-0.5, 0.5)
-                    pattern_change_interval = random.uniform(2.0, 8.0)
+                    # Switch traffic pattern - ensure we use patterns that reach boundaries
+                    rate_pattern_type = random.choice(['full_sine', 'boundary_jumps', 'sweep', 'aggressive_random'])
+                    pattern_change_interval = random.uniform(8.0, 20.0)
                     last_pattern_change = now
-                else:
-                    # Minor fluctuations with momentum
-                    rate_acceleration += random.uniform(-0.1, 0.1)
-                    rate_acceleration = max(-1.0, min(1.0, rate_acceleration))  # Limit acceleration
+                    rate_pattern_phase = 0.0
 
-                # Update velocity with acceleration
-                rate_velocity += rate_acceleration * dt
-                rate_velocity = max(-2.0, min(2.0, rate_velocity))  # Limit velocity
+                    # Often start at a boundary to ensure we visit them
+                    if random.random() < 0.6:  # 60% chance to start at boundary
+                        if random.random() < 0.5:
+                            current_mbps = max_mbps
+                        else:
+                            current_mbps = min_mbps
+                        rate_velocity = 0
+                        dwell_at_boundary = True
+                        dwell_remaining = random.uniform(2.0, 5.0)
 
-                # Apply damping to velocity (natural slowdown)
-                rate_velocity *= 0.95
+                # Handle dwelling at boundaries
+                if dwell_at_boundary:
+                    dwell_remaining -= dt
+                    if dwell_remaining <= 0:
+                        dwell_at_boundary = False
+                        # Strong push away from boundary
+                        if current_mbps <= min_mbps + 0.1:
+                            rate_velocity = rate_range * random.uniform(1.0, 2.0)
+                        else:
+                            rate_velocity = -rate_range * random.uniform(1.0, 2.0)
+                    else:
+                        # Stay exactly at boundary
+                        if current_mbps < rate_center:
+                            current_mbps = min_mbps
+                        else:
+                            current_mbps = max_mbps
+                        last_rate_update = now
+                        continue
 
-                # Update current rate
-                current_mbps += rate_velocity * dt
+                # Apply aggressive patterns that ALWAYS use the full range
+                if rate_pattern_type == 'full_sine':
+                    # Sine wave that definitely spans full range
+                    rate_pattern_phase += dt * 0.5  # Moderate speed
+                    wave_value = math.sin(rate_pattern_phase)
+                    # Direct mapping ensuring we hit exact min and max
+                    # Map [-1, 1] to [min_mbps, max_mbps]
+                    current_mbps = min_mbps + (max_mbps - min_mbps) * (wave_value + 1.0) / 2.0
+                    # Force exact boundaries at extremes
+                    if wave_value <= -0.99:
+                        current_mbps = min_mbps
+                    elif wave_value >= 0.99:
+                        current_mbps = max_mbps
 
-                # Bounce off limits with some elasticity
-                if current_mbps < min_mbps:
-                    current_mbps = min_mbps + (min_mbps - current_mbps) * 0.3
-                    rate_velocity = abs(rate_velocity) * 0.5  # Reverse and dampen
-                elif current_mbps > max_mbps:
-                    current_mbps = max_mbps - (current_mbps - max_mbps) * 0.3
-                    rate_velocity = -abs(rate_velocity) * 0.5  # Reverse and dampen
+                elif rate_pattern_type == 'boundary_jumps':
+                    # Frequently jump between boundaries and middle
+                    if random.random() < 0.2:  # 20% chance per update - more frequent
+                        choice = random.random()
+                        if choice < 0.4:
+                            current_mbps = min_mbps  # 40% chance for min
+                        elif choice < 0.8:
+                            current_mbps = max_mbps  # 40% chance for max
+                        else:
+                            # 20% chance for random position in range
+                            current_mbps = min_mbps + rate_range * random.random()
+
+                elif rate_pattern_type == 'sweep':
+                    # Linear sweep from min to max and back
+                    rate_pattern_phase += dt * 0.25  # Steady sweep speed
+                    phase_mod = rate_pattern_phase % 2.0
+                    if phase_mod < 1.0:
+                        # Sweep up from min to max - ensure we hit both exactly
+                        progress = phase_mod
+                        if progress <= 0.02:
+                            current_mbps = min_mbps  # Start exactly at min
+                        elif progress >= 0.98:
+                            current_mbps = max_mbps  # End exactly at max
+                        else:
+                            # Linear interpolation
+                            current_mbps = min_mbps + rate_range * progress
+                    else:
+                        # Sweep down from max to min - ensure we hit both exactly
+                        progress = phase_mod - 1.0
+                        if progress <= 0.02:
+                            current_mbps = max_mbps  # Start exactly at max
+                        elif progress >= 0.98:
+                            current_mbps = min_mbps  # End exactly at min
+                        else:
+                            # Linear interpolation
+                            current_mbps = max_mbps - rate_range * progress
+
+                elif rate_pattern_type == 'aggressive_random':
+                    # Aggressive random walk that favors extremes
+                    if random.random() < 0.2:  # 20% chance to jump
+                        rand = random.random()
+                        if rand < 0.3:
+                            # Jump to min
+                            current_mbps = min_mbps
+                        elif rand < 0.6:
+                            # Jump to max
+                            current_mbps = max_mbps
+                        else:
+                            # Random position favoring extremes
+                            if random.random() < 0.5:
+                                # Near min
+                                current_mbps = min_mbps + rate_range * random.uniform(0, 0.3)
+                            else:
+                                # Near max
+                                current_mbps = max_mbps - rate_range * random.uniform(0, 0.3)
+                    else:
+                        # Small random walk
+                        current_mbps += random.gauss(0, rate_range * 0.1)
+
+                # Ensure we stay within bounds
+                current_mbps = max(min_mbps, min(max_mbps, current_mbps))
+
+                # Force more frequent exact boundary visits
+                if random.random() < 0.1:  # 10% chance for guaranteed boundary hit
+                    if random.random() < 0.5:
+                        current_mbps = min_mbps
+                    else:
+                        current_mbps = max_mbps
 
                 last_rate_update = now
 
-                # Use current_mbps as the target for rate limiting
-                target_mbps = current_mbps
+        # For floating rate mode, ensure current_mbps is always within bounds
+        if use_floating_rate and min_mbps is not None and max_mbps is not None:
+            current_mbps = max(min_mbps, min(max_mbps, current_mbps))
+
         step = steps[idx]
         idx = (idx + 1) % len(steps)
 
         # Generate packet
         if step.size <= 0:
-            fragments, delay = obfuscator.obfuscate(b"", profile=profile, base_delay=step.delay)
+            fragments, _ = obfuscator.obfuscate(b"", profile=profile, base_delay=step.delay)
         else:
             payload = _generate_payload(step.size, entropy=entropy)
-            fragments, delay = obfuscator.obfuscate(payload, profile=profile, base_delay=step.delay)
+            fragments, _ = obfuscator.obfuscate(payload, profile=profile, base_delay=step.delay)
 
-        # Rate limiting to achieve target
-        if (target_mbps and target_mbps > 0) or (use_floating_rate and current_mbps and current_mbps > 0):
-            rate_target = current_mbps if use_floating_rate else target_mbps
-            bytes_sent += sum(len(f) for f in fragments)
-            packet_count += 1
+        # Calculate packet size
+        packet_bytes = sum(len(f) for f in fragments)
 
-            # Check actual rate every 100 packets
-            if packet_count % 100 == 0:
-                elapsed = time.time() - start_time
-                if elapsed > 0:
-                    actual_mbps = (bytes_sent * 8) / (elapsed * 1024 * 1024)
-                    # Adjust delay to match target rate
-                    if actual_mbps > 0:
-                        rate_ratio = rate_target / actual_mbps
-                        if rate_ratio > 1.2:  # Too slow
-                            delay = delay * 0.5  # Reduce delay
-                        elif rate_ratio < 0.8:  # Too fast
-                            delay = delay * 1.5  # Increase delay
+        # Update rate window tracking
+        now = time.time()
+        window_elapsed = now - rate_window_start
 
-        # Ensure minimum delay for stability
-        delay = max(0.0001, min(0.1, delay))
+        # Reset window every second to prevent drift
+        if window_elapsed > 1.0:
+            rate_window_bytes = 0
+            rate_window_start = now
+            window_elapsed = 0
+
+        # Calculate delay to achieve target rate while strictly enforcing boundaries
+        if use_floating_rate and min_mbps is not None and max_mbps is not None:
+            # Ensure current_mbps is strictly within bounds
+            rate_limit_mbps = max(min_mbps, min(max_mbps, current_mbps))
+        elif target_mbps:
+            rate_limit_mbps = target_mbps
+        else:
+            rate_limit_mbps = None
+
+        if rate_limit_mbps and rate_limit_mbps > 0:
+            # Target bytes per second for desired rate
+            target_bytes_per_second = rate_limit_mbps * 1024 * 1024 / 8
+
+            # Simple and direct delay calculation for better rate achievement
+            if target_bytes_per_second > 0 and packet_bytes > 0:
+                # Calculate ideal delay for this packet size at target rate
+                delay = packet_bytes / target_bytes_per_second
+
+                # For higher rates, reduce delay to allow bursting
+                if rate_limit_mbps >= 5:
+                    delay = delay * 0.9  # Allow 10% burst for high rates
+                elif rate_limit_mbps >= 2:
+                    delay = delay * 0.95  # Allow 5% burst for medium rates
+
+                # Minimal bounds to prevent issues
+                delay = max(0.00001, min(0.1, delay))
+            else:
+                delay = 0.001
+        else:
+            delay = step.delay if hasattr(step, 'delay') else 0.001
+
+        # Update window counter
+        rate_window_bytes += packet_bytes
 
         yield fragments, delay
 
