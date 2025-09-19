@@ -4,10 +4,15 @@
 # Use the official Python image based on Alpine
 FROM python:3.13-alpine
 
+LABEL maintainer="kogeler"
+LABEL description="Cloudflare DDNS Updater"
+LABEL version="1.1.0"
+
 # Use environment variables so that Python won't create .pyc files
 # and the output is written directly to stdout (unbuffered).
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 # Create a non-privileged user and group (pyuser)
 # -D: do not create a home directory, -G: set the group
