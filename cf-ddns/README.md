@@ -7,10 +7,12 @@ A Python script that dynamically updates a Cloudflare DNS A record with your ext
 ## Features
 
 - **Dynamic DNS Update:** Automatically updates the specified Cloudflare DNS record when your external IP changes.
-- **Prometheus Metrics:** Exposes key metrics:
-  - Total number of IP updates.
-  - Gauge indicating the current IP (value 1) and previously used IPs (value 0).
-  - Counter tracking external IP retrieval errors with a label indicating the service domain.
+- **Prometheus Metrics:** Exposes comprehensive metrics for monitoring:
+  - IP update counters and timestamps
+  - IP usage tracking with historical data
+  - Error tracking for IP retrieval and Cloudflare API
+- **Robust Error Handling:** Retry logic with exponential backoff for API calls
+- **Record Management:** Automatic record creation and recreation if needed
 - **Environment Variable Configuration:** All settings are controlled via environment variables.
 
 ---
@@ -77,17 +79,45 @@ Optional variables:
 The following metrics are exposed under `/metrics`:
 
 - **cf_ddns_ip_updates_total**  
-  A counter that increments each time the IP address is updated.
+  A counter that increments each time the IP address is successfully updated.
 
-- **cf_ddns_ip_info{domain, ip}**  
-  A gauge indicating IP usage. The current IP is set to `1`, and previous IP values remain at `0`.
+- **cf_ddns_ip_info{cf_host, ip}**  
+  A gauge indicating IP usage. The current IP is set to `1`, and previous IP values remain at `0` for historical tracking.
 
-- **cf_ddns_ip_retrieval_errors_total{service_domain}**  
+- **cf_ddns_ip_retrieval_errors_total{check_ip_service_host}**  
   A counter that increments when an error occurs while retrieving the external IP from a specific service (e.g., `checkip.amazonaws.com` or `api.ipify.org`).
+
+- **cf_ddns_cloudflare_api_errors_total**  
+  A counter that increments when Cloudflare API calls fail.
+
+- **cf_ddns_last_ip_check_timestamp_seconds**  
+  A gauge with the Unix timestamp of the last IP check.
+
+- **cf_ddns_last_ip_update_timestamp_seconds**  
+  A gauge with the Unix timestamp of the last successful IP update.
 
 Access the metrics at:
 
     http://<HOST>:<CF_DDNS_METRICS_PORT>/metrics
+
+---
+
+## Advanced Features
+
+### Retry Logic
+The script implements exponential backoff retry logic for:
+- DNS record retrieval (up to 3 attempts)
+- DNS record creation (up to 3 attempts)  
+- DNS record updates (up to 3 attempts)
+
+### Error Handling
+- Automatic handling of "record not found" errors (Cloudflare error code 81058)
+- Automatic record recreation if the record ID becomes invalid
+- Consecutive failure tracking with graceful shutdown after 10 failures
+
+### IP Validation
+- IPv4 address format validation for all retrieved IPs
+- Multiple IP retrieval services for redundancy
 
 ---
 
@@ -102,3 +132,5 @@ This project is licensed under the [Apache License 2.0](../LICENSE).
 - Ensure that your Cloudflare API token, zone ID, and host are correctly provided.
 - The script fetches the external IP via HTTPS from two services: `checkip.amazonaws.com` and `api.ipify.org`.
 - Monitor Prometheus metrics to stay aware of DNS update activity and potential errors.
+- The script maintains historical IP information in metrics for tracking purposes.
+- All API calls include proper error handling and retry mechanisms for reliability.
