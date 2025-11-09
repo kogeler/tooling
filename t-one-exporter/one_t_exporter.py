@@ -292,6 +292,17 @@ def update_metrics():
         failed_count = 0
         HEALTH_STATUS["total_validators"] = len(validators)
 
+        logger.debug(
+            f"Successfully processed {successful_count} validators, {failed_count} failed"
+        )
+
+        # Clear all metrics before setting new ones to ensure only active validators are shown
+        logger.debug("Clearing all metrics to ensure only active validators are shown")
+        for metric_name, metric in METRICS.items():
+            if hasattr(metric, "_metrics"):
+                metric._metrics.clear()
+
+        # Now set metrics for active validators
         for i, result in enumerate(results):
             try:
                 logger.debug(
@@ -306,6 +317,13 @@ def update_metrics():
                     failed_count += 1
                     HEALTH_STATUS["last_error"] = (
                         f"API error: {result.get('error', 'Unknown')}"
+                    )
+                    continue
+
+                # Check if validator is active in current session
+                if not result.get("active", False):
+                    logger.info(
+                        f"Validator {result.get('network')}/{result.get('address')} is not active in current session - skipping metrics"
                     )
                     continue
 
@@ -428,10 +446,6 @@ def update_metrics():
                 METRICS["one_t_errors"].inc()
                 failed_count += 1
                 HEALTH_STATUS["last_error"] = str(e)
-
-        logger.debug(
-            f"Successfully processed {successful_count} validators, {failed_count} failed"
-        )
 
         # Update health status
         HEALTH_STATUS["successful_validators"] = successful_count

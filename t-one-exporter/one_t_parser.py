@@ -168,11 +168,26 @@ def compute_current_session_result(network: str, addr: str) -> Dict[str, Any]:
     except Exception as e:
         performance_score = 0.0  # Default score on calculation error
 
+    # Determine if validator is active in current session
+    # Validator is considered active if:
+    # - Has voting activity (explicit or implicit votes)
+    # - Has production (points or authored blocks)
+    # - Has a valid grade (not "-" or -1.0)
+    is_active = (
+        (explicit_votes > 0 or implicit_votes > 0)
+        or (current_points > 0 or current_ab_count > 0)
+        or (
+            grade.get("grade") not in [None, "-", "N/A"]
+            and grade_to_numeric(grade.get("grade", "N/A")) >= 0
+        )
+    )
+
     result = {
         "ok": True,
         "network": network,
         "address": addr,
         "identity": identity_str,
+        "active": is_active,
         "current_session": current_session,
         "grade": grade.get("grade"),
         "grade_numeric": grade_to_numeric(grade.get("grade", "N/A")),
