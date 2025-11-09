@@ -455,6 +455,7 @@ class TestMockedMetricUpdate(unittest.TestCase):
                     "address": "5Dv8i8YqQZ7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q",
                     "identity": "TestValidator2",
                     "active": False,  # This validator is inactive
+                    "grade": "-",
                     "grade_numeric": -1.0,
                     "performance_score": 0.75,
                     "components": {
@@ -535,6 +536,7 @@ class TestMockedMetricUpdate(unittest.TestCase):
                     "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
                     "identity": "TestValidator1",
                     "active": False,
+                    "grade": "-",
                     "grade_numeric": -1.0,
                     "performance_score": 0.75,
                     "components": {
@@ -559,6 +561,7 @@ class TestMockedMetricUpdate(unittest.TestCase):
                     "address": "5Dv8i8YqQZ7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q",
                     "identity": "TestValidator2",
                     "active": False,
+                    "grade": "-",
                     "grade_numeric": -1.0,
                     "performance_score": 0.75,
                     "components": {
@@ -808,6 +811,7 @@ class TestActiveValidatorFiltering(unittest.TestCase):
                 "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
                 "identity": "TestValidator",
                 "active": False,  # Explicitly inactive
+                "grade": "-",  # Grade is "-" so validator is inactive
                 "grade_numeric": 9.0,
                 "performance_score": 0.95,
                 "components": {
@@ -912,6 +916,7 @@ class TestActiveValidatorFiltering(unittest.TestCase):
                     "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
                     "identity": "TestValidator",
                     "active": False,  # Now inactive
+                    "grade": "-",  # Grade is "-" so validator is inactive
                     "grade_numeric": -1.0,
                     "performance_score": 0.75,
                     "components": {
@@ -1157,6 +1162,163 @@ class TestHealthCheck(unittest.TestCase):
         # Verify recovery
         self.assertTrue(HEALTH_STATUS["healthy"])
         self.assertIsNone(HEALTH_STATUS["last_error"])
+
+
+class TestSimplifiedActiveLogic(unittest.TestCase):
+    """Test the simplified active field logic based only on grade."""
+
+    def test_active_based_on_grade(self):
+        """Test that active field is determined solely by grade value."""
+        from one_t_exporter import update_metrics
+
+        with patch.dict(
+            os.environ,
+            {
+                "ONE_T_VAL_1": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
+                "ONE_T_VAL_NETWORK_1": "polkadot",
+            },
+        ):
+            # Test case 1: Validator with grade "A+" should be active
+            mock_result_active = {
+                "ok": True,
+                "network": "polkadot",
+                "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
+                "identity": "TestValidator",
+                "active": True,  # Active because grade is "A+"
+                "grade": "A+",
+                "grade_numeric": 10.0,
+                "performance_score": 0.95,
+                "components": {
+                    "mvr": 0.05,
+                    "bar": 0.98,
+                    "points_normalized": 0.85,
+                    "pv_sessions_ratio": 0.99,
+                },
+                "key_metrics": {
+                    "missed_votes_total": 10,
+                    "bitfields_unavailability_total": 5,
+                },
+                "current_session_details": {
+                    "points": 1000,
+                    "authored_blocks_count": 5,
+                    "para_points": 900,
+                },
+            }
+
+            with patch(
+                f"{EXPORTER_MODULE}.one_t_lib.compute_current_session_results_batch"
+            ) as mock_batch:
+                mock_batch.return_value = [mock_result_active]
+                update_metrics()
+
+            labels = {
+                "network": "polkadot",
+                "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
+                "identity": "TestValidator",
+            }
+
+            # Active validator should have metrics
+            self.assertEqual(
+                METRICS["one_t_grade_numeric"].labels(**labels)._value.get(), 10.0
+            )
+
+            # Clear metrics for next test
+            for metric_name, metric in METRICS.items():
+                if hasattr(metric, "_metrics"):
+                    metric._metrics.clear()
+
+            # Test case 2: Validator with grade "-" should be inactive
+            mock_result_inactive = {
+                "ok": True,
+                "network": "polkadot",
+                "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
+                "identity": "TestValidator",
+                "active": False,  # Inactive because grade is "-"
+                "grade": "-",
+                "grade_numeric": -1.0,
+                "performance_score": 0.75,
+                "components": {
+                    "mvr": 0.0,
+                    "bar": 1.0,
+                    "points_normalized": 0.0,
+                    "pv_sessions_ratio": 0.0,
+                },
+                "key_metrics": {
+                    "missed_votes_total": 0,
+                    "bitfields_unavailability_total": 0,
+                },
+                "current_session_details": {
+                    "points": 0,
+                    "authored_blocks_count": 0,
+                    "para_points": 0,
+                },
+            }
+
+            with patch(
+                f"{EXPORTER_MODULE}.one_t_lib.compute_current_session_results_batch"
+            ) as mock_batch:
+                mock_batch.return_value = [mock_result_inactive]
+                update_metrics()
+
+            # Inactive validator should not have metrics (should be 0.0)
+            self.assertEqual(
+                METRICS["one_t_grade_numeric"].labels(**labels)._value.get(), 0.0
+            )
+
+    def test_grade_none_makes_inactive(self):
+        """Test that validator with None grade is inactive."""
+        from one_t_exporter import update_metrics
+
+        with patch.dict(
+            os.environ,
+            {
+                "ONE_T_VAL_1": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
+                "ONE_T_VAL_NETWORK_1": "polkadot",
+            },
+        ):
+            # Validator with None grade should be inactive
+            mock_result = {
+                "ok": True,
+                "network": "polkadot",
+                "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
+                "identity": "TestValidator",
+                "active": False,  # Inactive because grade is None
+                "grade": None,
+                "grade_numeric": -1.0,
+                "performance_score": 0.75,
+                "components": {
+                    "mvr": 0.0,
+                    "bar": 1.0,
+                    "points_normalized": 0.0,
+                    "pv_sessions_ratio": 0.0,
+                },
+                "key_metrics": {
+                    "missed_votes_total": 0,
+                    "bitfields_unavailability_total": 0,
+                },
+                "current_session_details": {
+                    "points": 0,
+                    "authored_blocks_count": 0,
+                    "para_points": 0,
+                },
+            }
+
+            with patch(
+                f"{EXPORTER_MODULE}.one_t_lib.compute_current_session_results_batch"
+            ) as mock_batch:
+                mock_batch.return_value = [mock_result]
+                update_metrics()
+
+            labels = {
+                "network": "polkadot",
+                "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
+                "identity": "TestValidator",
+            }
+
+            # Inactive validator should not have metrics
+            self.assertEqual(
+                METRICS["one_t_grade_numeric"].labels(**labels)._value.get(), 0.0
+            )
 
 
 class TestSignalHandling(unittest.TestCase):
