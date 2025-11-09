@@ -22,7 +22,7 @@ RUN addgroup -g 1000 pyuser && adduser -D -G pyuser -u 1000 pyuser
 WORKDIR /app
 
 # Copy the Python script (or any other necessary files) into the container
-COPY cone_t_parser.py .
+COPY one_t_parser.py .
 COPY one_t_exporter.py .
 COPY requirements.txt .
 
