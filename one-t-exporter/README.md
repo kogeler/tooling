@@ -4,6 +4,9 @@ Prometheus exporter for TurboFlakes ONE-T validator performance metrics.
 
 ## Changelog
 
+### v1.0.5
+- fix the wrong name of the exporter
+
 ### v1.0.4
 - Added `ONE_T_ENV` environment variable support
 - Added `env` label to all metrics for environment segregation
