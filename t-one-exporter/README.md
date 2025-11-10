@@ -2,6 +2,15 @@
 
 Prometheus exporter for TurboFlakes ONE-T validator performance metrics.
 
+## Changelog
+
+### v1.0.4
+- Added `ONE_T_ENV` environment variable support
+- Added `env` label to all metrics for environment segregation
+
+### v1.0.3
+- Initial release
+
 ## Overview
 
 This exporter collects performance metrics for Polkadot/Kusama validators from the TurboFlakes ONE-T API and exposes them in Prometheus format.
@@ -97,7 +106,7 @@ This exporter collects performance metrics for Polkadot/Kusama validators from t
   - Cumulative count of errors encountered during metric collection
   - Monitors exporter health and API connectivity
 
-**Labels**: All metrics include `network`, `address`, and `identity` labels.
+**Labels**: All metrics include `network`, `address`, `identity`, and `env` labelsidentity` labels.
 
 ## Health Check
 

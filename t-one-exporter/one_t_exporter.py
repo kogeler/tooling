@@ -24,6 +24,7 @@ import one_t_parser as one_t_lib
 ONE_T_PORT = int(os.getenv("ONE_T_PORT", "8000"))
 ONE_T_COLLECT_PERIOD = int(os.getenv("ONE_T_COLLECT_PERIOD", "60"))
 ONE_T_LOG_LEVEL = os.getenv("ONE_T_LOG_LEVEL", "INFO").upper()
+ONE_T_ENV = os.getenv("ONE_T_ENV", "")
 
 # Configure logging
 logging.basicConfig(
@@ -65,72 +66,74 @@ METRICS = {
     "one_t_grade_numeric": Gauge(
         "one_t_grade_numeric",
         "ONE-T numeric grade value (higher is better)",
-        ["network", "address", "identity"],
+        ["network", "address", "identity", "env"],
     ),
     "one_t_performance_score": Gauge(
         "one_t_performance_score",
         "ONE-T performance score (0.0-1.0)",
-        ["network", "address", "identity"],
+        ["network", "address", "identity", "env"],
     ),
     "one_t_mvr": Gauge(
-        "one_t_mvr", "Missed Vote Ratio (MVR)", ["network", "address", "identity"]
+        "one_t_mvr",
+        "Missed Vote Ratio (MVR)",
+        ["network", "address", "identity", "env"],
     ),
     "one_t_bar": Gauge(
         "one_t_bar",
         "Bitfields Availability Ratio (BAR)",
-        ["network", "address", "identity"],
+        ["network", "address", "identity", "env"],
     ),
     "one_t_points_normalized": Gauge(
         "one_t_points_normalized",
         "Normalized points component",
-        ["network", "address", "identity"],
+        ["network", "address", "identity", "env"],
     ),
     "one_t_pv_sessions_ratio": Gauge(
         "one_t_pv_sessions_ratio",
         "Para-validator sessions ratio",
-        ["network", "address", "identity"],
+        ["network", "address", "identity", "env"],
     ),
     # Voting metrics (Gauges for absolute values from current session)
     "one_t_missed_votes": Gauge(
         "one_t_missed_votes",
         "Total missed votes in current session",
-        ["network", "address", "identity"],
+        ["network", "address", "identity", "env"],
     ),
     "one_t_bitfields_unavailability": Gauge(
         "one_t_bitfields_unavailability",
         "Total bitfields unavailability in current session",
-        ["network", "address", "identity"],
+        ["network", "address", "identity", "env"],
     ),
     "one_t_explicit_votes": Gauge(
         "one_t_explicit_votes",
         "Total explicit votes in current session",
-        ["network", "address", "identity"],
+        ["network", "address", "identity", "env"],
     ),
     "one_t_implicit_votes": Gauge(
         "one_t_implicit_votes",
         "Total implicit votes in current session",
-        ["network", "address", "identity"],
+        ["network", "address", "identity", "env"],
     ),
     "one_t_bitfields_availability": Gauge(
         "one_t_bitfields_availability",
         "Total bitfields availability in current session",
-        ["network", "address", "identity"],
+        ["network", "address", "identity", "env"],
     ),
     # Session metrics (Gauges for absolute values from current session)
     "one_t_points": Gauge(
         "one_t_points",
         "Total session points in current session",
-        ["network", "address", "identity"],
+        ["network", "address", "identity", "env"],
     ),
     "one_t_authored_blocks_count": Gauge(
         "one_t_authored_blocks_count",
         "Total authored blocks in current session",
-        ["network", "address", "identity"],
+        ["network", "address", "identity", "env"],
     ),
     "one_t_para_points": Gauge(
         "one_t_para_points",
         "Total para points in current session",
-        ["network", "address", "identity"],
+        ["network", "address", "identity", "env"],
     ),
     # System metrics (Counter for cumulative errors)
     "one_t_errors": Counter(
@@ -339,7 +342,12 @@ def update_metrics():
                     continue
 
                 # Extract labels for metrics
-                labels = {"network": network, "address": address, "identity": identity}
+                labels = {
+                    "network": network,
+                    "address": address,
+                    "identity": identity,
+                    "env": ONE_T_ENV,
+                }
                 logger.debug(f"Setting metrics with labels: {labels}")
 
                 try:

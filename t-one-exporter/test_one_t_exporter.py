@@ -309,6 +309,7 @@ class TestMockedMetricUpdate(unittest.TestCase):
             "network": "polkadot",
             "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
             "identity": "TestValidator",
+            "env": "",
         }
 
         self.assertEqual(
@@ -487,11 +488,13 @@ class TestMockedMetricUpdate(unittest.TestCase):
                 "network": "polkadot",
                 "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
                 "identity": "TestValidator1",
+                "env": "",
             }
             inactive_labels = {
                 "network": "kusama",
                 "address": "5Dv8i8YqQZ7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q",
                 "identity": "TestValidator2",
+                "env": "",
             }
 
             # Active validator should have metrics
@@ -597,11 +600,13 @@ class TestMockedMetricUpdate(unittest.TestCase):
                 "network": "polkadot",
                 "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
                 "identity": "TestValidator1",
+                "env": "",
             }
             labels2 = {
                 "network": "kusama",
                 "address": "5Dv8i8YqQZ7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q",
                 "identity": "TestValidator2",
+                "env": "",
             }
 
             # All metrics should be at default values (0.0) for inactive validators
@@ -842,6 +847,7 @@ class TestActiveValidatorFiltering(unittest.TestCase):
                 "network": "polkadot",
                 "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
                 "identity": "TestValidator",
+                "env": "",
             }
 
             # Metrics should be at default values (0.0) for inactive validator
@@ -901,6 +907,7 @@ class TestActiveValidatorFiltering(unittest.TestCase):
                 "network": "polkadot",
                 "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
                 "identity": "TestValidator",
+                "env": "",
             }
 
             # Should have metrics after first update
@@ -1164,6 +1171,132 @@ class TestHealthCheck(unittest.TestCase):
         self.assertIsNone(HEALTH_STATUS["last_error"])
 
 
+class TestEnvLabelSupport(unittest.TestCase):
+    """Test ONE_T_ENV environment variable support."""
+
+    def setUp(self):
+        """Set up test environment."""
+        # Clear any existing metrics
+        for metric_name, metric in METRICS.items():
+            if hasattr(metric, "_metrics"):
+                metric._metrics.clear()
+
+    def test_env_label_with_value(self):
+        """Test that env label is included when ONE_T_ENV is set."""
+        from one_t_exporter import update_metrics
+
+        with patch.dict(
+            os.environ,
+            {
+                "ONE_T_VAL_1": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
+                "ONE_T_VAL_NETWORK_1": "polkadot",
+                "ONE_T_ENV": "production",  # Set env value
+            },
+        ):
+            mock_result = {
+                "ok": True,
+                "network": "polkadot",
+                "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
+                "identity": "TestValidator",
+                "active": True,
+                "grade": "A+",
+                "grade_numeric": 9.0,
+                "performance_score": 0.95,
+                "components": {
+                    "mvr": 0.05,
+                    "bar": 0.98,
+                    "points_normalized": 0.85,
+                    "pv_sessions_ratio": 0.99,
+                },
+                "key_metrics": {
+                    "missed_votes_total": 10,
+                    "bitfields_unavailability_total": 5,
+                },
+                "current_session_details": {
+                    "points": 1000,
+                    "authored_blocks_count": 5,
+                    "para_points": 900,
+                },
+            }
+
+            with patch(
+                f"{EXPORTER_MODULE}.one_t_lib.compute_current_session_results_batch"
+            ) as mock_batch:
+                mock_batch.return_value = [mock_result]
+                update_metrics()
+
+            labels = {
+                "network": "polkadot",
+                "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
+                "identity": "TestValidator",
+                "env": "production",  # Should have env value
+            }
+
+            # Metrics should be set with env label
+            self.assertEqual(
+                METRICS["one_t_grade_numeric"].labels(**labels)._value.get(), 9.0
+            )
+            self.assertEqual(
+                METRICS["one_t_performance_score"].labels(**labels)._value.get(), 0.95
+            )
+
+    def test_env_label_empty_string(self):
+        """Test that env label is empty string when ONE_T_ENV is not set."""
+        from one_t_exporter import update_metrics
+
+        with patch.dict(
+            os.environ,
+            {
+                "ONE_T_VAL_1": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
+                "ONE_T_VAL_NETWORK_1": "polkadot",
+                # ONE_T_ENV not set
+            },
+        ):
+            mock_result = {
+                "ok": True,
+                "network": "polkadot",
+                "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
+                "identity": "TestValidator",
+                "active": True,
+                "grade": "A+",
+                "grade_numeric": 9.0,
+                "performance_score": 0.95,
+                "components": {
+                    "mvr": 0.05,
+                    "bar": 0.98,
+                    "points_normalized": 0.85,
+                    "pv_sessions_ratio": 0.99,
+                },
+                "key_metrics": {
+                    "missed_votes_total": 10,
+                    "bitfields_unavailability_total": 5,
+                },
+                "current_session_details": {
+                    "points": 1000,
+                    "authored_blocks_count": 5,
+                    "para_points": 900,
+                },
+            }
+
+            with patch(
+                f"{EXPORTER_MODULE}.one_t_lib.compute_current_session_results_batch"
+            ) as mock_batch:
+                mock_batch.return_value = [mock_result]
+                update_metrics()
+
+            labels = {
+                "network": "polkadot",
+                "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
+                "identity": "TestValidator",
+                "env": "",  # Should be empty string when not set
+            }
+
+            # Metrics should be set with empty env label
+            self.assertEqual(
+                METRICS["one_t_grade_numeric"].labels(**labels)._value.get(), 9.0
+            )
+
+
 class TestSimplifiedActiveLogic(unittest.TestCase):
     """Test the simplified active field logic based only on grade."""
 
@@ -1215,6 +1348,7 @@ class TestSimplifiedActiveLogic(unittest.TestCase):
                 "network": "polkadot",
                 "address": "5C5cD4LaiSwqFwxUWRWfNMKLYctDH5bPkkstGNQGzYYaPtgb",
                 "identity": "TestValidator",
+                "env": "",
             }
 
             # Active validator should have metrics
