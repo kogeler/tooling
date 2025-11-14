@@ -9,16 +9,17 @@ Prometheus exporter for TurboFlakes ONE-T validator performance metrics.
 Exports metrics for validators configured via environment variables.
 """
 
-import os
-import sys
-import time
-import signal
 import logging
+import os
+import signal
+import sys
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import List, Tuple, Dict, Any
-from prometheus_client import start_http_server, Gauge, Counter, REGISTRY
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any, Dict, List, Tuple
+
 import one_t_parser as one_t_lib
+from prometheus_client import REGISTRY, Counter, Gauge, start_http_server
 
 # Environment variable configuration
 ONE_T_PORT = int(os.getenv("ONE_T_PORT", "8000"))
@@ -334,14 +335,19 @@ def update_metrics():
                 address = result.get("address", "")
                 identity = result.get("identity", "")
 
-                if not network or not address:
-                    logger.error(f"Missing network or address in result: {result}")
+                # Validate required labels - only env can be empty
+                if not network or not address or not identity:
+                    logger.error(
+                        f"Missing required labels in result: network='{network}', address='{address}', identity='{identity}'"
+                    )
                     METRICS["one_t_errors"].inc()
                     failed_count += 1
-                    HEALTH_STATUS["last_error"] = "Invalid result data"
+                    HEALTH_STATUS["last_error"] = (
+                        "Invalid result data - missing required labels"
+                    )
                     continue
 
-                # Extract labels for metrics
+                # Extract labels for metrics - env is the only optional label
                 labels = {
                     "network": network,
                     "address": address,
@@ -455,14 +461,15 @@ def update_metrics():
                 failed_count += 1
                 HEALTH_STATUS["last_error"] = str(e)
 
-        # Update health status
+        # Update health status - health check fails only if no metrics were generated
         HEALTH_STATUS["successful_validators"] = successful_count
-        if successful_count > 0 and failed_count == 0:
+        if successful_count > 0:
             HEALTH_STATUS["healthy"] = True
             HEALTH_STATUS["last_error"] = None
             HEALTH_STATUS["last_success_time"] = time.time()
-        elif failed_count > 0:
+        else:
             HEALTH_STATUS["healthy"] = False
+            HEALTH_STATUS["last_error"] = "No valid metrics generated in this scrape"
 
     except Exception as e:
         logger.error(f"Error during metric collection: {e}")

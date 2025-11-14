@@ -4,8 +4,13 @@ Prometheus exporter for TurboFlakes ONE-T validator performance metrics.
 
 ## Changelog
 
+### v1.0.6
+- Enforce required labels (`network`, `address`, `identity`) before emitting metrics to avoid malformed time-series
+- Health status now stays green as long as at least one validator produced metrics and reports “No valid metrics generated in this scrape” otherwise
+- Reorganized and expanded the pytest suite under `tests/` to cover validation, metric updates, health logic, and signal handling
+
 ### v1.0.5
-- fix the wrong name of the exporter
+- Fix the wrong name of the exporter
 
 ### v1.0.4
 - Added `ONE_T_ENV` environment variable support
@@ -116,14 +121,14 @@ This exporter collects performance metrics for Polkadot/Kusama validators from t
 The exporter provides a health check endpoint on port `ONE_T_PORT + 1` (default: 8001):
 
 - **Endpoint**: `http://localhost:8001/health`
-- **Healthy (200 OK)**: After first successful collection of all validators
+- **Healthy (200 OK)**: After the first successful collection producing at least one valid validator
 - **Unhealthy (503 Service Unavailable)**: 
-  - No successful collection yet
+  - No valid metrics generated in the most recent scrape
   - Any errors during last collection
   - No validators configured
 - **Response**: Plain text status message with validator count
 
-The health check becomes green after the first successful collection and turns red if any errors occur. It returns to green once collection succeeds again.
+The health check becomes green after the first successful collection that yields metrics and turns red if no valid data was produced. It returns to green once collection succeeds again.
 
 ## Quick Start
 
@@ -186,3 +191,21 @@ curl http://localhost:8001/health
 - **Session Metrics**: Tracks validator participation and rewards
 
 These metrics provide comprehensive visibility into validator performance, helping operators maintain optimal node health and avoid slashing risks.
+
+## Testing
+
+The test suite resides in `tests/` and is split by topic:
+
+- `test_validation.py` — network/address validation and env parsing
+- `test_metrics_definition.py` — Prometheus metric registry definitions
+- `test_metrics_update.py` — metric updates, filtering, env labels
+- `test_health.py` — health status and HTTP handler logic
+- `test_signal_handling.py` — graceful shutdown behavior
+
+Run everything inside the provided virtual environment:
+
+```bash
+cd one-t-exporter
+source .venv/bin/activate
+pytest tests
+```

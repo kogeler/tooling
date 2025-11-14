@@ -6,7 +6,7 @@ FROM python:3.13-alpine
 
 LABEL maintainer="kogeler"
 LABEL description="T-ONE exporter"
-LABEL version="1.0.5"
+LABEL version="1.0.6"
 
 # Use environment variables so that Python won't create .pyc files
 # and the output is written directly to stdout (unbuffered).
