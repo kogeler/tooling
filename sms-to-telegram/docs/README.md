@@ -67,7 +67,7 @@ GOOS=linux GOARCH=arm64 go build -o sms-to-telegram-arm64 .
 ## Docker
 
 ```bash
-# Build image (from repo root)
+# You can build image (from repo root) or use existing images
 docker build -t sms-to-telegram ./sms-to-telegram
 
 # Run with modem device passed through
@@ -75,7 +75,7 @@ docker run --rm --device /dev/ttyUSB0 \
   -e TELEGRAM_BOT_TOKEN="your-bot-token" \
   -e TELEGRAM_CHAT_IDS="-100123456789,9876543" \
   -e SERIAL_PORT=/dev/ttyUSB0 \
-  sms-to-telegram
+  ghcr.io/kogeler/tooling/sms-to-telegram:latest
 ```
 
 ## Installation
