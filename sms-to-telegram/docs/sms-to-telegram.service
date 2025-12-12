@@ -1,0 +1,69 @@
+[Unit]
+Description=SMS to Telegram Forwarder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+
+# Configuration
+Environment=TELEGRAM_BOT_TOKEN=your-token-here
+Environment=TELEGRAM_CHAT_IDS=-100123456789
+Environment=SERIAL_PORT=/dev/ttyUSB0
+Environment=BAUD_RATE=115200
+Environment=LOG_LEVEL=INFO
+
+ExecStart=/usr/local/bin/sms-to-telegram
+
+# Run as dedicated user with serial port access
+# Create user: useradd -r -s /usr/sbin/nologin -G dialout sms-forwarder
+User=sms-forwarder
+Group=dialout
+
+# Filesystem: no write access except tmp
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# Device access: only serial ports
+PrivateDevices=yes
+DeviceAllow=/dev/ttyUSB0 rw
+DeviceAllow=/dev/ttyUSB1 rw
+DeviceAllow=/dev/ttyACM0 rw
+
+# Network: only IPv4/IPv6 for Telegram API
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# Drop all capabilities
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+
+# Kernel protection
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# System call filter: allow only native arch
+SystemCallArchitectures=native
+
+# Process isolation
+LockPersonality=yes
+ProcSubset=pid
+ProtectProc=invisible
+PrivateIPC=yes
+
+# Prevent privilege escalation
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+# Resource limits (Go runtime needs reasonable limits)
+LimitNOFILE=256
+LimitNPROC=64
+
+[Install]
+WantedBy=multi-user.target
