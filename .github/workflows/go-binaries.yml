@@ -1,0 +1,205 @@
+# Copyright © 2025 kogeler
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build and Release Go Binaries
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set_matrix.outputs.matrix }}
+      has_targets: ${{ steps.set_matrix.outputs.has_targets }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Locate Go projects with version changes
+        id: find_targets
+        run: |
+          set -euo pipefail
+
+          echo "Checking for changed files in commit ${{ github.sha }}"
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff-tree --no-commit-id --name-only -r ${{ github.sha }})
+          else
+            CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r ${{ github.sha }})
+          fi
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          VERSION_FILES=$(echo "$CHANGED_FILES" | grep '\.version$' || true)
+
+          TARGET_DIRS=$(echo "$VERSION_FILES" | while read -r file; do
+            [ -z "$file" ] && continue
+            folder=$(echo "$file" | cut -d'/' -f1)
+
+            if [ -f "$folder/.version" ] && [ -f "$folder/main.go" ]; then
+              echo "$folder"
+            fi
+          done | sort -u)
+
+          echo "Candidate folders:"
+          echo "$TARGET_DIRS"
+
+          if [ -z "$TARGET_DIRS" ]; then
+            JSON="[]"
+          else
+            JSON=$(echo "$TARGET_DIRS" | jq -R -s -c 'split("\n")[:-1]')
+          fi
+
+          echo "dirs=$JSON" >> $GITHUB_OUTPUT
+
+      - name: Set matrix
+        id: set_matrix
+        run: |
+          DIRS='${{ steps.find_targets.outputs.dirs }}'
+
+          if [ "$DIRS" = "[]" ] || [ -z "$DIRS" ]; then
+            echo "No Go folders with .version changes found"
+            echo "has_targets=false" >> $GITHUB_OUTPUT
+            echo "matrix={\"folders\":[]}" >> $GITHUB_OUTPUT
+          else
+            echo "Found Go folders: $DIRS"
+            echo "has_targets=true" >> $GITHUB_OUTPUT
+            MATRIX_JSON=$(jq -c -n --argjson arr "$DIRS" '{folders: $arr}')
+            echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.set_matrix.outputs.has_targets }}" = "true" ]; then
+            echo "### 🐹 Go binaries to build" >> $GITHUB_STEP_SUMMARY
+            echo '${{ steps.find_targets.outputs.dirs }}' | jq -r '.[]' | while read -r dir; do
+              echo "- $dir" >> $GITHUB_STEP_SUMMARY
+            done
+          else
+            echo "### ℹ️ No .version files changed for Go projects" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  build_and_release:
+    needs: prepare
+    if: needs.prepare.outputs.has_targets == 'true'
+    runs-on: ubuntu-latest
+    container: golang:1.25-alpine
+    strategy:
+      matrix:
+        folder: ${{ fromJson(needs.prepare.outputs.matrix).folders }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: read_version
+        run: |
+          VERSION=$(sed '/^[[:space:]]*$/d' "${{ matrix.folder }}/.version" | head -n 1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Building ${{ matrix.folder }} version $VERSION"
+
+      - name: Run tests
+        run: go test ./...
+        working-directory: ${{ matrix.folder }}
+
+      - name: Build binaries
+        run: |
+          set -euo pipefail
+          mkdir -p "../dist/${{ matrix.folder }}"
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "../dist/${{ matrix.folder }}/${{ matrix.folder }}-${VERSION}-linux-${arch}" .
+            cp "../dist/${{ matrix.folder }}/${{ matrix.folder }}-${VERSION}-linux-${arch}" "../dist/${{ matrix.folder }}/${{ matrix.folder }}-linux-${arch}"
+          done
+        working-directory: ${{ matrix.folder }}
+
+      - name: Publish release assets
+        uses: actions/github-script@v7
+        env:
+          VERSION: ${{ steps.read_version.outputs.version }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = '${{ matrix.folder }}';
+
+            async function fetchRelease() {
+              return github.rest.repos.getReleaseByTag({ owner, repo, tag });
+            }
+
+            let releaseResponse;
+
+            try {
+              releaseResponse = await fetchRelease();
+            } catch (error) {
+              if (error.status === 404) {
+                const created = await github.rest.repos.createRelease({
+                  owner,
+                  repo,
+                  tag_name: tag,
+                  name: tag,
+                  draft: false,
+                  prerelease: false,
+                });
+
+                releaseResponse = await github.rest.repos.getRelease({
+                  owner,
+                  repo,
+                  release_id: created.data.id,
+                });
+              } else {
+                throw error;
+              }
+            }
+
+            const release = releaseResponse.data;
+            const baseDir = path.join(process.env.GITHUB_WORKSPACE, 'dist', '${{ matrix.folder }}');
+
+            const assetsToUpload = [
+              `${tag}-${process.env.VERSION}-linux-amd64`,
+              `${tag}-${process.env.VERSION}-linux-arm64`,
+              `${tag}-linux-amd64`,
+              `${tag}-linux-arm64`,
+            ];
+
+            for (const assetName of assetsToUpload) {
+              const existing = release.assets?.find((asset) => asset.name === assetName);
+
+              if (existing) {
+                core.info(`Deleting existing asset ${assetName} (id: ${existing.id})`);
+                await github.rest.repos.deleteReleaseAsset({
+                  owner,
+                  repo,
+                  asset_id: existing.id,
+                });
+              }
+
+              const filePath = path.join(baseDir, assetName);
+              core.info(`Uploading ${filePath} to release ${tag}`);
+
+              const content = fs.readFileSync(filePath);
+              await github.rest.repos.uploadReleaseAsset({
+                owner,
+                repo,
+                release_id: release.id,
+                name: assetName,
+                headers: {
+                  'content-type': 'application/octet-stream',
+                  'content-length': content.length,
+                },
+                data: content,
+              });
+            }
