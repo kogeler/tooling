@@ -11,7 +11,7 @@ SERVICE_URL="https://raw.githubusercontent.com/kogeler/tooling/refs/heads/main/s
 
 usage() {
   cat <<'EOF'
-Usage: install.sh --name NAME --serial /dev/ttyUSB0 --token BOT_TOKEN --chats id1,id2 [--baud 115200]
+Usage: install.sh --name NAME --serial /dev/ttyUSB0 --token BOT_TOKEN --chats id1,id2 [--baud 115200] [--version X.Y.Z]
 
 Required:
   --name    Installation name (used for /opt/<name> and service name)
@@ -21,6 +21,7 @@ Required:
 
 Optional:
   --baud    Serial port baud rate (default: 115200)
+  --version Binary version (e.g., 1.0.2). Default: latest build without version suffix.
 EOF
   exit 1
 }
@@ -39,6 +40,7 @@ SERIAL_PORT=""
 TELEGRAM_TOKEN=""
 CHAT_IDS=""
 BAUD_RATE="$DEFAULT_BAUD"
+VERSION=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -60,6 +62,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --baud)
       BAUD_RATE="${2:-}"
+      shift 2
+      ;;
+    --version)
+      VERSION="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -89,6 +95,11 @@ fi
 
 if [[ ! "$BAUD_RATE" =~ ^[0-9]+$ ]]; then
   echo "Baud rate must be numeric."
+  exit 1
+fi
+
+if [[ -n "$VERSION" && "$VERSION" =~ [^a-zA-Z0-9_.-] ]]; then
+  echo "Version may only contain letters, numbers, '.', '_' or '-'."
   exit 1
 fi
 
@@ -126,26 +137,30 @@ BIN_PATH="${INSTALL_DIR}/sms-to-telegram"
 SERVICE_NAME="${NAME}"
 SERVICE_FILE="${SERVICE_NAME}.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_FILE}"
-BIN_URL="${BIN_BASE_URL}/sms-to-telegram-linux-${BIN_ARCH}"
+BIN_FILE="sms-to-telegram-linux-${BIN_ARCH}"
+if [[ -n "$VERSION" ]]; then
+  BIN_FILE="sms-to-telegram-${VERSION}-linux-${BIN_ARCH}"
+fi
+BIN_URL="${BIN_BASE_URL}/${BIN_FILE}"
 
 echo "Creating install directory at ${INSTALL_DIR}..."
 mkdir -p "$INSTALL_DIR"
 
+TMP_BIN="$(mktemp)"
+TMP_SERVICE="$(mktemp)"
+cleanup() {
+  rm -f "$TMP_BIN" "$TMP_SERVICE"
+}
+trap cleanup EXIT
+
 echo "Downloading binary for ${BIN_ARCH}..."
-curl -fsSL "$BIN_URL" -o "$BIN_PATH"
-chmod 0755 "$BIN_PATH"
-chown root:root "$BIN_PATH"
+curl -fsSL "$BIN_URL" -o "$TMP_BIN"
+install -m 0755 -o root -g root "$TMP_BIN" "$BIN_PATH"
 
 if ! id -u sms-forwarder >/dev/null 2>&1; then
   echo "Creating service user sms-forwarder..."
   useradd -r -s /usr/sbin/nologin -G dialout sms-forwarder
 fi
-
-TMP_SERVICE="$(mktemp)"
-cleanup() {
-  rm -f "$TMP_SERVICE"
-}
-trap cleanup EXIT
 
 echo "Downloading systemd unit template..."
 curl -fsSL "$SERVICE_URL" -o "$TMP_SERVICE"
@@ -164,12 +179,10 @@ sed -i \
   -e "s|^Environment=SERIAL_PORT=.*|Environment=SERIAL_PORT=${ESC_SERIAL}|" \
   -e "s|^Environment=BAUD_RATE=.*|Environment=BAUD_RATE=${ESC_BAUD}|" \
   -e "s|^ExecStart=.*|ExecStart=${ESC_BIN_PATH}|" \
-  -e "s|^DeviceAllow=.*|DeviceAllow=${ESC_SERIAL} rw|" \
   "$TMP_SERVICE"
 
 echo "Installing systemd unit to ${SERVICE_PATH}..."
-mv "$TMP_SERVICE" "$SERVICE_PATH"
-chmod 0644 "$SERVICE_PATH"
+install -m 0644 -o root -g root "$TMP_SERVICE" "$SERVICE_PATH"
 
 echo "Reloading systemd and enabling service ${SERVICE_NAME}..."
 systemctl daemon-reload
