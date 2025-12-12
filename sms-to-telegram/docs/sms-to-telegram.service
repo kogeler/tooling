@@ -27,10 +27,6 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 
-# Device access: only serial ports
-PrivateDevices=yes
-DeviceAllow=/dev/ttyUSB0 rw
-
 # Network: only IPv4/IPv6 for Telegram API
 RestrictAddressFamilies=AF_INET AF_INET6
 
