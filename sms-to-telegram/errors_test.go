@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestDiagnosticError(t *testing.T) {
@@ -27,7 +28,7 @@ func TestDiagnosticError(t *testing.T) {
 
 func TestErrorNotifier_Deduplication(t *testing.T) {
 	ctx := context.Background()
-	notifier := NewErrorNotifier(nil, []int64{123}, true, "test-host")
+	notifier := NewErrorNotifier(nil, []int64{123}, true, "test-host", 5*time.Second)
 
 	err1 := NewDiagnosticError(ErrTypeModemNotResponding, "modem error")
 	err2 := NewDiagnosticError(ErrTypeModemNotResponding, "modem error again")
@@ -56,7 +57,7 @@ func TestErrorNotifier_Deduplication(t *testing.T) {
 
 func TestErrorNotifier_Recovery(t *testing.T) {
 	ctx := context.Background()
-	notifier := NewErrorNotifier(nil, []int64{123}, true, "test-host")
+	notifier := NewErrorNotifier(nil, []int64{123}, true, "test-host", 5*time.Second)
 
 	// No previous error - recovery should not be sent
 	if notifier.NotifyRecovery(ctx) {
@@ -80,7 +81,7 @@ func TestErrorNotifier_Recovery(t *testing.T) {
 
 func TestErrorNotifier_HasError(t *testing.T) {
 	ctx := context.Background()
-	notifier := NewErrorNotifier(nil, []int64{123}, true, "test-host")
+	notifier := NewErrorNotifier(nil, []int64{123}, true, "test-host", 5*time.Second)
 
 	if notifier.HasError() {
 		t.Error("HasError should be false initially")
@@ -102,7 +103,7 @@ func TestErrorNotifier_HasError(t *testing.T) {
 
 func TestErrorNotifier_ErrorAfterRecovery(t *testing.T) {
 	ctx := context.Background()
-	notifier := NewErrorNotifier(nil, []int64{123}, true, "test-host")
+	notifier := NewErrorNotifier(nil, []int64{123}, true, "test-host", 5*time.Second)
 
 	err := NewDiagnosticError(ErrTypeModemNotResponding, "error 1")
 
@@ -152,7 +153,7 @@ func TestErrorTypeName(t *testing.T) {
 }
 
 func TestErrorNotifier_FormatMessage(t *testing.T) {
-	notifier := NewErrorNotifier(nil, []int64{123}, true, "test-host")
+	notifier := NewErrorNotifier(nil, []int64{123}, true, "test-host", 5*time.Second)
 
 	tests := []struct {
 		errType     DiagnosticErrorType

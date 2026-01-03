@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -26,6 +27,12 @@ type Config struct {
 	BaudRate      int
 	LogLevel      slog.Level
 	DryRun        bool // for testing without telegram
+	// Max age for stale multipart SMS parts before deletion. 0 disables cleanup.
+	MultipartMaxAge time.Duration
+	// Timeout for a single Telegram API call.
+	TelegramSendTimeout time.Duration
+	// Grace period to wait for network registration before alerting. 0 disables grace.
+	NetworkRegGrace time.Duration
 }
 
 func main() {
@@ -42,6 +49,9 @@ func main() {
 		"baud_rate", cfg.BaudRate,
 		"chat_ids", cfg.ChatIDs,
 		"dry_run", cfg.DryRun,
+		"multipart_max_age", cfg.MultipartMaxAge,
+		"telegram_send_timeout", cfg.TelegramSendTimeout,
+		"network_reg_grace", cfg.NetworkRegGrace,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -63,29 +73,33 @@ func main() {
 }
 
 func loadConfig() (*Config, error) {
+	dryRun := os.Getenv("DRY_RUN") == "true" || os.Getenv("DRY_RUN") == "1"
+
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
-	if token == "" {
+	if token == "" && !dryRun {
 		return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN environment variable is required")
 	}
 
 	chatIDsStr := os.Getenv("TELEGRAM_CHAT_IDS")
-	if chatIDsStr == "" {
+	if chatIDsStr == "" && !dryRun {
 		return nil, fmt.Errorf("TELEGRAM_CHAT_IDS environment variable is required (comma-separated list)")
 	}
 
 	var chatIDs []int64
-	for _, idStr := range strings.Split(chatIDsStr, ",") {
-		idStr = strings.TrimSpace(idStr)
-		if idStr == "" {
-			continue
+	if chatIDsStr != "" {
+		for _, idStr := range strings.Split(chatIDsStr, ",") {
+			idStr = strings.TrimSpace(idStr)
+			if idStr == "" {
+				continue
+			}
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid chat ID %q: %w", idStr, err)
+			}
+			chatIDs = append(chatIDs, id)
 		}
-		id, err := strconv.ParseInt(idStr, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid chat ID %q: %w", idStr, err)
-		}
-		chatIDs = append(chatIDs, id)
 	}
-	if len(chatIDs) == 0 {
+	if len(chatIDs) == 0 && !dryRun {
 		return nil, fmt.Errorf("at least one chat ID is required")
 	}
 
@@ -119,15 +133,52 @@ func loadConfig() (*Config, error) {
 		}
 	}
 
-	dryRun := os.Getenv("DRY_RUN") == "true" || os.Getenv("DRY_RUN") == "1"
+	var multipartMaxAge time.Duration
+	if maxAgeStr := os.Getenv("MULTIPART_MAX_AGE"); maxAgeStr != "" {
+		var err error
+		multipartMaxAge, err = time.ParseDuration(maxAgeStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid MULTIPART_MAX_AGE %q: %w", maxAgeStr, err)
+		}
+		if multipartMaxAge < 0 {
+			return nil, fmt.Errorf("invalid MULTIPART_MAX_AGE %q: must be >= 0", maxAgeStr)
+		}
+	}
+
+	telegramSendTimeout := 20 * time.Second
+	if timeoutStr := os.Getenv("TELEGRAM_SEND_TIMEOUT"); timeoutStr != "" {
+		var err error
+		telegramSendTimeout, err = time.ParseDuration(timeoutStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid TELEGRAM_SEND_TIMEOUT %q: %w", timeoutStr, err)
+		}
+		if telegramSendTimeout <= 0 {
+			return nil, fmt.Errorf("invalid TELEGRAM_SEND_TIMEOUT %q: must be > 0", timeoutStr)
+		}
+	}
+
+	networkRegGrace := 90 * time.Second
+	if graceStr := os.Getenv("NETWORK_REG_GRACE"); graceStr != "" {
+		var err error
+		networkRegGrace, err = time.ParseDuration(graceStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid NETWORK_REG_GRACE %q: %w", graceStr, err)
+		}
+		if networkRegGrace < 0 {
+			return nil, fmt.Errorf("invalid NETWORK_REG_GRACE %q: must be >= 0", graceStr)
+		}
+	}
 
 	return &Config{
-		TelegramToken: token,
-		ChatIDs:       chatIDs,
-		SerialPort:    serialPort,
-		BaudRate:      baudRate,
-		LogLevel:      logLevel,
-		DryRun:        dryRun,
+		TelegramToken:       token,
+		ChatIDs:             chatIDs,
+		SerialPort:          serialPort,
+		BaudRate:            baudRate,
+		LogLevel:            logLevel,
+		DryRun:              dryRun,
+		MultipartMaxAge:     multipartMaxAge,
+		TelegramSendTimeout: telegramSendTimeout,
+		NetworkRegGrace:     networkRegGrace,
 	}, nil
 }
 
@@ -139,8 +190,9 @@ func setupLogging(level slog.Level) {
 	slog.SetDefault(slog.New(handler))
 }
 
-// runModemDiagnostics performs detailed modem diagnostics and returns DiagnosticError
-func runModemDiagnostics(modem *SimpleAT) *DiagnosticError {
+// runModemDiagnostics performs detailed modem diagnostics and returns DiagnosticError.
+// networkGrace defines how long to wait for network registration after sessionStart.
+func runModemDiagnostics(ctx context.Context, modem *SimpleAT, sessionStart time.Time, networkGrace time.Duration) *DiagnosticError {
 	slog.Info("Testing modem connection...")
 
 	// Test modem with simple AT command
@@ -243,17 +295,23 @@ func runModemDiagnostics(modem *SimpleAT) *DiagnosticError {
 	}
 
 	// Check signal quality
+	var noSignal bool
+	var signalChecked bool
+	var signalRSSI string
 	if resp, err := modem.Command("AT+CSQ"); err == nil {
 		slog.Info("Signal quality", "response", strings.Join(resp, " "))
 		// Parse signal: +CSQ: rssi,ber
 		// rssi: 0-31 (0=-113dBm, 31=-51dBm), 99=unknown
 		for _, line := range resp {
 			if strings.HasPrefix(line, "+CSQ:") {
+				signalChecked = true
 				parts := strings.Split(strings.TrimPrefix(line, "+CSQ:"), ",")
 				if len(parts) >= 1 {
 					rssi := strings.TrimSpace(parts[0])
+					signalRSSI = rssi
 					if rssi == "99" {
 						slog.Warn("SIGNAL: No signal or not detectable")
+						noSignal = true
 					} else if rssi == "0" {
 						slog.Warn("SIGNAL: Very weak signal (-113 dBm or less)")
 					} else {
@@ -266,17 +324,35 @@ func runModemDiagnostics(modem *SimpleAT) *DiagnosticError {
 		slog.Warn("Could not check signal quality", "error", err)
 	}
 
+	if noSignal && signalChecked {
+		return NewDiagnosticError(ErrTypeNoSignal,
+			"No signal detected (CSQ=%s)", signalRSSI)
+	}
+
 	// Check network registration
 	var networkRegistered bool
-	if resp, err := modem.Command("AT+CREG?"); err == nil {
+	var cregChecked bool
+	var networkStat string
+	checkNetwork := func() *DiagnosticError {
+		cregChecked = false
+		networkRegistered = false
+		networkStat = ""
+
+		resp, err := modem.Command("AT+CREG?")
+		if err != nil {
+			slog.Warn("Could not check network registration", "error", err)
+			return nil
+		}
 		slog.Info("Network registration", "response", strings.Join(resp, " "))
 		// Parse: +CREG: n,stat
 		// stat: 0=not registered, 1=registered home, 2=searching, 3=denied, 4=unknown, 5=roaming
 		for _, line := range resp {
 			if strings.HasPrefix(line, "+CREG:") {
+				cregChecked = true
 				parts := strings.Split(strings.TrimPrefix(line, "+CREG:"), ",")
 				if len(parts) >= 2 {
 					stat := strings.TrimSpace(parts[1])
+					networkStat = stat
 					switch stat {
 					case "0":
 						slog.Warn("NETWORK: Not registered, not searching")
@@ -288,7 +364,6 @@ func runModemDiagnostics(modem *SimpleAT) *DiagnosticError {
 						networkRegistered = true
 					case "2":
 						slog.Warn("NETWORK: Not registered, searching for network...")
-						slog.Info("Waiting for network registration (this can take 30-60 seconds)...")
 					case "3":
 						slog.Error("NETWORK: Registration denied by operator")
 						return NewDiagnosticError(ErrTypeNetworkDenied,
@@ -302,8 +377,52 @@ func runModemDiagnostics(modem *SimpleAT) *DiagnosticError {
 				}
 			}
 		}
-	} else {
-		slog.Warn("Could not check network registration", "error", err)
+
+		return nil
+	}
+
+	if diagErr := checkNetwork(); diagErr != nil {
+		return diagErr
+	}
+
+	waitedForNetwork := false
+	for simReady && cregChecked && !networkRegistered && networkGrace > 0 {
+		elapsed := time.Since(sessionStart)
+		if elapsed >= networkGrace {
+			break
+		}
+		if networkStat != "0" && networkStat != "2" && networkStat != "4" {
+			break
+		}
+
+		remaining := networkGrace - elapsed
+		wait := 5 * time.Second
+		if remaining < wait {
+			wait = remaining
+		}
+		if !waitedForNetwork {
+			slog.Info("Waiting for network registration", "grace", networkGrace, "elapsed", elapsed)
+			waitedForNetwork = true
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(wait):
+		}
+
+		if diagErr := checkNetwork(); diagErr != nil {
+			return diagErr
+		}
+	}
+
+	// Treat missing registration as an error when SIM is ready and CREG was checked.
+	if simReady && cregChecked && !networkRegistered {
+		if networkStat == "" {
+			networkStat = "unknown"
+		}
+		return NewDiagnosticError(ErrTypeNetworkNotRegistered,
+			"Not registered on network (CREG=%s)", networkStat)
 	}
 
 	// Warn if SIM is ready but not registered
@@ -342,7 +461,7 @@ func run(ctx context.Context, cfg *Config) error {
 	}
 
 	// Create error notifier for sending diagnostic errors to Telegram
-	notifier := NewErrorNotifier(tgBot, cfg.ChatIDs, cfg.DryRun, hostname)
+	notifier := NewErrorNotifier(tgBot, cfg.ChatIDs, cfg.DryRun, hostname, cfg.TelegramSendTimeout)
 
 	// Retry interval for modem connection issues
 	retryInterval := 30 * time.Second
@@ -375,8 +494,7 @@ func run(ctx context.Context, cfg *Config) error {
 			// Determine if we need modem reset on next attempt
 			// SIM-related errors benefit from full modem reset
 			switch diagErr.Type {
-			case ErrTypeSimNotDetected, ErrTypeSimPinRequired, ErrTypeSimPukLocked,
-				ErrTypeNetworkDenied, ErrTypeNetworkNotRegistered, ErrTypeNoSignal:
+			case ErrTypeSimNotDetected, ErrTypeSimPinRequired, ErrTypeSimPukLocked, ErrTypeNetworkDenied:
 				needReset = true
 				slog.Info("Will perform modem reset on next attempt")
 			default:
@@ -447,9 +565,11 @@ func runModemLoop(ctx context.Context, cfg *Config, tgBot *bot.Bot, notifier *Er
 		slog.Info("Modem reset complete")
 	}
 
+	sessionStart := time.Now()
+
 	// Run detailed modem diagnostics
 	slog.Info("Running modem diagnostics...")
-	if diagErr := runModemDiagnostics(modem); diagErr != nil {
+	if diagErr := runModemDiagnostics(ctx, modem, sessionStart, cfg.NetworkRegGrace); diagErr != nil {
 		return diagErr
 	}
 
@@ -509,7 +629,7 @@ func runModemLoop(ctx context.Context, cfg *Config, tgBot *bot.Bot, notifier *Er
 		if IsModemError(err) {
 			slog.Warn("Modem returned ERROR - running diagnostics to determine cause")
 			// Run diagnostics to get specific error
-			if diagErr := runModemDiagnostics(modem); diagErr != nil {
+			if diagErr := runModemDiagnostics(ctx, modem, sessionStart, cfg.NetworkRegGrace); diagErr != nil {
 				return diagErr
 			}
 			// Diagnostics passed but we still got ERROR - generic modem error
@@ -546,7 +666,7 @@ func runModemLoop(ctx context.Context, cfg *Config, tgBot *bot.Bot, notifier *Er
 				}
 				// Modem responds but with ERROR - run diagnostics
 				slog.Warn("Modem health check returned ERROR - running diagnostics")
-				if diagErr := runModemDiagnostics(modem); diagErr != nil {
+				if diagErr := runModemDiagnostics(ctx, modem, sessionStart, cfg.NetworkRegGrace); diagErr != nil {
 					return diagErr
 				}
 			}
@@ -579,13 +699,32 @@ func processMessages(ctx context.Context, modem *SimpleAT, tgBot *bot.Bot, cfg *
 	slog.Debug("Checking for new SMS messages")
 
 	// List all messages from SIM storage
-	messages, indicesToDelete, err := listSMSMessages(modem)
+	messages, indicesToDelete, err := listSMSMessages(modem, cfg.MultipartMaxAge)
 	if err != nil {
 		return fmt.Errorf("failed to list SMS messages: %w", err)
 	}
 
 	if len(messages) == 0 {
-		slog.Debug("No messages found")
+		if len(indicesToDelete) == 0 {
+			slog.Debug("No messages found")
+			return nil
+		}
+		slog.Warn("No complete messages, but stale multipart parts found", "count", len(indicesToDelete))
+		if cfg.DryRun {
+			slog.Info("DRY_RUN: Skipping SMS deletion", "indices", indicesToDelete)
+			return nil
+		}
+		unique := make(map[int]struct{}, len(indicesToDelete))
+		for _, idx := range indicesToDelete {
+			if _, ok := unique[idx]; ok {
+				continue
+			}
+			unique[idx] = struct{}{}
+			slog.Debug("Deleting stale SMS part from SIM", "index", idx)
+			if err := deleteSMS(modem, idx); err != nil {
+				slog.Error("Failed to delete stale SMS part", "error", err, "index", idx)
+			}
+		}
 		return nil
 	}
 
@@ -622,7 +761,12 @@ func processMessages(ctx context.Context, modem *SimpleAT, tgBot *bot.Bot, cfg *
 	if cfg.DryRun {
 		slog.Info("DRY_RUN: Skipping SMS deletion", "indices", indicesToDelete)
 	} else {
+		unique := make(map[int]struct{}, len(indicesToDelete))
 		for _, idx := range indicesToDelete {
+			if _, ok := unique[idx]; ok {
+				continue
+			}
+			unique[idx] = struct{}{}
 			slog.Debug("Deleting SMS from SIM", "index", idx)
 			if err := deleteSMS(modem, idx); err != nil {
 				slog.Error("Failed to delete SMS", "error", err, "index", idx)
@@ -640,7 +784,7 @@ type RawSMS struct {
 	PDU   *PDUMessage
 }
 
-func listSMSMessages(modem *SimpleAT) ([]SMSMessage, []int, error) {
+func listSMSMessages(modem *SimpleAT, maxAge time.Duration) ([]SMSMessage, []int, error) {
 	// AT+CMGL=4 lists all messages in PDU mode
 	// 4 = all messages
 	resp, err := modem.Command("AT+CMGL=4")
@@ -709,8 +853,6 @@ func listSMSMessages(modem *SimpleAT) ([]SMSMessage, []int, error) {
 	var indicesToDelete []int
 
 	for _, raw := range rawMessages {
-		indicesToDelete = append(indicesToDelete, raw.Index)
-
 		if raw.PDU.IsMultipart {
 			slog.Debug("Multipart SMS part",
 				"index", raw.Index,
@@ -719,7 +861,7 @@ func listSMSMessages(modem *SimpleAT) ([]SMSMessage, []int, error) {
 				"total", raw.PDU.TotalParts,
 			)
 
-			assembled := collector.Add(raw.PDU)
+			assembled, partIndices := collector.Add(raw.Index, raw.PDU)
 			if assembled != nil {
 				messages = append(messages, SMSMessage{
 					Index:       raw.Index, // Use last part's index
@@ -730,6 +872,7 @@ func listSMSMessages(modem *SimpleAT) ([]SMSMessage, []int, error) {
 					IsMultipart: true,
 					TotalParts:  raw.PDU.TotalParts,
 				})
+				indicesToDelete = append(indicesToDelete, partIndices...)
 			}
 		} else {
 			messages = append(messages, SMSMessage{
@@ -741,12 +884,22 @@ func listSMSMessages(modem *SimpleAT) ([]SMSMessage, []int, error) {
 				IsMultipart: false,
 				TotalParts:  1,
 			})
+			indicesToDelete = append(indicesToDelete, raw.Index)
 		}
 	}
 
 	// Warn about incomplete multipart messages
 	if pending := collector.Pending(); pending > 0 {
 		slog.Warn("Some multipart messages are incomplete - waiting for more parts", "pending", pending)
+	}
+
+	if maxAge > 0 {
+		now := time.Now()
+		stale := collector.StaleIndices(maxAge, now)
+		if len(stale) > 0 {
+			slog.Warn("Stale multipart parts detected", "count", len(stale), "max_age", maxAge)
+			indicesToDelete = append(indicesToDelete, stale...)
+		}
 	}
 
 	return messages, indicesToDelete, nil
@@ -788,12 +941,19 @@ func sendToTelegramWithRetry(ctx context.Context, tgBot *bot.Bot, cfg *Config, t
 		return nil
 	}
 
+	if tgBot == nil {
+		return fmt.Errorf("telegram bot not initialized")
+	}
+
 	maxRetries := 10
 	baseDelay := 5 * time.Second
 	maxDelay := 5 * time.Minute
 
+	var sendErrors []error
+
 	for _, chatID := range cfg.ChatIDs {
 		delay := baseDelay
+		var lastErr error
 
 		for attempt := 1; attempt <= maxRetries; attempt++ {
 			select {
@@ -804,16 +964,20 @@ func sendToTelegramWithRetry(ctx context.Context, tgBot *bot.Bot, cfg *Config, t
 
 			slog.Debug("Sending to Telegram", "chat_id", chatID, "attempt", attempt)
 
-			_, err := tgBot.SendMessage(ctx, &bot.SendMessageParams{
+			sendCtx, cancel := context.WithTimeout(ctx, cfg.TelegramSendTimeout)
+			_, err := tgBot.SendMessage(sendCtx, &bot.SendMessageParams{
 				ChatID:    chatID,
 				Text:      text,
 				ParseMode: models.ParseModeHTML,
 			})
+			cancel()
 
 			if err == nil {
 				slog.Debug("Message sent successfully", "chat_id", chatID)
+				lastErr = nil
 				break
 			}
+			lastErr = err
 
 			slog.Warn("Failed to send to Telegram",
 				"chat_id", chatID,
@@ -823,7 +987,7 @@ func sendToTelegramWithRetry(ctx context.Context, tgBot *bot.Bot, cfg *Config, t
 			)
 
 			if attempt == maxRetries {
-				return fmt.Errorf("failed to send to chat %d after %d attempts: %w", chatID, maxRetries, err)
+				break
 			}
 
 			select {
@@ -838,6 +1002,14 @@ func sendToTelegramWithRetry(ctx context.Context, tgBot *bot.Bot, cfg *Config, t
 				delay = maxDelay
 			}
 		}
+
+		if lastErr != nil {
+			sendErrors = append(sendErrors, fmt.Errorf("failed to send to chat %d after %d attempts: %w", chatID, maxRetries, lastErr))
+		}
+	}
+
+	if len(sendErrors) > 0 {
+		return errors.Join(sendErrors...)
 	}
 
 	return nil

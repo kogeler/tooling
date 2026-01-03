@@ -274,25 +274,34 @@ func TestMultipartCollector(t *testing.T) {
 	}
 
 	// Add parts out of order
-	result := collector.Add(part2)
+	result, indices := collector.Add(2, part2)
 	if result != nil {
 		t.Error("Should return nil when message incomplete")
+	}
+	if len(indices) != 0 {
+		t.Errorf("Indices should be empty for incomplete message, got %v", indices)
 	}
 	if collector.Pending() != 1 {
 		t.Errorf("Pending() = %d, want 1", collector.Pending())
 	}
 
-	result = collector.Add(part1)
+	result, indices = collector.Add(1, part1)
 	if result != nil {
 		t.Error("Should return nil when message incomplete")
+	}
+	if len(indices) != 0 {
+		t.Errorf("Indices should be empty for incomplete message, got %v", indices)
 	}
 	if collector.Pending() != 1 {
 		t.Errorf("Pending() = %d, want 1", collector.Pending())
 	}
 
-	result = collector.Add(part3)
+	result, indices = collector.Add(3, part3)
 	if result == nil {
 		t.Fatal("Should return complete message")
+	}
+	if len(indices) != 3 || indices[0] != 1 || indices[1] != 2 || indices[2] != 3 {
+		t.Errorf("Indices = %v, want [1 2 3]", indices)
 	}
 
 	expectedText := "Part 1 text. Part 2 text. Part 3 text."
@@ -342,8 +351,8 @@ func TestMultipartCollectorDifferentSenders(t *testing.T) {
 		TotalParts:   2,
 	}
 
-	collector.Add(msg1)
-	collector.Add(msg2)
+	collector.Add(1, msg1)
+	collector.Add(2, msg2)
 
 	// Should have 2 pending (different senders)
 	if collector.Pending() != 2 {
@@ -361,12 +370,47 @@ func TestMultipartCollectorSinglePart(t *testing.T) {
 		IsMultipart: false,
 	}
 
-	result := collector.Add(msg)
+	result, indices := collector.Add(5, msg)
 	if result == nil {
 		t.Fatal("Non-multipart should be returned immediately")
 	}
+	if len(indices) != 1 || indices[0] != 5 {
+		t.Errorf("Indices = %v, want [5]", indices)
+	}
 	if result.Text != "Single message" {
 		t.Errorf("Text = %q, want %q", result.Text, "Single message")
+	}
+}
+
+func TestMultipartCollectorStaleIndices(t *testing.T) {
+	collector := NewMultipartCollector()
+	now := time.Now()
+
+	oldPart := &PDUMessage{
+		Sender:       "+1234567890",
+		Timestamp:    now.Add(-2 * time.Hour),
+		Text:         "Old part",
+		IsMultipart:  true,
+		MultipartRef: 1,
+		PartNumber:   1,
+		TotalParts:   2,
+	}
+	newPart := &PDUMessage{
+		Sender:       "+0987654321",
+		Timestamp:    now.Add(-30 * time.Minute),
+		Text:         "New part",
+		IsMultipart:  true,
+		MultipartRef: 2,
+		PartNumber:   1,
+		TotalParts:   2,
+	}
+
+	collector.Add(10, oldPart)
+	collector.Add(20, newPart)
+
+	stale := collector.StaleIndices(1*time.Hour, now)
+	if len(stale) != 1 || stale[0] != 10 {
+		t.Errorf("StaleIndices = %v, want [10]", stale)
 	}
 }
 
