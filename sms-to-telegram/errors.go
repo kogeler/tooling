@@ -5,9 +5,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -54,16 +56,21 @@ type ErrorNotifier struct {
 	chatIDs       []int64
 	dryRun        bool
 	hostname      string
+	sendTimeout   time.Duration
 }
 
 // NewErrorNotifier creates a new error notifier
-func NewErrorNotifier(tgBot *bot.Bot, chatIDs []int64, dryRun bool, hostname string) *ErrorNotifier {
+func NewErrorNotifier(tgBot *bot.Bot, chatIDs []int64, dryRun bool, hostname string, sendTimeout time.Duration) *ErrorNotifier {
+	if sendTimeout <= 0 {
+		sendTimeout = 20 * time.Second
+	}
 	return &ErrorNotifier{
 		lastErrorType: ErrTypeNone,
 		tgBot:         tgBot,
 		chatIDs:       chatIDs,
 		dryRun:        dryRun,
 		hostname:      hostname,
+		sendTimeout:   sendTimeout,
 	}
 }
 
@@ -80,7 +87,6 @@ func (n *ErrorNotifier) NotifyError(ctx context.Context, err *DiagnosticError) b
 	}
 
 	slog.Info("Sending error notification", "type", errorTypeName(err.Type), "previous", errorTypeName(n.lastErrorType))
-	n.lastErrorType = err.Type
 
 	// Format error message
 	msg := n.formatErrorMessage(err)
@@ -90,6 +96,8 @@ func (n *ErrorNotifier) NotifyError(ctx context.Context, err *DiagnosticError) b
 		slog.Error("Failed to send error notification to Telegram", "error", err)
 		return false
 	}
+
+	n.lastErrorType = err.Type
 
 	return true
 }
@@ -106,7 +114,6 @@ func (n *ErrorNotifier) NotifyRecovery(ctx context.Context) bool {
 	}
 
 	prevError := n.lastErrorType
-	n.lastErrorType = ErrTypeNone
 	slog.Info("Sending recovery notification", "previous_error", errorTypeName(prevError))
 
 	msg := fmt.Sprintf("<b>SMS Gateway Recovered</b>\n\n"+
@@ -120,6 +127,8 @@ func (n *ErrorNotifier) NotifyRecovery(ctx context.Context) bool {
 		slog.Error("Failed to send recovery notification to Telegram", "error", err)
 		return false
 	}
+
+	n.lastErrorType = ErrTypeNone
 
 	return true
 }
@@ -178,15 +187,22 @@ func (n *ErrorNotifier) sendToTelegram(ctx context.Context, text string) error {
 		return fmt.Errorf("telegram bot not initialized")
 	}
 
+	var sendErrors []error
 	for _, chatID := range n.chatIDs {
-		_, err := n.tgBot.SendMessage(ctx, &bot.SendMessageParams{
+		sendCtx, cancel := context.WithTimeout(ctx, n.sendTimeout)
+		_, err := n.tgBot.SendMessage(sendCtx, &bot.SendMessageParams{
 			ChatID:    chatID,
 			Text:      text,
 			ParseMode: models.ParseModeHTML,
 		})
+		cancel()
 		if err != nil {
-			return fmt.Errorf("failed to send to chat %d: %w", chatID, err)
+			sendErrors = append(sendErrors, fmt.Errorf("failed to send to chat %d: %w", chatID, err))
 		}
+	}
+
+	if len(sendErrors) > 0 {
+		return errors.Join(sendErrors...)
 	}
 
 	return nil

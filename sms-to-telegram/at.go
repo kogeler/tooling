@@ -56,10 +56,13 @@ func (s *SimpleAT) CommandWithTimeout(cmd string, timeout time.Duration) ([]stri
 	var gotOK, gotERROR bool
 	noDataCount := 0
 	maxNoData := int(timeout.Milliseconds() / 50) // Max iterations without data
+	if maxNoData < 1 {
+		maxNoData = 1
+	}
 
 	for time.Now().Before(deadline) {
 		line, err := reader.ReadString('\n')
-		if err != nil {
+		if err != nil && len(line) == 0 {
 			noDataCount++
 
 			// If we've been waiting too long without any data, modem might be disconnected
@@ -108,6 +111,11 @@ func (s *SimpleAT) CommandWithTimeout(cmd string, timeout time.Duration) ([]stri
 
 		// It's a response line
 		lines = append(lines, line)
+
+		// If we got partial data with an error, keep waiting for the rest.
+		if err != nil {
+			continue
+		}
 	}
 
 	if gotERROR {

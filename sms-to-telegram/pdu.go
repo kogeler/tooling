@@ -365,40 +365,54 @@ func decodeUCS2(data []byte) string {
 
 // MultipartCollector collects parts of multipart SMS messages
 type MultipartCollector struct {
-	parts map[string]map[int]*PDUMessage // key: "sender:ref", value: map of part# -> message
+	parts map[string]map[int]multipartPart // key: "sender:ref", value: map of part# -> part
+}
+
+type multipartPart struct {
+	index int
+	msg   *PDUMessage
 }
 
 // NewMultipartCollector creates a new collector
 func NewMultipartCollector() *MultipartCollector {
 	return &MultipartCollector{
-		parts: make(map[string]map[int]*PDUMessage),
+		parts: make(map[string]map[int]multipartPart),
 	}
 }
 
-// Add adds a message part and returns the complete message if all parts received
-func (c *MultipartCollector) Add(msg *PDUMessage) *PDUMessage {
+// Add adds a message part and returns the complete message plus indices if all parts received.
+func (c *MultipartCollector) Add(index int, msg *PDUMessage) (*PDUMessage, []int) {
 	if !msg.IsMultipart {
-		return msg
+		return msg, []int{index}
 	}
 
 	key := fmt.Sprintf("%s:%d", msg.Sender, msg.MultipartRef)
 
 	if c.parts[key] == nil {
-		c.parts[key] = make(map[int]*PDUMessage)
+		c.parts[key] = make(map[int]multipartPart)
 	}
 
-	c.parts[key][msg.PartNumber] = msg
+	c.parts[key][msg.PartNumber] = multipartPart{index: index, msg: msg}
 
 	// Check if we have all parts
 	if len(c.parts[key]) == msg.TotalParts {
+		parts := c.parts[key]
+		firstPart, ok := parts[1]
+		if !ok {
+			return nil, nil
+		}
+
 		// Assemble complete message
 		var fullText string
-		firstPart := c.parts[key][1]
+		indices := make([]int, 0, msg.TotalParts)
 
 		for i := 1; i <= msg.TotalParts; i++ {
-			if part, ok := c.parts[key][i]; ok {
-				fullText += part.Text
+			part, ok := parts[i]
+			if !ok {
+				return nil, nil
 			}
+			fullText += part.msg.Text
+			indices = append(indices, part.index)
 		}
 
 		// Clean up
@@ -406,17 +420,47 @@ func (c *MultipartCollector) Add(msg *PDUMessage) *PDUMessage {
 
 		// Return assembled message
 		return &PDUMessage{
-			Sender:    firstPart.Sender,
-			Timestamp: firstPart.Timestamp,
-			Text:      fullText,
-			SMSC:      firstPart.SMSC,
-		}
+			Sender:       firstPart.msg.Sender,
+			Timestamp:    firstPart.msg.Timestamp,
+			Text:         fullText,
+			SMSC:         firstPart.msg.SMSC,
+			IsMultipart:  true,
+			MultipartRef: msg.MultipartRef,
+			PartNumber:   1,
+			TotalParts:   msg.TotalParts,
+		}, indices
 	}
 
-	return nil // Not complete yet
+	return nil, nil // Not complete yet
 }
 
 // Pending returns number of incomplete multipart messages
 func (c *MultipartCollector) Pending() int {
 	return len(c.parts)
+}
+
+// StaleIndices returns indices of multipart parts older than maxAge.
+func (c *MultipartCollector) StaleIndices(maxAge time.Duration, now time.Time) []int {
+	if maxAge <= 0 {
+		return nil
+	}
+
+	var stale []int
+	for _, parts := range c.parts {
+		for _, part := range parts {
+			ts := part.msg.Timestamp
+			if ts.IsZero() {
+				continue
+			}
+			age := now.Sub(ts)
+			if age < 0 {
+				continue
+			}
+			if age >= maxAge {
+				stale = append(stale, part.index)
+			}
+		}
+	}
+
+	return stale
 }

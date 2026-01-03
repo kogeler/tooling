@@ -58,6 +58,19 @@ func TestSimpleAT_Command_OK(t *testing.T) {
 	}
 }
 
+func TestSimpleAT_Command_OK_NoNewline(t *testing.T) {
+	port := newMockPort("AT\r\nOK")
+	at := NewSimpleAT(port, 1*time.Second)
+
+	lines, err := at.Command("AT")
+	if err != nil {
+		t.Fatalf("Command() error = %v", err)
+	}
+	if len(lines) != 0 {
+		t.Errorf("Expected 0 lines, got %d", len(lines))
+	}
+}
+
 func TestSimpleAT_Command_WithResponse(t *testing.T) {
 	port := newMockPort("AT+CPIN?\r\n+CPIN: READY\r\nOK\r\n")
 	at := NewSimpleAT(port, 1*time.Second)
