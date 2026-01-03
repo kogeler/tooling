@@ -6,20 +6,26 @@
 set -euo pipefail
 
 DEFAULT_BAUD="115200"
+DEFAULT_NAME="sms-to-telegram"
 BIN_BASE_URL="https://github.com/kogeler/tooling/releases/download/sms-to-telegram"
 SERVICE_URL="https://raw.githubusercontent.com/kogeler/tooling/refs/heads/main/sms-to-telegram/docs/sms-to-telegram.service"
 
 usage() {
   cat <<'EOF'
-Usage: install.sh --name NAME --serial /dev/ttyUSB0 --token BOT_TOKEN --chats id1,id2 [--baud 115200] [--version X.Y.Z]
+Usage:
+  install.sh [--name NAME] --serial /dev/ttyUSB0 --token BOT_TOKEN --chats id1,id2 [--baud 115200] [--version X.Y.Z]
+  install.sh --update [--name NAME] [--version X.Y.Z]
 
-Required:
-  --name    Installation name (used for /opt/<name> and service name)
+Install (default):
   --serial  Serial port path for the modem (e.g., /dev/ttyUSB0)
   --token   Telegram bot token
   --chats   Comma-separated list of chat IDs
 
+Update-only:
+  --update  Update binary and restart service (no config changes)
+
 Optional:
+  --name    Installation name (used for /opt/<name> and service name; default: sms-to-telegram)
   --baud    Serial port baud rate (default: 115200)
   --version Binary version (e.g., 1.0.2). Default: latest build without version suffix.
 EOF
@@ -35,15 +41,20 @@ if [[ $# -eq 0 ]]; then
   usage
 fi
 
-NAME=""
+NAME="$DEFAULT_NAME"
 SERIAL_PORT=""
 TELEGRAM_TOKEN=""
 CHAT_IDS=""
 BAUD_RATE="$DEFAULT_BAUD"
 VERSION=""
+UPDATE_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --update)
+      UPDATE_ONLY=1
+      shift
+      ;;
     --name)
       NAME="${2:-}"
       shift 2
@@ -78,9 +89,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$NAME" || -z "$SERIAL_PORT" || -z "$TELEGRAM_TOKEN" || -z "$CHAT_IDS" ]]; then
-  echo "Missing required arguments."
-  usage
+if [[ -z "$NAME" ]]; then
+  echo "Installation name must not be empty."
+  exit 1
+fi
+
+if [[ "$UPDATE_ONLY" -eq 0 ]]; then
+  if [[ -z "$SERIAL_PORT" || -z "$TELEGRAM_TOKEN" || -z "$CHAT_IDS" ]]; then
+    echo "Missing required arguments."
+    usage
+  fi
 fi
 
 if [[ "$NAME" =~ [^a-zA-Z0-9_.-] ]]; then
@@ -88,14 +106,16 @@ if [[ "$NAME" =~ [^a-zA-Z0-9_.-] ]]; then
   exit 1
 fi
 
-if [[ "$SERIAL_PORT" != /* ]]; then
-  echo "Serial port path must be absolute (e.g., /dev/ttyUSB0)."
-  exit 1
-fi
+if [[ "$UPDATE_ONLY" -eq 0 ]]; then
+  if [[ "$SERIAL_PORT" != /* ]]; then
+    echo "Serial port path must be absolute (e.g., /dev/ttyUSB0)."
+    exit 1
+  fi
 
-if [[ ! "$BAUD_RATE" =~ ^[0-9]+$ ]]; then
-  echo "Baud rate must be numeric."
-  exit 1
+  if [[ ! "$BAUD_RATE" =~ ^[0-9]+$ ]]; then
+    echo "Baud rate must be numeric."
+    exit 1
+  fi
 fi
 
 if [[ -n "$VERSION" && "$VERSION" =~ [^a-zA-Z0-9_.-] ]]; then
@@ -143,15 +163,45 @@ if [[ -n "$VERSION" ]]; then
 fi
 BIN_URL="${BIN_BASE_URL}/${BIN_FILE}"
 
+TMP_BIN="$(mktemp)"
+TMP_SERVICE=""
+cleanup() {
+  if [[ -n "$TMP_BIN" ]]; then
+    rm -f "$TMP_BIN"
+  fi
+  if [[ -n "$TMP_SERVICE" ]]; then
+    rm -f "$TMP_SERVICE"
+  fi
+}
+trap cleanup EXIT
+
+if [[ "$UPDATE_ONLY" -eq 1 ]]; then
+  if [[ ! -d "$INSTALL_DIR" ]]; then
+    echo "Install directory ${INSTALL_DIR} not found. Run full install first."
+    exit 1
+  fi
+
+  if [[ ! -f "$SERVICE_PATH" ]]; then
+    echo "Service unit ${SERVICE_PATH} not found. Run full install first."
+    exit 1
+  fi
+
+  echo "Downloading binary for ${BIN_ARCH}..."
+  curl -fsSL "$BIN_URL" -o "$TMP_BIN"
+  install -m 0755 -o root -g root "$TMP_BIN" "$BIN_PATH"
+
+  echo "Restarting service ${SERVICE_NAME}..."
+  systemctl restart "$SERVICE_NAME"
+
+  echo "Update complete. Service status:"
+  systemctl --no-pager --full status "$SERVICE_NAME"
+  exit 0
+fi
+
 echo "Creating install directory at ${INSTALL_DIR}..."
 mkdir -p "$INSTALL_DIR"
 
-TMP_BIN="$(mktemp)"
 TMP_SERVICE="$(mktemp)"
-cleanup() {
-  rm -f "$TMP_BIN" "$TMP_SERVICE"
-}
-trap cleanup EXIT
 
 echo "Downloading binary for ${BIN_ARCH}..."
 curl -fsSL "$BIN_URL" -o "$TMP_BIN"
