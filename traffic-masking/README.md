@@ -1,6 +1,6 @@
 # Traffic Masking System
 
-UDP-based cover traffic generator designed to mask traffic patterns inside encrypted tunnels (VPN/WireGuard) and defeat traffic analysis including ML-based detection.
+UDP-based cover traffic generator designed to mask traffic patterns inside encrypted tunnels and defeat traffic analysis including ML-based detection.
 
 ## Features
 
@@ -10,6 +10,7 @@ UDP-based cover traffic generator designed to mask traffic patterns inside encry
 - **ML resistance**: Advanced obfuscation techniques
 - **Protocol mimicry**: 6 traffic profiles (web, video, voip, file, gaming, mixed)
 - **Bidirectional flow**: Adaptive client uplink response
+- **Auto-reconnection**: Client recovers automatically after server restart or network loss
 
 ## Installation
 
@@ -52,11 +53,14 @@ python traffic_masking_client.py \
 ## Testing
 
 ```bash
-# Run complete test suite
+# Run complete test suite (includes reconnection test)
 python test_traffic_masking.py
 
 # Quick 10-second test
 python test_traffic_masking.py --quick
+
+# Module tests only (no network transmission)
+python test_traffic_masking.py --modules-only
 ```
 
 ## Key Parameters

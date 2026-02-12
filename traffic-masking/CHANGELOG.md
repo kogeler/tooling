@@ -5,6 +5,26 @@ All notable changes to the Traffic Masking System will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2025-02-12
+
+### Fixed
+- Client now automatically reconnects after server restart or network loss
+- Previously, the client sent `INIT_CLIENT` only once at startup; after server restart the client was permanently forgotten and traffic never resumed
+
+### Added
+- Periodic keepalive packets (every 5s) to maintain server registration
+- Connection loss detection (10s receive timeout)
+- Automatic reconnection with exponential backoff (1s to 30s)
+- Socket timeout on client to prevent indefinite blocking in receive loop
+- Connection status (`connected`/`disconnected`) in client stats output
+- Reconnection test (`run_reconnection_test`) in the test suite — 3-phase test covering initial connection, server kill, and recovery after server restart
+
+## [1.0.1] - 2024-12-20
+
+### Added
+- Rate limiting patterns
+- A test script for rate limiting patterns
+
 ## [1.0.0] - 2024-12-20
 
 ### Added
@@ -79,15 +99,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned
+- Traffic-aware adaptive mode with tunnel interface monitoring
+- Aggregate profile validation and real-time adjustment
+- Upload/download ratio compensation
+- Realistic session scheduling with idle periods
 - Performance optimization with Cython/Rust modules
 - Additional protocol profiles
-- Enhanced machine learning evasion techniques
 - Built-in traffic analysis tools
-- GUI for configuration and monitoring
-
-
-## [1.0.1] - 2024-12-20
-
-### Added
-- Rate limiting patterns
-- A test script for rate limiting patterns

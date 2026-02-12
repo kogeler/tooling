@@ -84,6 +84,8 @@ GOOS=linux GOARCH=arm64 go build -o sms-to-telegram-arm64 .
 
 ### Remote install (script)
 
+For install and update, you can optionally pass `--version X.Y.Z`; if omitted, the latest build is used.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kogeler/tooling/refs/heads/main/sms-to-telegram/docs/install.sh | \
   sudo bash -s -- \
@@ -92,6 +94,15 @@ curl -fsSL https://raw.githubusercontent.com/kogeler/tooling/refs/heads/main/sms
     --token "your-bot-token" \
     --chats "-100123456789,987654321" \
     --baud 115200
+```
+
+Update binary only:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kogeler/tooling/refs/heads/main/sms-to-telegram/docs/install.sh | \
+  sudo bash -s -- \
+    --update \
+    --name sms-to-telegram
 ```
 
 ### Manual install (build + systemd)

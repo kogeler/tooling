@@ -1,0 +1,12 @@
+{
+  "version": 0,
+  "descriptorPath": ".papi/descriptors",
+  "entries": {
+    "ah": {
+      "wsUrl": "wss://rpc-assethub.novasama-tech.org",
+      "metadata": ".papi/metadata/ah.scale",
+      "genesis": "0x68d56f15f85d3136970ec16946040bc1752654e906147f7e43e9d539d7c3de2f",
+      "codeHash": "0x459e6d0d0ce817a0332b56c9fa22a5b0e7b2fd0f7c59adb2d761cd9ff8441274"
+    }
+  }
+}
