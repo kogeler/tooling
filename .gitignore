@@ -5,6 +5,7 @@ __pycache__
 traffic-masking/*.log
 .gocache
 tokens.sh
+node_modules
 
 # binaries
 sms-to-telegram/sms-to-telegram
