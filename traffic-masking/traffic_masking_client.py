@@ -88,26 +88,34 @@ class AdaptiveTrafficClient:
         self.socket = init_udp_socket(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
         self.socket.settimeout(2.0)
 
-    def _register(self):
-        """Send registration packet to the server"""
+    def _send_registration(self):
+        """Send registration packet to the server (UDP: no delivery guarantee)"""
         try:
             self.socket.sendto(b"INIT_CLIENT", self.server_addr)
-            self.connected = True
-            self.last_received = time.time()
             print(
                 f"[*] Registration sent to {self.server_host}:{self.server_port}",
                 flush=True,
             )
+            return True
         except Exception as e:
             print(f"[!] Registration failed: {e}", flush=True)
-            self.connected = False
+            return False
+
+    def _wait_for_server(self, timeout=5.0):
+        """Wait for actual data from the server to confirm connection"""
+        deadline = time.time() + timeout
+        while time.time() < deadline and self.running:
+            if self.connected:
+                return True
+            time.sleep(0.2)
+        return self.connected
 
     def _reconnect(self):
         """Reconnect to the server with exponential backoff"""
         delay = self.RECONNECT_DELAY_MIN
         while self.running:
             print(
-                f"[*] Reconnecting in {delay:.1f}s...",
+                f"[*] Attempting reconnect in {delay:.1f}s...",
                 flush=True,
             )
             time.sleep(delay)
@@ -115,13 +123,15 @@ class AdaptiveTrafficClient:
                 break
             try:
                 self._create_socket()
-                self._register()
-                if self.connected:
+                self._send_registration()
+                # Wait for actual server response to confirm connection
+                if self._wait_for_server(timeout=delay + 2.0):
                     print("[*] Reconnected successfully", flush=True)
-                    # Reset rate tracking for fresh start
                     self.received_rate = 0
                     self.rate_window.clear()
                     return
+                else:
+                    print("[!] No response from server", flush=True)
             except Exception as e:
                 print(f"[!] Reconnect failed: {e}", flush=True)
             delay = min(delay * 2, self.RECONNECT_DELAY_MAX)
@@ -144,7 +154,8 @@ class AdaptiveTrafficClient:
             )
 
         # Send initial registration packet
-        self._register()
+        self._send_registration()
+        self.last_received = time.time()  # Grace period for initial connection
 
         # Start threads
         threading.Thread(target=self.receive_loop, daemon=True).start()
@@ -247,12 +258,6 @@ class AdaptiveTrafficClient:
             if not self.running:
                 break
 
-            # Send keepalive to stay registered on the server
-            try:
-                self.socket.sendto(b"KEEPALIVE", self.server_addr)
-            except Exception:
-                pass
-
             # Check if we've lost the connection
             if (
                 self.last_received > 0
@@ -265,6 +270,14 @@ class AdaptiveTrafficClient:
                 self.connected = False
                 self.received_rate = 0
                 self._reconnect()
+                # After _reconnect returns (success), resume keepalive loop
+                continue
+
+            # Send keepalive to stay registered on the server
+            try:
+                self.socket.sendto(b"KEEPALIVE", self.server_addr)
+            except Exception:
+                pass
 
     def send_loop(self):
         """Generate uplink traffic"""
