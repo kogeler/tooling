@@ -604,14 +604,39 @@ def run_reconnection_test(port=8889):
         with open(client_log_path, "r") as f:
             loss_log = f.read()
 
-        if (
-            "disconnected" in loss_log
-            or "Connection lost" in loss_log
-            or "Reconnecting" in loss_log
-        ):
+        if "Connection lost" in loss_log:
             print("✓ Phase 2: Client detected connection loss")
         else:
             print("⚠ Phase 2: Client may not have detected loss (checking Phase 3)")
+
+        # Verify client does NOT falsely report successful reconnection while server is down
+        # Split log into lines after "Connection lost" to check behavior during downtime
+        loss_idx = loss_log.find("Connection lost")
+        if loss_idx >= 0:
+            downtime_log = loss_log[loss_idx:]
+            false_reconnects = downtime_log.count("Reconnected successfully")
+            if false_reconnects > 0:
+                print(
+                    f"✗ Phase 2: Client falsely reported 'Reconnected successfully' {false_reconnects} time(s) while server was down"
+                )
+                test_results["transmission"]["reconnect"] = False
+                return False
+            else:
+                print("✓ Phase 2: No false reconnection reports during server downtime")
+
+            # Verify client shows disconnected status (not connected) during downtime
+            downtime_stats = [l for l in downtime_log.splitlines() if "[STATS]" in l]
+            false_connected = [l for l in downtime_stats if "Status: connected" in l]
+            if false_connected:
+                print(
+                    f"✗ Phase 2: Client reported 'connected' status {len(false_connected)} time(s) while server was down"
+                )
+                test_results["transmission"]["reconnect"] = False
+                return False
+            else:
+                print(
+                    "✓ Phase 2: Client correctly reported disconnected status during downtime"
+                )
 
         # Phase 3: Restart server, verify client reconnects and resumes traffic
         print("[RECONN] Phase 3: Restarting server...")
@@ -644,8 +669,19 @@ def run_reconnection_test(port=8889):
             test_results["transmission"]["reconnect"] = False
             return False
 
-        # Check if the last few stats lines show data reception
+        # Verify "Reconnected successfully" appears after server restart
+        # (should only appear now, not during Phase 2 downtime)
+        has_reconnected_msg = "Reconnected successfully" in full_log
+        if has_reconnected_msg:
+            print("✓ Phase 3: Client reported successful reconnection")
+        else:
+            print("✗ Phase 3: Client never reported 'Reconnected successfully'")
+            test_results["transmission"]["reconnect"] = False
+            return False
+
+        # Check the last few stats lines show connected status and data flow
         last_stats = stats_lines[-3:]
+        has_connected_status = any("Status: connected" in l for l in last_stats)
         recovered = False
         for line in last_stats:
             rx_match = re.search(r"Rx:\s*([0-9.]+)\s*Mbps", line)
@@ -653,24 +689,16 @@ def run_reconnection_test(port=8889):
                 recovered = True
                 break
 
-        # Also check for connected status in recent lines
-        has_connected_status = any(
-            "connected" in l and "disconnected" not in l
-            for l in full_log.splitlines()[-10:]
-            if "[STATS]" in l
-        )
-
-        # Check for reconnection log messages
-        has_reconnect_msg = "Reconnect" in full_log or "Registration sent" in full_log
-
-        if recovered or has_connected_status:
-            print("✓ Phase 3: Client reconnected and resumed receiving data")
+        if has_connected_status and recovered:
+            print("✓ Phase 3: Client connected and receiving data after recovery")
             test_results["transmission"]["reconnect"] = True
             success = True
-        elif has_reconnect_msg:
-            print(
-                "✓ Phase 3: Client attempted reconnection (traffic may still be ramping up)"
-            )
+        elif has_connected_status:
+            print("✓ Phase 3: Client connected (traffic still ramping up)")
+            test_results["transmission"]["reconnect"] = True
+            success = True
+        elif recovered:
+            print("✓ Phase 3: Client receiving data after recovery")
             test_results["transmission"]["reconnect"] = True
             success = True
         else:

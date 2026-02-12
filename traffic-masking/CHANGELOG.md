@@ -5,6 +5,23 @@ All notable changes to the Traffic Masking System will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2025-02-12
+
+### Fixed
+- Client no longer falsely reports "Reconnected successfully" when server is unreachable
+- Connection status now reflects actual data flow, not just successful UDP send
+- Exponential backoff now works correctly (was resetting every cycle due to false success)
+
+### Changed
+- Reconnection logic now waits for actual server response before confirming connection
+- Keepalive is only sent when connected; on timeout the client enters reconnect loop first
+- All Russian comments in source code translated to English
+
+### Improved
+- Reconnection test now validates no false reconnection reports during server downtime
+- Reconnection test verifies client shows `disconnected` status while server is down
+- Reconnection test requires `Reconnected successfully` message only after real server recovery
+
 ## [1.0.3] - 2025-02-12
 
 ### Fixed
