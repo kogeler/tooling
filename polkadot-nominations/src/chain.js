@@ -23,6 +23,14 @@ export async function fetchCommissions(api) {
   return map;
 }
 
+export async function fetchActiveValidators(api) {
+  const era = await api.query.Staking.ActiveEra.getValue();
+  const entries = await api.query.Staking.ErasStakersOverview.getEntries(
+    era.index,
+  );
+  return entries.map((e) => e.keyArgs[1]);
+}
+
 export async function fetchNominators(api) {
   return api.query.Staking.Nominators.getEntries();
 }

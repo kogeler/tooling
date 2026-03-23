@@ -1,3 +1,5 @@
 node_modules/
 .papi/descriptors/
 .papi/metadata/
+config.json
+nominations.json

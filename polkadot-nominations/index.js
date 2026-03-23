@@ -1,6 +1,7 @@
 import { validator, minStakeDot, rpcUrl } from "./src/config.js";
 import {
   connect,
+  fetchActiveValidators,
   fetchCommissions,
   fetchNominators,
   fetchStakes,
@@ -15,14 +16,36 @@ async function main() {
   const { client, api } = connect();
 
   console.error("Fetching chain data...");
-  const [commissions, nominatorEntries, stakes] = await Promise.all([
-    fetchCommissions(api),
-    fetchNominators(api),
-    fetchStakes(api),
-  ]);
+  const [activeValidators, commissions, nominatorEntries, stakes] =
+    await Promise.all([
+      fetchActiveValidators(api),
+      fetchCommissions(api),
+      fetchNominators(api),
+      fetchStakes(api),
+    ]);
+  const activeSet = new Set(activeValidators);
   console.error(
-    `Loaded: ${commissions.size} validators, ${nominatorEntries.length} nominators, ${stakes.size} ledgers`,
+    `Loaded: ${commissions.size} validators (${activeSet.size} active), ${nominatorEntries.length} nominators, ${stakes.size} ledgers`,
   );
+
+  const SELF_STAKE_THRESHOLD = 10_000;
+  let activeAbove = 0;
+  let allAbove = 0;
+  for (const addr of commissions.keys()) {
+    const selfStake = stakes.get(addr) ?? 0;
+    if (selfStake >= SELF_STAKE_THRESHOLD) {
+      allAbove++;
+      if (activeSet.has(addr)) activeAbove++;
+    }
+  }
+  const activeSelfStakePct =
+    activeSet.size > 0
+      ? Math.round((activeAbove / activeSet.size) * 1e4) / 1e2
+      : 0;
+  const allSelfStakePct =
+    commissions.size > 0
+      ? Math.round((allAbove / commissions.size) * 1e4) / 1e2
+      : 0;
 
   const nominations = [];
   const uniqueTargets = new Map();
@@ -66,6 +89,8 @@ async function main() {
     validator,
     total_nominators: nominations.length,
     unique_targets: uniqueTargets.size,
+    active_validators_self_stake_gte_10k_pct: activeSelfStakePct,
+    all_validators_self_stake_gte_10k_pct: allSelfStakePct,
     ...calcPercentiles([...uniqueTargets.values()], {
       descending: true,
       prefix: "commission_",
