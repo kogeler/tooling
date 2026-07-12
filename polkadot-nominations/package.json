@@ -13,7 +13,7 @@
   "description": "Fetch all nominations from Polkadot Asset Hub",
   "dependencies": {
     "@polkadot-api/descriptors": "file:.papi/descriptors",
-    "polkadot-api": "^1.23.3",
+    "polkadot-api": "^2.1.7",
     "ws": "^8.19.0"
   }
 }
