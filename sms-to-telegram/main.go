@@ -479,7 +479,11 @@ func run(ctx context.Context, cfg *Config) error {
 	// only several consecutive failures mean the modem is really gone.
 	consecutiveSessionFailures := 0
 	const sessionFailureAlertThreshold = 3
-	onHealthy := func() { consecutiveSessionFailures = 0 }
+	escalator := &resetEscalator{}
+	onHealthy := func() {
+		consecutiveSessionFailures = 0
+		escalator.Healthy()
+	}
 
 	wait := func(d time.Duration) bool {
 		select {
@@ -516,6 +520,11 @@ func run(ctx context.Context, cfg *Config) error {
 
 			// Determine if we need a modem reset on the next attempt.
 			needReset = needsModemReset(diagErr.Type)
+			if forced := escalator.Observe(diagErr.Type); forced && !needReset {
+				needReset = true
+				slog.Warn("Escalating to modem reset after repeated failures",
+					"type", errorTypeName(diagErr.Type), "streak", escalator.streak)
+			}
 			if needReset {
 				slog.Info("Will perform modem reset on next attempt")
 			}
@@ -641,6 +650,37 @@ func initModemSession(modem ATCommander) (simUsed, simTotal int, err error) {
 
 	slog.Info("Modem session initialized", "sim_used", simUsed, "sim_total", simTotal)
 	return simUsed, simTotal, nil
+}
+
+// resetEscalator forces a last-resort AT+CFUN reset when the same diagnostic
+// condition (by alertGroup) repeats with no healthy session in between.
+// Wedge states whose type normally never resets (persistent command failures,
+// radio outages where a re-registration may help) get one escalated reset on
+// every escalateEvery-th consecutive occurrence instead of retrying forever.
+type resetEscalator struct {
+	lastGroup DiagnosticErrorType
+	streak    int
+}
+
+const escalateEvery = 3
+
+// Observe records a diagnostic failure and reports whether a reset should be
+// forced in addition to the type's own reset policy.
+func (e *resetEscalator) Observe(t DiagnosticErrorType) bool {
+	group := alertGroup(t)
+	if group == e.lastGroup {
+		e.streak++
+	} else {
+		e.lastGroup = group
+		e.streak = 1
+	}
+	return e.streak%escalateEvery == 0
+}
+
+// Healthy resets the streak after a fully initialized, diagnosed session.
+func (e *resetEscalator) Healthy() {
+	e.lastGroup = ErrTypeNone
+	e.streak = 0
 }
 
 // needsModemReset reports whether a diagnostic error type warrants a full

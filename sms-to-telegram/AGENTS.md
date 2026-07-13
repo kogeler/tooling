@@ -98,6 +98,19 @@ Two distinct error families — keep them separate when changing code:
   everything for the next poll, `deliveryRejected` retains + alerts once +
   skips that message (in-memory set), `deliveryDone` deletes.
 
+Alerting rules on top of the two families:
+
+- Dedup is by `alertGroup`, not raw type: NoSignal and NetworkNotRegistered
+  are one group (flapping weak coverage must not re-alert per flip).
+- Destination failures (401/403/404: kicked bot, deleted chat) are handled by
+  the Deliverer with stateless per-chat dedup (`destIssue`) plus a "work
+  again" notice — deliberately OUTSIDE the notifier's chat-state machine, so
+  a modem session restart never announces a false "Recovered" while a
+  Telegram destination is still broken. Keep it that way.
+- `resetEscalator`: after `escalateEvery` consecutive failures of one
+  condition group with no healthy session, a last-resort `AT+CFUN` reset is
+  forced even for types outside `needsModemReset`.
+
 ## Key invariants — do not break
 
 1. **Never delete an SMS from the SIM before that SMS (all chunks, all parts)
@@ -199,9 +212,13 @@ Rules:
   service is down for the duration.
 - The SUBMIT encoder lives in the untagged `livesend_test.go` so encoder ↔
   production-decoder round trips run in ordinary CI; keep it that way.
-- Not covered (manual only): alphanumeric senders, alert/negative paths
-  (antenna off, SIM out), CFUN reset, the >4096-char chunking scenario
-  (~30 real SMS per run).
+- `TestLive_FlightModeRadioRecovery` needs only `LIVE_SERIAL_PORT` and costs
+  no SMS: it drives a real radio outage via `AT+CFUN=4` (flight mode — the
+  modem truthfully reports no service, equivalent to shielding for everything
+  the software can observe), asserts the radio-group diagnosis, and verifies
+  the escalation-style `AT+CFUN` cycle restores a passing diagnosis.
+- Not covered (manual only): alphanumeric senders, physical SIM-out/USB-replug
+  paths, the >4096-char chunking scenario (~30 real SMS per run).
 
 ## Dependencies
 

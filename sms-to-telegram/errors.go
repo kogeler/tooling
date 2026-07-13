@@ -94,10 +94,23 @@ func NewErrorNotifier(sender TelegramSender, chatIDs []int64, dryRun bool, hostn
 	}
 }
 
+// alertGroup maps diagnostic error types onto deduplication groups. No-signal
+// and not-registered are physically one flapping condition (weak/absent
+// coverage): a marginal site alternates between CSQ=99 and CREG=2 across
+// diagnostic runs, and alternating alert types must not pierce deduplication.
+func alertGroup(t DiagnosticErrorType) DiagnosticErrorType {
+	switch t {
+	case ErrTypeNoSignal, ErrTypeNetworkNotRegistered:
+		return ErrTypeNoSignal // canonical representative of the radio group
+	default:
+		return t
+	}
+}
+
 // NotifyError sends error notification to every chat whose last delivered
-// state differs from this error type. Returns true if at least one chat was
-// notified. A chat whose send fails keeps its old state and is retried on the
-// next NotifyError call.
+// state is in a different dedup group than this error. Returns true if at
+// least one chat was notified. A chat whose send fails keeps its old state
+// and is retried on the next NotifyError call.
 func (n *ErrorNotifier) NotifyError(ctx context.Context, diagErr *DiagnosticError) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -105,7 +118,10 @@ func (n *ErrorNotifier) NotifyError(ctx context.Context, diagErr *DiagnosticErro
 	msg := n.formatErrorMessage(diagErr)
 	notified := false
 	for _, chatID := range n.chatIDs {
-		if n.chatState[chatID] == diagErr.Type {
+		if alertGroup(n.chatState[chatID]) == alertGroup(diagErr.Type) {
+			// Same condition (possibly a refined sibling type): remember the
+			// latest type silently so recovery names the current state.
+			n.chatState[chatID] = diagErr.Type
 			slog.Debug("Skipping duplicate error notification",
 				"chat_id", chatID, "type", errorTypeName(diagErr.Type))
 			continue

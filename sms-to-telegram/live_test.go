@@ -27,6 +27,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -320,4 +321,95 @@ func TestLive_GSM7FinnishChars(t *testing.T) {
 		t.Errorf("round trip text = %q, want %q", pending.Message.Text, body)
 	}
 	h.deliverAndVerify(pending)
+}
+
+// setupLiveModem is the lightweight variant of setupLive for tests that only
+// need the modem (no Telegram, no SMS cost): it requires just LIVE_SERIAL_PORT.
+func setupLiveModem(t *testing.T) *SimpleAT {
+	t.Helper()
+
+	portPath := os.Getenv("LIVE_SERIAL_PORT")
+	if portPath == "" {
+		t.Skip("live env not configured: need LIVE_SERIAL_PORT")
+	}
+	baud := 115200
+	if s := os.Getenv("LIVE_BAUD_RATE"); s != "" {
+		var err error
+		if baud, err = strconv.Atoi(s); err != nil {
+			t.Fatalf("invalid LIVE_BAUD_RATE %q", s)
+		}
+	}
+
+	p, err := serial.OpenPort(&serial.Config{Name: portPath, Baud: baud, ReadTimeout: 500 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("open serial port (is the sms-to-telegram service stopped?): %v", err)
+	}
+	t.Cleanup(func() { p.Close() })
+
+	modem := NewSimpleAT(p, 5*time.Second)
+	if _, _, err := initModemSession(modem); err != nil {
+		t.Fatalf("initModemSession: %v", err)
+	}
+	return modem
+}
+
+// TestLive_FlightModeRadioRecovery drives a real radio outage without any RF
+// shielding: AT+CFUN=4 (flight mode) makes the modem genuinely report a lost
+// network, diagnostics must classify it as a radio-group error, and the same
+// AT+CFUN cycle the reset escalation performs must bring the radio back to a
+// passing diagnosis. Costs no SMS and needs no Telegram configuration.
+func TestLive_FlightModeRadioRecovery(t *testing.T) {
+	modem := setupLiveModem(t)
+
+	// Whatever happens, never leave the modem in flight mode. Note: on SIM800
+	// R14.18 the CFUN setting SURVIVES a power cycle, so an aborted run would
+	// otherwise leave the modem radio-dead until someone sends CFUN=1.
+	t.Cleanup(func() {
+		if modem.Poisoned() {
+			t.Log("cleanup: session poisoned, cannot restore CFUN=1")
+			return
+		}
+		modem.CommandWithTimeout("AT+CFUN=1", 20*time.Second)
+	})
+
+	// Precondition: force full functionality, healing any flight mode left
+	// over from a previously aborted run (see the cleanup note above).
+	if _, err := modem.CommandWithTimeout("AT+CFUN=1", 20*time.Second); err != nil {
+		t.Fatalf("AT+CFUN=1 precondition: %v", err)
+	}
+	time.Sleep(2 * time.Second)
+
+	// Baseline: radio healthy.
+	if err := runModemDiagnostics(context.Background(), modem, clk.Now(), 90*time.Second); err != nil {
+		t.Fatalf("baseline diagnostics: %v", err)
+	}
+
+	// Radio off. The modem now truthfully reports no service; with a short
+	// grace the diagnostics must return a radio-group error.
+	if _, err := modem.CommandWithTimeout("AT+CFUN=4", 15*time.Second); err != nil {
+		t.Fatalf("AT+CFUN=4: %v", err)
+	}
+	time.Sleep(2 * time.Second)
+
+	err := runModemDiagnostics(context.Background(), modem, clk.Now(), 15*time.Second)
+	var diagErr *DiagnosticError
+	if !errors.As(err, &diagErr) {
+		t.Fatalf("diagnostics with radio off: err = %v, want DiagnosticError", err)
+	}
+	if alertGroup(diagErr.Type) != alertGroup(ErrTypeNoSignal) {
+		t.Fatalf("radio-off verdict = %s, want the radio group (No Signal / Not Registered)",
+			errorTypeName(diagErr.Type))
+	}
+	t.Logf("radio-off verdict: %s (%s)", errorTypeName(diagErr.Type), diagErr.Message)
+
+	// The cure applied by the reset escalation: a CFUN cycle back to full
+	// functionality. Diagnostics must pass again within a registration grace.
+	if _, err := modem.CommandWithTimeout("AT+CFUN=1", 20*time.Second); err != nil {
+		t.Fatalf("AT+CFUN=1: %v", err)
+	}
+	time.Sleep(2 * time.Second)
+	if err := runModemDiagnostics(context.Background(), modem, clk.Now(), 90*time.Second); err != nil {
+		t.Fatalf("diagnostics after radio restore: %v", err)
+	}
+	t.Log("radio restored and re-registered")
 }

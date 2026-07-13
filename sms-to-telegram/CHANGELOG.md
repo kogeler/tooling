@@ -105,6 +105,18 @@
 - Notifier keeps per-chat delivered state: a chat that missed an alert is
   retried without spamming the others; recovery goes only to chats that saw
   the error.
+- "No signal" and "not registered" alerts form one deduplication group —
+  flapping weak coverage no longer produces an alert on every flip between
+  the two states.
+- Telegram destination failures (kicked bot, deleted chat) alert once per
+  chat via a stateless path and send a one-time notice when the chat works
+  again; they no longer latch into the modem-recovery state, which used to
+  produce a false "Recovered" plus a repeated alert on every session restart.
+- Last-resort reset escalation: three consecutive failures of the same
+  condition without a healthy session force an `AT+CFUN` reset even for
+  error types that normally never reset.
+- Documentation now recommends a stable `/dev/serial/by-id/...` path for
+  `SERIAL_PORT` (`ttyUSBn` names change on USB re-enumeration).
 - All dynamic values in notifications are HTML-escaped — raw modem output can
   no longer make Telegram reject the alert itself.
 - SIM storage monitoring: usage is checked at session start and on every
@@ -156,7 +168,8 @@
   network round trip, decoding, multipart assembly, real Telegram delivery,
   SIM cleanup. Scenarios: GSM7, UCS2 with Cyrillic + emoji, 3-part
   concatenated message, GSM7 national characters; foreign SMS on the SIM are
-  never touched.
+  never touched. A flight-mode scenario (AT+CFUN=4, no SMS cost) drives a real
+  radio outage and verifies the radio diagnosis and CFUN recovery cycle.
 
 ## 1.1.0
 

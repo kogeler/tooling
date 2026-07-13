@@ -99,6 +99,11 @@ type Deliverer struct {
 	// fingerprint) so they are not re-sent to already-delivered chats on
 	// every poll; the SIM slot stays until removed manually.
 	rejected map[string]struct{}
+	// destIssue tracks per-chat destination failures (kicked bot, deleted
+	// chat) with stateless dedup, deliberately OUTSIDE the modem-recovery
+	// state machine: a modem session restart must not announce a false
+	// "Recovered" while a Telegram destination is still broken.
+	destIssue map[int64]bool
 }
 
 func NewDeliverer(sender TelegramSender, notifier *ErrorNotifier, cfg *Config) *Deliverer {
@@ -108,6 +113,7 @@ func NewDeliverer(sender TelegramSender, notifier *ErrorNotifier, cfg *Config) *
 		cfg:           cfg,
 		cooldownUntil: make(map[int64]time.Time),
 		rejected:      make(map[string]struct{}),
+		destIssue:     make(map[int64]bool),
 	}
 }
 
@@ -197,6 +203,7 @@ func (d *Deliverer) sendChunk(ctx context.Context, chatID int64, text string) de
 		class, retryAfter := classifySendError(err)
 		switch class {
 		case sendOK:
+			d.clearDestinationFailure(ctx, chatID)
 			return deliveryDone
 
 		case sendRateLimited:
@@ -208,8 +215,7 @@ func (d *Deliverer) sendChunk(ctx context.Context, chatID int64, text string) de
 		case sendDestinationFailed:
 			slog.Error("Telegram destination/configuration error",
 				"chat_id", chatID, "error", err)
-			d.notifier.NotifyError(ctx, NewDiagnosticError(ErrTypeDeliveryRejected,
-				"Telegram rejected chat %d: %v", chatID, err))
+			d.alertDestinationFailure(ctx, chatID, err)
 			return deliveryDeferred
 
 		case sendContentRejected:
@@ -242,6 +248,41 @@ func (d *Deliverer) sendChunk(ctx context.Context, chatID int64, text string) de
 			case <-clk.After(delay):
 			}
 		}
+	}
+}
+
+// alertDestinationFailure broadcasts a once-per-chat alert about a broken
+// destination (kicked bot, deleted chat, bad token). Stateless with its own
+// dedup — see the destIssue field comment.
+func (d *Deliverer) alertDestinationFailure(ctx context.Context, chatID int64, sendErr error) {
+	if d.destIssue[chatID] {
+		return
+	}
+	d.destIssue[chatID] = true
+
+	msg := fmt.Sprintf("<b>SMS Gateway Alert</b>\n\n"+
+		"<b>Error:</b> Telegram rejects deliveries to chat <code>%d</code>\n"+
+		"<b>Details:</b> %s\n\n"+
+		"<i>Check that the bot is still a member of that chat and the token is valid. SMS are retained on the SIM until delivery succeeds.</i>",
+		chatID, escapeHTML(sendErr.Error()))
+	if err := d.notifier.sendToTelegram(ctx, msg); err != nil {
+		slog.Error("Failed to send destination-failure alert", "error", err)
+		d.destIssue[chatID] = false // re-arm so the alert is retried
+	}
+}
+
+// clearDestinationFailure sends a one-time notice when a previously failing
+// destination accepts messages again.
+func (d *Deliverer) clearDestinationFailure(ctx context.Context, chatID int64) {
+	if !d.destIssue[chatID] {
+		return
+	}
+	d.destIssue[chatID] = false
+
+	msg := fmt.Sprintf("<b>SMS Gateway Recovered</b>\n\n"+
+		"<b>Status:</b> Deliveries to chat <code>%d</code> work again", chatID)
+	if err := d.notifier.sendToTelegram(ctx, msg); err != nil {
+		slog.Error("Failed to send destination-recovery notice", "error", err)
 	}
 }
 

@@ -515,3 +515,75 @@ func TestDeliverer_PlainFallbackOn400(t *testing.T) {
 		t.Error("fallback message still contains HTML tags")
 	}
 }
+
+// TestDeliverer_DestinationFailureStateless: a broken destination (kicked
+// bot) alerts once via the stateless path, never enters the modem-recovery
+// state machine (no false "Recovered" on session restart), and produces a
+// one-time restored notice when the chat works again.
+func TestDeliverer_DestinationFailureStateless(t *testing.T) {
+	t.Cleanup(swapClock(newFakeClock()))
+	cfg := testConfig()
+	cfg.ChatIDs = []int64{100, 200}
+	deliverer, sender, alertSender := newTestDeliverer(cfg)
+	broken := true
+	sender.script = func(_ int, chatID int64, _ string) error {
+		if chatID == 200 && broken {
+			return fmt.Errorf("%w, bot was kicked from the group chat", bot.ErrorForbidden)
+		}
+		return nil
+	}
+	pending := PendingSMS{
+		Message:     SMSMessage{From: "+1", Text: "hi", Time: time.Now()},
+		PartIndices: []int{3},
+	}
+
+	countAlerts := func(marker string) int {
+		n := 0
+		for _, m := range alertSender.sent {
+			if strings.Contains(m.Text, marker) {
+				n++
+			}
+		}
+		return n
+	}
+
+	// First attempt: deferred, one destination alert broadcast (to 2 chats).
+	if status := deliverer.Deliver(context.Background(), pending); status != deliveryDeferred {
+		t.Fatalf("status = %v, want deliveryDeferred", status)
+	}
+	if got := countAlerts("rejects deliveries to chat"); got != 2 {
+		t.Fatalf("destination alert broadcasts = %d sends, want 2 (one alert to two chats)", got)
+	}
+
+	// Crucially: the modem-recovery state machine is untouched.
+	if deliverer.notifier.HasError() {
+		t.Fatal("destination failure must not enter the modem state machine")
+	}
+	if deliverer.notifier.NotifyRecovery(context.Background()) {
+		t.Fatal("modem session restart must not announce a false Recovered")
+	}
+
+	// Second attempt while still broken: no duplicate alert.
+	if status := deliverer.Deliver(context.Background(), pending); status != deliveryDeferred {
+		t.Fatal("still deferred while destination is broken")
+	}
+	if got := countAlerts("rejects deliveries to chat"); got != 2 {
+		t.Fatalf("duplicate destination alert sent (%d sends)", got)
+	}
+
+	// Destination healed: delivery completes, one restored notice goes out.
+	broken = false
+	if status := deliverer.Deliver(context.Background(), pending); status != deliveryDone {
+		t.Fatal("delivery should succeed after the destination heals")
+	}
+	if got := countAlerts("work again"); got != 2 {
+		t.Fatalf("restored notice = %d sends, want 2 (one notice to two chats)", got)
+	}
+
+	// Breaking it again re-arms the alert.
+	broken = true
+	deliverer.Deliver(context.Background(), pending)
+	if got := countAlerts("rejects deliveries to chat"); got != 4 {
+		t.Fatalf("re-break alert = %d sends total, want 4", got)
+	}
+}

@@ -287,3 +287,68 @@ func TestNeedsModemReset(t *testing.T) {
 		}
 	}
 }
+
+// Flapping weak coverage alternates NoSignal and NetworkNotRegistered across
+// diagnostic runs; the two types are one dedup group and must not produce an
+// alert per flip.
+func TestErrorNotifier_RadioGroupDedup(t *testing.T) {
+	sender := &fakeSender{}
+	notifier := NewErrorNotifier(sender, []int64{100}, false, "host", time.Second)
+	ctx := context.Background()
+
+	if !notifier.NotifyError(ctx, NewDiagnosticError(ErrTypeNoSignal, "CSQ=99")) {
+		t.Fatal("first radio alert should be sent")
+	}
+	if notifier.NotifyError(ctx, NewDiagnosticError(ErrTypeNetworkNotRegistered, "CREG=2")) {
+		t.Fatal("flip to NotRegistered must be deduplicated (same radio group)")
+	}
+	if notifier.NotifyError(ctx, NewDiagnosticError(ErrTypeNoSignal, "CSQ=99 again")) {
+		t.Fatal("flip back to NoSignal must be deduplicated")
+	}
+	if len(sender.sent) != 1 {
+		t.Fatalf("alerts sent = %d, want 1", len(sender.sent))
+	}
+
+	// Recovery fires once and names the latest observed state.
+	if !notifier.NotifyRecovery(ctx) {
+		t.Fatal("recovery should be sent")
+	}
+	if got := sender.sent[len(sender.sent)-1].Text; !strings.Contains(got, "No Signal") {
+		t.Errorf("recovery names %q, want the latest radio state (No Signal)", got)
+	}
+
+	// A different error class still alerts normally after recovery.
+	if !notifier.NotifyError(ctx, NewDiagnosticError(ErrTypeSimNotDetected, "gone")) {
+		t.Fatal("different class after recovery should alert")
+	}
+}
+
+// The escalator forces a last-resort reset on every 3rd consecutive failure
+// of the same condition group, and radio-group flips count as one condition.
+func TestResetEscalator(t *testing.T) {
+	e := &resetEscalator{}
+	seq := []struct {
+		errType DiagnosticErrorType
+		want    bool
+	}{
+		{ErrTypeNoSignal, false},
+		{ErrTypeNetworkNotRegistered, false}, // same radio group → streak 2
+		{ErrTypeNoSignal, true},              // streak 3 → escalate
+		{ErrTypeNoSignal, false},
+		{ErrTypeNoSignal, false},
+		{ErrTypeNoSignal, true},            // streak 6 → escalate again
+		{ErrTypeModemNotResponding, false}, // different group → streak resets
+		{ErrTypeModemNotResponding, false},
+		{ErrTypeModemNotResponding, true},
+	}
+	for i, step := range seq {
+		if got := e.Observe(step.errType); got != step.want {
+			t.Fatalf("step %d (%s): Observe = %v, want %v",
+				i, errorTypeName(step.errType), got, step.want)
+		}
+	}
+	e.Healthy()
+	if e.Observe(ErrTypeModemNotResponding) {
+		t.Error("streak must reset after a healthy session")
+	}
+}

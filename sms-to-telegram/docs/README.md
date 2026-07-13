@@ -62,6 +62,11 @@ All configuration via environment variables:
 | `NETWORK_REG_GRACE` | No | `90s` | Grace period to wait for network registration before alerting; `0` disables grace |
 | `MULTIPART_MAX_AGE` | No | `0` | Max age for stale multipart parts before deletion (e.g. `72h`); `0` disables cleanup |
 
+For `SERIAL_PORT`, prefer a stable device path such as
+`/dev/serial/by-id/usb-<vendor>_<model>-if00-port0` over `/dev/ttyUSB0`: the
+`ttyUSBn` name can change when the USB device re-enumerates (replug, modem
+reset), and the service would then wait forever for the old device name.
+
 ## Usage
 
 ```bash
@@ -115,6 +120,10 @@ go test -tags live -run TestLive -v -timeout 20m .
 The suite skips automatically when the `LIVE_*` variables are unset. Only
 messages carrying a per-run marker are delivered or deleted, so other SMS on
 the SIM are left untouched — but a dedicated test SIM is still recommended.
+
+The radio-outage scenario (`-run TestLive_FlightModeRadioRecovery`) needs only
+`LIVE_SERIAL_PORT` and sends no SMS: it toggles the modem's flight mode to
+simulate a real loss of network service and verifies diagnosis and recovery.
 
 ## Cross-compilation
 
@@ -209,6 +218,11 @@ Modem-side:
   locked (these trigger an `AT+CFUN` modem reset on the next attempt),
   registration denied (reset too), not registered or no signal after
   `NETWORK_REG_GRACE` (signal and registration share the grace window).
+  "No signal" and "not registered" form one deduplication group: flapping
+  weak coverage that alternates between them does not re-alert on every flip.
+- Last-resort escalation: after 3 consecutive failures of the same condition
+  with no healthy session in between, an `AT+CFUN` reset is attempted even
+  for error types that normally do not reset.
 - SIM storage: usage is checked at session start and on every health tick;
   crossing 80% raises a `SIM Storage Low` alert (cleared below 70%).
 
@@ -223,7 +237,10 @@ Telegram-side:
   kept on the SIM, an alert with its slot number is sent once, and later
   messages continue to flow. Remove the slot manually (`AT+CMGD=<index>`).
 - 401/403/404 (token/chat problems): delivery pauses (nothing is deleted) and
-  an alert is sent; fix the configuration and everything resumes.
+  an alert is broadcast once per broken chat; when the chat accepts messages
+  again a one-time "work again" notice is sent. These alerts are independent
+  of the modem recovered/failed state, so a modem reconnect never announces a
+  false recovery while a Telegram destination is still broken.
 
 Message hygiene:
 
