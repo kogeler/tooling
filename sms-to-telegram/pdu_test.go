@@ -414,45 +414,88 @@ func TestMultipartCollectorStaleIndices(t *testing.T) {
 	}
 }
 
-func TestParseUDH(t *testing.T) {
-	msg := &PDUMessage{}
-
+func TestParseUDHInfo(t *testing.T) {
 	// 8-bit reference UDH: IEI=00, len=03, ref=42, total=3, part=2
-	udh := []byte{0x00, 0x03, 0x2A, 0x03, 0x02}
-	msg.parseUDH(udh)
+	info := parseUDHInfo([]byte{0x00, 0x03, 0x2A, 0x03, 0x02})
 
-	if !msg.IsMultipart {
-		t.Error("IsMultipart should be true")
+	if info.malformed {
+		t.Fatalf("unexpectedly malformed: %s", info.malformedReason)
 	}
-	if msg.MultipartRef != 42 {
-		t.Errorf("MultipartRef = %d, want 42", msg.MultipartRef)
+	if !info.multipart {
+		t.Error("multipart should be true")
 	}
-	if msg.TotalParts != 3 {
-		t.Errorf("TotalParts = %d, want 3", msg.TotalParts)
+	if info.refKind != 8 {
+		t.Errorf("refKind = %d, want 8", info.refKind)
 	}
-	if msg.PartNumber != 2 {
-		t.Errorf("PartNumber = %d, want 2", msg.PartNumber)
+	if info.ref != 42 {
+		t.Errorf("ref = %d, want 42", info.ref)
+	}
+	if info.total != 3 {
+		t.Errorf("total = %d, want 3", info.total)
+	}
+	if info.part != 2 {
+		t.Errorf("part = %d, want 2", info.part)
 	}
 }
 
-func TestParseUDH16BitRef(t *testing.T) {
-	msg := &PDUMessage{}
-
+func TestParseUDHInfo16BitRef(t *testing.T) {
 	// 16-bit reference UDH: IEI=08, len=04, ref=0x0102, total=5, part=3
-	udh := []byte{0x08, 0x04, 0x01, 0x02, 0x05, 0x03}
-	msg.parseUDH(udh)
+	info := parseUDHInfo([]byte{0x08, 0x04, 0x01, 0x02, 0x05, 0x03})
 
-	if !msg.IsMultipart {
-		t.Error("IsMultipart should be true")
+	if info.malformed {
+		t.Fatalf("unexpectedly malformed: %s", info.malformedReason)
 	}
-	if msg.MultipartRef != 258 { // 0x0102
-		t.Errorf("MultipartRef = %d, want 258", msg.MultipartRef)
+	if !info.multipart {
+		t.Error("multipart should be true")
 	}
-	if msg.TotalParts != 5 {
-		t.Errorf("TotalParts = %d, want 5", msg.TotalParts)
+	if info.refKind != 16 {
+		t.Errorf("refKind = %d, want 16", info.refKind)
 	}
-	if msg.PartNumber != 3 {
-		t.Errorf("PartNumber = %d, want 3", msg.PartNumber)
+	if info.ref != 258 { // 0x0102
+		t.Errorf("ref = %d, want 258", info.ref)
+	}
+	if info.total != 5 {
+		t.Errorf("total = %d, want 5", info.total)
+	}
+	if info.part != 3 {
+		t.Errorf("part = %d, want 3", info.part)
+	}
+}
+
+func TestParseUDHInfoMalformed(t *testing.T) {
+	tests := []struct {
+		name string
+		udh  []byte
+	}{
+		{"total zero", []byte{0x00, 0x03, 0x2A, 0x00, 0x00}},
+		{"part zero", []byte{0x00, 0x03, 0x2A, 0x03, 0x00}},
+		{"part beyond total", []byte{0x00, 0x03, 0x2A, 0x03, 0x04}},
+		{"wrong concat IE length", []byte{0x00, 0x04, 0x2A, 0x03, 0x02, 0x01}},
+		{"truncated IE", []byte{0x00, 0x03, 0x2A}},
+		{"conflicting concat IEs", []byte{0x00, 0x03, 0x2A, 0x03, 0x02, 0x00, 0x03, 0x2B, 0x03, 0x02}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := parseUDHInfo(tt.udh)
+			if !info.malformed {
+				t.Errorf("parseUDHInfo(%x) should be malformed", tt.udh)
+			}
+		})
+	}
+}
+
+func TestParseUDHInfoIgnoresOtherIEs(t *testing.T) {
+	// Port addressing IE (0x05) before a valid concat IE.
+	info := parseUDHInfo([]byte{0x05, 0x04, 0x0B, 0x84, 0x0B, 0x84, 0x00, 0x03, 0x2A, 0x02, 0x01})
+	if info.malformed || !info.multipart || info.ref != 42 {
+		t.Errorf("info = %+v, want valid multipart ref 42", info)
+	}
+}
+
+func TestParseUDHInfoNationalShift(t *testing.T) {
+	info := parseUDHInfo([]byte{0x25, 0x01, 0x01})
+	if !info.unsupportedShift {
+		t.Error("national language shift table should be flagged unsupported")
 	}
 }
 

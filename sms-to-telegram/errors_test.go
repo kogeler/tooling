@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -172,28 +173,15 @@ func TestErrorNotifier_FormatMessage(t *testing.T) {
 			err := NewDiagnosticError(tt.errType, "test message")
 			msg := notifier.formatErrorMessage(err)
 
-			if !contains(msg, tt.wantContain) {
+			if !strings.Contains(msg, tt.wantContain) {
 				t.Errorf("formatErrorMessage() should contain %q, got %q", tt.wantContain, msg)
 			}
-			if !contains(msg, "test-host") {
+			if !strings.Contains(msg, "test-host") {
 				t.Errorf("formatErrorMessage() should contain hostname")
 			}
-			if !contains(msg, "SMS Gateway Alert") {
+			if !strings.Contains(msg, "SMS Gateway Alert") {
 				t.Errorf("formatErrorMessage() should contain 'SMS Gateway Alert'")
 			}
 		})
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
-}
-
-func containsHelper(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

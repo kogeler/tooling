@@ -186,8 +186,10 @@ func TestIsTimeoutError(t *testing.T) {
 	}{
 		{"timeout error", ErrModemTimeout, true},
 		{"disconnect error", ErrModemDisconnect, true},
+		{"poisoned session", ErrSessionPoisoned, true},
+		// A failed write means the transport (and thus the session) is gone.
+		{"write error", ErrWriteFailed, true},
 		{"modem error", ErrModemError, false},
-		{"write error", ErrWriteFailed, false},
 		{"nil error", nil, false},
 	}
 

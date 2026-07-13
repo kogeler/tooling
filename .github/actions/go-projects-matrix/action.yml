@@ -1,0 +1,131 @@
+# Copyright © 2025 kogeler
+# SPDX-License-Identifier: Apache-2.0
+
+name: Go project matrix
+description: >
+  Detect top-level Go projects affected by the current change and emit a job
+  matrix. A Go project is a top-level folder containing main.go (plus go.mod
+  for test mode, plus .version for release mode). Requires the repository to
+  be checked out with enough history for the change range (fetch-depth: 0).
+
+inputs:
+  mode:
+    description: >
+      source-changes: projects with any changed files in the range; falls back
+      to ALL projects when the range is unknown (new branch, dispatch) or when
+      .github/ itself changed - for test workflows.
+      version-changes: projects whose .version file changed in the range;
+      never falls back to "all" - for release workflows.
+    required: false
+    default: source-changes
+
+outputs:
+  matrix:
+    description: 'JSON job matrix: {"folders": [...]}'
+    value: ${{ steps.detect.outputs.matrix }}
+  has_targets:
+    description: '"true" when at least one project matched'
+    value: ${{ steps.detect.outputs.has_targets }}
+  folders:
+    description: JSON array of matched project folders
+    value: ${{ steps.detect.outputs.folders }}
+
+runs:
+  using: composite
+  steps:
+    - name: Detect affected Go projects
+      id: detect
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        EVENT_NAME: ${{ github.event_name }}
+        EVENT_BEFORE: ${{ github.event.before }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -euo pipefail
+
+        # All top-level Go projects in the repository.
+        ALL_PROJECTS=$(for dir in */; do
+          dir="${dir%/}"
+          if [ -f "$dir/go.mod" ] && [ -f "$dir/main.go" ]; then
+            echo "$dir"
+          fi
+        done | sort -u)
+        echo "Go projects in repo:"
+        echo "${ALL_PROJECTS:-<none>}"
+
+        # Resolve the commit range for changed-file detection.
+        RANGE=""
+        case "$EVENT_NAME" in
+          pull_request)
+            if [ -n "$PR_BASE_SHA" ] && git cat-file -e "$PR_BASE_SHA" 2>/dev/null; then
+              RANGE="$PR_BASE_SHA...HEAD"
+            fi
+            ;;
+          push)
+            if [ -n "$EVENT_BEFORE" ] \
+               && [ "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "$EVENT_BEFORE" 2>/dev/null; then
+              RANGE="$EVENT_BEFORE...HEAD"
+            elif git rev-parse -q --verify 'HEAD~1' >/dev/null 2>&1; then
+              RANGE="HEAD~1...HEAD"
+            fi
+            ;;
+          *)
+            # workflow_dispatch etc.: inspect the last commit.
+            if git rev-parse -q --verify 'HEAD~1' >/dev/null 2>&1; then
+              RANGE="HEAD~1...HEAD"
+            fi
+            ;;
+        esac
+
+        CHANGED_FILES=""
+        if [ -n "$RANGE" ]; then
+          echo "Change range: $RANGE"
+          CHANGED_FILES=$(git diff --name-only "$RANGE")
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+        else
+          echo "No usable change range (new branch or shallow history)"
+        fi
+
+        TARGETS=""
+        if [ "$MODE" = "version-changes" ]; then
+          # Release mode: only projects whose .version changed in this range.
+          # Deliberately never falls back to "all projects".
+          TARGETS=$(echo "$CHANGED_FILES" | grep '\.version$' | while read -r f; do
+            [ -z "$f" ] && continue
+            folder="${f%%/*}"
+            if [ -f "$folder/.version" ] && [ -f "$folder/main.go" ]; then
+              echo "$folder"
+            fi
+          done | sort -u) || true
+        else
+          if [ -z "$RANGE" ] || echo "$CHANGED_FILES" | grep -q '^\.github/'; then
+            # Unknown range, or the CI definition itself changed: test everything.
+            TARGETS="$ALL_PROJECTS"
+          else
+            TARGETS=$(echo "$CHANGED_FILES" | while read -r f; do
+              [ -z "$f" ] && continue
+              echo "${f%%/*}"
+            done | sort -u | while read -r folder; do
+              if echo "$ALL_PROJECTS" | grep -qx "$folder"; then
+                echo "$folder"
+              fi
+            done) || true
+          fi
+        fi
+
+        echo "Target projects:"
+        echo "${TARGETS:-<none>}"
+
+        if [ -z "$TARGETS" ]; then
+          echo "has_targets=false" >> "$GITHUB_OUTPUT"
+          echo "folders=[]" >> "$GITHUB_OUTPUT"
+          echo 'matrix={"folders":[]}' >> "$GITHUB_OUTPUT"
+        else
+          FOLDERS=$(echo "$TARGETS" | jq -R -s -c 'split("\n")[:-1]')
+          echo "has_targets=true" >> "$GITHUB_OUTPUT"
+          echo "folders=$FOLDERS" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(jq -c -n --argjson arr "$FOLDERS" '{folders: $arr}')" >> "$GITHUB_OUTPUT"
+        fi

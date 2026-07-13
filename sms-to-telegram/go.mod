@@ -1,4 +1,4 @@
-module github.com/p2p-org/tooling/sms-to-telegram
+module github.com/kogeler/tooling/sms-to-telegram
 
 go 1.23.5
 

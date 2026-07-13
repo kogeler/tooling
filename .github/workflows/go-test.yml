@@ -1,0 +1,92 @@
+# Copyright © 2025 kogeler
+# SPDX-License-Identifier: Apache-2.0
+
+# Universal test gate for every Go project in the repository. The release
+# workflows (go-binaries.yml, docker-images.yml) run only when a .version file
+# changes, so this workflow is what tests ordinary source changes: it runs on
+# pushes to any branch and on pull requests, building a job matrix of affected
+# projects via the shared go-projects-matrix action.
+
+name: Go Tests
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.projects.outputs.matrix }}
+      has_targets: ${{ steps.projects.outputs.has_targets }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Locate affected Go projects
+        id: projects
+        uses: ./.github/actions/go-projects-matrix
+        with:
+          mode: source-changes
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.projects.outputs.has_targets }}" = "true" ]; then
+            echo "### 🧪 Go projects to test" >> $GITHUB_STEP_SUMMARY
+            echo '${{ steps.projects.outputs.folders }}' | jq -r '.[]' | while read -r dir; do
+              echo "- $dir" >> $GITHUB_STEP_SUMMARY
+            done
+          else
+            echo "### ℹ️ No Go projects affected by this change" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  test:
+    needs: prepare
+    if: needs.prepare.outputs.has_targets == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        folder: ${{ fromJson(needs.prepare.outputs.matrix).folders }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.folder }}/go.mod
+
+      - name: go vet
+        run: go vet ./...
+        working-directory: ${{ matrix.folder }}
+
+      - name: go test
+        run: go test ./...
+        working-directory: ${{ matrix.folder }}
+
+      - name: go test -race
+        run: go test -race ./...
+        working-directory: ${{ matrix.folder }}
+
+      - name: shellcheck project scripts
+        run: |
+          set -euo pipefail
+          mapfile -t scripts < <(git ls-files "${{ matrix.folder }}" | grep '\.sh$' || true)
+          if [ "${#scripts[@]}" -gt 0 ]; then
+            shellcheck "${scripts[@]}"
+          else
+            echo "No shell scripts in ${{ matrix.folder }}"
+          fi
