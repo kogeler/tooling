@@ -1,5 +1,5 @@
 import { createClient } from "polkadot-api";
-import { getWsProvider } from "polkadot-api/ws-provider";
+import { getWsProvider } from "polkadot-api/ws";
 import { ah } from "@polkadot-api/descriptors";
 import WebSocket from "ws";
 import { rpcUrl, DOT_PLANCK } from "./config.js";

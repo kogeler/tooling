@@ -20,6 +20,7 @@ polkadot-nominations/
   src/
     config.js           Loads config.json and .papi/polkadot-api.json, exports constants
     chain.js            RPC connection and data fetching (validators, nominators, ledgers)
+    rewards.js          Per-era validator payout computation (commission + own-stake reward)
     stats.js            Percentile calculation with configurable direction and prefix
   .gitignore            Excludes node_modules, .papi/descriptors, .papi/metadata
   README.md             User-facing documentation
@@ -40,13 +41,14 @@ polkadot-nominations/
 8. Computes commission percentiles per nomination (descending — higher percentile = lower commission)
 9. Computes global commission percentiles across all **unique** targets (deduplicated by address)
 10. Computes global stake percentiles across all matching nominators (ascending — standard)
-11. Outputs JSON to stdout, logs to stderr
+11. Computes the validator's own reward for the last `rewardEras` completed eras (commission cut + own-stake reward) with a per-era claimed flag
+12. Outputs JSON to stdout, logs to stderr
 
 ### Key Technical Details
 
 - **Runtime**: Node.js >= 22 (ES modules)
 - **Chain**: Polkadot Asset Hub (staking migrated from relay chain as of runtime v2.0.0)
-- **RPC library**: `polkadot-api` (PAPI) with generated type descriptors
+- **RPC library**: `polkadot-api` (PAPI) `^2.1.7` with generated type descriptors. Note the v2 breaking change: the ws provider is imported from `polkadot-api/ws` (the old `polkadot-api/ws-provider` subpath was removed)
 - **WebSocket**: Uses `ws` npm package passed as `websocketClass` to `getWsProvider` (Node 22 has native WebSocket but PAPI needs the class passed explicitly)
 - **Commission format**: Stored on-chain as Perbill (0..1,000,000,000), converted to % with 4 decimal precision
 - **Stake format**: Stored as Planck (bigint), converted to whole DOT via `active / 10n**10n`
@@ -59,13 +61,15 @@ polkadot-nominations/
 {
   "validator": "SS58 address of the target validator",
   "percentiles": [0.25, 0.5, 0.75, 0.9],
-  "minStakeDot": 0
+  "minStakeDot": 0,
+  "rewardEras": 20
 }
 ```
 
 - `validator` — required, SS58 address to filter nominations for
 - `percentiles` — optional, array of thresholds (0-1), default `[0.5, 0.75, 0.9]`
 - `minStakeDot` — optional, minimum active stake in whole DOT, default `0` (disabled)
+- `rewardEras` — optional, number of most recent completed eras to report validator rewards for, default `20`
 
 ### Output Structure
 
@@ -82,6 +86,33 @@ polkadot-nominations/
   "stake_p50": 2236,
   "stake_p75": 8061,
   "stake_p90": 23569.3,
+  "rewards": {
+    "eras_requested": 20,
+    "active_era": 1852,
+    "is_validator": true,
+    "current_commission_pct": 0,
+    "latest_era_commission_pct": 10,
+    "reward_collapse_pending": true,
+    "total_reward": 412.5,
+    "unclaimed_reward": 55.3,
+    "eras": [
+      {
+        "era": 1851,
+        "active": true,
+        "has_data": true,
+        "reward": 21.4567,
+        "commission_reward": 21.4567,
+        "own_stake_reward": 0,
+        "reward_planck": "214567000000",
+        "commission_pct": 10,
+        "own_stake": 0,
+        "total_stake": 1602477.39,
+        "claimed": false,
+        "claimed_pages": 0,
+        "total_pages": 1
+      }
+    ]
+  },
   "nominations": [
     {
       "nominator": "SS58...",
@@ -106,8 +137,34 @@ polkadot-nominations/
 | `Staking.Validators` | SS58String | `{ commission: Perbill, blocked: bool }` | Validator commission lookup |
 | `Staking.Nominators` | SS58String | `{ targets: SS58String[], submitted_in: u32, suppressed: bool }` | Nominator -> validator mappings |
 | `Staking.Ledger` | SS58String | `{ stash: SS58String, total: u128, active: u128, unlocking: [...] }` | Active stake per nominator |
+| `Staking.ActiveEra` | — | `{ index: u32, start?: u64 }` | Current era (rewards look back from `index - 1`) |
+| `Staking.ErasValidatorReward` | EraIndex | `u128` | Total payout minted for the whole era |
+| `Staking.ErasRewardPoints` | EraIndex | `{ total: u32, individual: [SS58, u32][] }` | Era reward points, per validator |
+| `Staking.ErasValidatorPrefs` | (EraIndex, SS58) | `{ commission: Perbill, blocked: bool }` | Per-era commission |
+| `Staking.ErasStakersOverview` | (EraIndex, SS58) | `{ total: u128, own: u128, nominator_count: u32, page_count: u32 }` | Per-era exposure (own/total, page count) |
+| `Staking.ClaimedRewards` | (EraIndex, SS58) | `u32[]` | Claimed page indices for the era |
 
-All three are fetched via `.getEntries()` (full storage scan) in a single parallel batch.
+The first three are fetched via `.getEntries()` (full storage scan) in a single parallel batch. The reward items are read per-era via `.getValue()` for the validator across the last `rewardEras` eras.
+
+### Reward Computation (src/rewards.js)
+
+Replicates `pallet_staking::do_payout_stakers_by_page`. The **validator's own** reward for an era is:
+
+```
+validator_total_payout = ErasValidatorReward(era) * validator_points / total_points
+commission_payout      = commission * validator_total_payout          // Perbill
+leftover               = validator_total_payout - commission_payout
+own_stake_reward       = leftover * overview.own / overview.total
+personal_reward        = commission_payout + own_stake_reward
+```
+
+Nominator payouts are intentionally excluded. Arithmetic is done in `BigInt` Planck to match on-chain integer math, then converted to DOT.
+
+**Claimed flag:** the own-stake reward is paid only with page `0`; commission is spread across all pages. A reward is therefore *fully* claimed only when `ClaimedRewards(era, validator).length == overview.page_count`. Most validators have a single page, so this is effectively binary.
+
+**Migration boundary:** eras predating the Asset Hub staking migration (and the not-yet-finalized current era) have no `ErasValidatorReward`, so they are reported with `has_data: false`, `active: false`, `reward: 0`. Requesting more `rewardEras` than exist since the migration is safe.
+
+**Commission-change detection:** per-era commission comes from `ErasValidatorPrefs`, which is snapshotted at era start. A live commission change (e.g. the 0% referendum) only shows in `current_commission_pct` (from `Staking.Validators`) until the next era snapshots it. `reward_collapse_pending` is `true` when the latest era's reward is commission-only (`own_stake_reward == 0`) and the current commission is now lower than the snapshot — i.e. rewards have not dropped yet but will fall to ~0 for a validator with no own-stake cushion. This is exactly the situation for a 0%-commission validator that lacks the self-stake minimum.
 
 ### Typical Data Volumes (Polkadot, Feb 2025)
 

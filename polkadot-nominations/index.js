@@ -1,4 +1,4 @@
-import { validator, minStakeDot, rpcUrl } from "./src/config.js";
+import { validator, minStakeDot, rewardEras, rpcUrl } from "./src/config.js";
 import {
   connect,
   fetchActiveValidators,
@@ -6,6 +6,7 @@ import {
   fetchNominators,
   fetchStakes,
 } from "./src/chain.js";
+import { fetchValidatorRewards } from "./src/rewards.js";
 import { calcPercentiles } from "./src/stats.js";
 
 async function main() {
@@ -16,12 +17,14 @@ async function main() {
   const { client, api } = connect();
 
   console.error("Fetching chain data...");
-  const [activeValidators, commissions, nominatorEntries, stakes] =
+  console.error(`Reward lookback: last ${rewardEras} eras`);
+  const [activeValidators, commissions, nominatorEntries, stakes, rewards] =
     await Promise.all([
       fetchActiveValidators(api),
       fetchCommissions(api),
       fetchNominators(api),
       fetchStakes(api),
+      fetchValidatorRewards(api),
     ]);
   const activeSet = new Set(activeValidators);
   console.error(
@@ -96,9 +99,23 @@ async function main() {
       prefix: "commission_",
     }),
     ...calcPercentiles(nominatorStakes, { prefix: "stake_" }),
+    rewards,
     nominations,
   };
 
+  const claimedEras = rewards.eras.filter((e) => e.active && e.claimed).length;
+  const activeEras = rewards.eras.filter((e) => e.active).length;
+  console.error(
+    `Rewards: ${rewards.total_reward} DOT over ${activeEras} active eras ` +
+      `(${claimedEras} claimed, ${rewards.unclaimed_reward} DOT unclaimed)`,
+  );
+  console.error(
+    `Commission: current ${rewards.current_commission_pct}% vs ` +
+      `latest era snapshot ${rewards.latest_era_commission_pct}%` +
+      (rewards.reward_collapse_pending
+        ? " -> rewards NOT yet dropped, but will collapse to ~0 once the new commission is snapshotted (no own-stake cushion)"
+        : ""),
+  );
   console.error(`Found ${nominations.length} nominators for this validator`);
   console.log(JSON.stringify(output, null, 2));
 

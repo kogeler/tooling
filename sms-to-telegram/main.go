@@ -5,6 +5,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,9 +18,31 @@ import (
 	"time"
 
 	"github.com/go-telegram/bot"
-	"github.com/go-telegram/bot/models"
 	"github.com/tarm/serial"
 )
+
+// contentFingerprint returns a short non-reversible identifier for sensitive
+// content (SMS bodies, raw PDUs) so it can be correlated in logs without
+// exposing the content itself. Full content is only ever logged at DEBUG.
+func contentFingerprint(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return fmt.Sprintf("%x", sum[:6])
+}
+
+// maskICCID keeps only the last 4 digits of an ICCID for logging.
+func maskICCID(lines []string) string {
+	s := strings.Join(lines, " ")
+	digits := make([]rune, 0, len(s))
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			digits = append(digits, r)
+		}
+	}
+	if len(digits) <= 4 {
+		return "****"
+	}
+	return "****" + string(digits[len(digits)-4:])
+}
 
 type Config struct {
 	TelegramToken string
@@ -73,7 +97,8 @@ func main() {
 }
 
 func loadConfig() (*Config, error) {
-	dryRun := os.Getenv("DRY_RUN") == "true" || os.Getenv("DRY_RUN") == "1"
+	dryRunStr := os.Getenv("DRY_RUN")
+	dryRun := strings.EqualFold(dryRunStr, "true") || strings.EqualFold(dryRunStr, "yes") || dryRunStr == "1"
 
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if token == "" && !dryRun {
@@ -87,6 +112,7 @@ func loadConfig() (*Config, error) {
 
 	var chatIDs []int64
 	if chatIDsStr != "" {
+		seen := make(map[int64]struct{})
 		for _, idStr := range strings.Split(chatIDsStr, ",") {
 			idStr = strings.TrimSpace(idStr)
 			if idStr == "" {
@@ -96,6 +122,14 @@ func loadConfig() (*Config, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid chat ID %q: %w", idStr, err)
 			}
+			if id == 0 {
+				return nil, fmt.Errorf("invalid chat ID %q: 0 is not a valid Telegram chat", idStr)
+			}
+			// Duplicate destinations would double-send every SMS.
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
 			chatIDs = append(chatIDs, id)
 		}
 	}
@@ -114,6 +148,9 @@ func loadConfig() (*Config, error) {
 		baudRate, err = strconv.Atoi(baudStr)
 		if err != nil {
 			return nil, fmt.Errorf("invalid BAUD_RATE %q: %w", baudStr, err)
+		}
+		if baudRate <= 0 {
+			return nil, fmt.Errorf("invalid BAUD_RATE %q: must be > 0", baudStr)
 		}
 	}
 
@@ -190,14 +227,59 @@ func setupLogging(level slog.Level) {
 	slog.SetDefault(slog.New(handler))
 }
 
-// runModemDiagnostics performs detailed modem diagnostics and returns DiagnosticError.
-// networkGrace defines how long to wait for network registration after sessionStart.
-func runModemDiagnostics(ctx context.Context, modem *SimpleAT, sessionStart time.Time, networkGrace time.Duration) *DiagnosticError {
+// parseCPIN extracts the exact +CPIN status value.
+func parseCPIN(lines []string) (string, bool) {
+	for _, line := range lines {
+		if strings.HasPrefix(line, "+CPIN:") {
+			return strings.ToUpper(strings.TrimSpace(strings.TrimPrefix(line, "+CPIN:"))), true
+		}
+	}
+	return "", false
+}
+
+// parseCSQ extracts the RSSI field of a +CSQ response.
+func parseCSQ(lines []string) (int, bool) {
+	for _, line := range lines {
+		if strings.HasPrefix(line, "+CSQ:") {
+			fields := strings.Split(strings.TrimPrefix(line, "+CSQ:"), ",")
+			if len(fields) >= 1 {
+				if rssi, err := strconv.Atoi(strings.TrimSpace(fields[0])); err == nil {
+					return rssi, true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+// parseCREG extracts the registration status field of a +CREG response.
+func parseCREG(lines []string) (int, bool) {
+	for _, line := range lines {
+		if strings.HasPrefix(line, "+CREG:") {
+			fields := strings.Split(strings.TrimPrefix(line, "+CREG:"), ",")
+			if len(fields) >= 2 {
+				if stat, err := strconv.Atoi(strings.TrimSpace(fields[1])); err == nil {
+					return stat, true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+// runModemDiagnostics checks modem responsiveness, SIM state, signal and
+// network registration. Error kinds are preserved: transport failures return
+// a *SessionError (reopen quietly), modem-level problems return a typed
+// *DiagnosticError (alert), and cancellation returns ctx.Err().
+// networkGrace defines how long after sessionStart unknown signal (CSQ=99)
+// and missing registration are tolerated before alerting.
+func runModemDiagnostics(ctx context.Context, modem ATCommander, sessionStart time.Time, networkGrace time.Duration) error {
 	slog.Info("Testing modem connection...")
 
-	// Test modem with simple AT command
-	slog.Debug("Testing modem with AT command...")
 	if resp, cmdErr := modem.Command("AT"); cmdErr != nil {
+		if IsTimeoutError(cmdErr) {
+			return NewSessionError(cmdErr)
+		}
 		slog.Error("Modem not responding to AT command", "error", cmdErr)
 		return NewDiagnosticError(ErrTypeModemNotResponding,
 			"Modem not responding to AT commands: %v", cmdErr)
@@ -205,194 +287,131 @@ func runModemDiagnostics(ctx context.Context, modem *SimpleAT, sessionStart time
 		slog.Debug("Modem responds to AT", "response", resp)
 	}
 
-	// Disable echo to avoid confusion
-	modem.Command("ATE0")
-
-	slog.Info("Modem connection OK")
-
-	// Get modem info
+	// Modem info is best-effort.
 	if resp, err := modem.Command("ATI"); err == nil {
 		slog.Info("Modem info", "model", strings.Join(resp, " "))
 	}
 
-	// Check SIM card status - this is critical
-	// Note: SIM may take a few seconds to initialize after modem power-on
+	// SIM status. The SIM may take a few seconds to initialize after
+	// power-on, so a modem ERROR is retried; a transport failure is not a
+	// SIM problem and must not be misreported as one.
 	slog.Debug("Checking SIM card (may retry if not ready yet)...")
-
-	var simResp []string
-	var simErr error
-	var simReady bool
-
-	// Retry SIM check up to 5 times with delays (SIM initialization can take time)
-	for attempt := 1; attempt <= 5; attempt++ {
-		simResp, simErr = modem.Command("AT+CPIN?")
-		if simErr == nil {
-			// Success - SIM responded
+	var cpinStatus string
+	for attempt := 1; ; attempt++ {
+		resp, err := modem.Command("AT+CPIN?")
+		if err == nil {
+			status, ok := parseCPIN(resp)
+			if !ok {
+				return NewDiagnosticError(ErrTypeSimNotDetected,
+					"Invalid AT+CPIN? response: %s (expected +CPIN:)", strings.Join(resp, " "))
+			}
+			cpinStatus = status
 			break
 		}
-
-		if attempt < 5 {
-			slog.Debug("SIM not ready yet, waiting...", "attempt", attempt)
-			time.Sleep(2 * time.Second)
+		if IsTimeoutError(err) {
+			return NewSessionError(err)
 		}
-	}
-
-	if simErr != nil {
-		// AT+CPIN? still returns ERROR after retries - try to understand why
-		slog.Warn("AT+CPIN? returned ERROR after retries, checking if SIM is physically present...")
-
-		// Try AT+CCID to check if SIM is physically detected
-		ccidResp, ccidErr := modem.Command("AT+CCID")
-		if ccidErr != nil {
-			// Both CPIN and CCID fail - SIM physically not detected
-			slog.Error("SIM card not detected", "cpin_error", simErr, "ccid_error", ccidErr)
+		if attempt >= 5 {
+			// AT+CPIN? still returns ERROR - check physical presence.
+			ccidResp, ccidErr := modem.Command("AT+CCID")
+			if ccidErr != nil {
+				if IsTimeoutError(ccidErr) {
+					return NewSessionError(ccidErr)
+				}
+				slog.Error("SIM card not detected", "cpin_error", err, "ccid_error", ccidErr)
+				return NewDiagnosticError(ErrTypeSimNotDetected,
+					"SIM card not physically detected (AT+CPIN? and AT+CCID both fail)")
+			}
+			slog.Info("SIM card physically detected", "iccid_masked", maskICCID(ccidResp))
 			return NewDiagnosticError(ErrTypeSimNotDetected,
-				"SIM card not physically detected (AT+CPIN? and AT+CCID both fail)")
+				"SIM card detected but not ready (AT+CPIN? fails)")
 		}
-
-		slog.Info("SIM card physically detected", "ICCID", ccidResp)
-		slog.Warn("But AT+CPIN? fails - SIM may be initializing")
-		return NewDiagnosticError(ErrTypeSimNotDetected,
-			"SIM card detected but not ready (AT+CPIN? fails)")
+		slog.Debug("SIM not ready yet, waiting...", "attempt", attempt)
+		if !sleepCtx(ctx, 2*time.Second) {
+			return ctx.Err()
+		}
 	}
 
-	// Parse SIM status - must contain "+CPIN:" prefix
-	simStatus := strings.Join(simResp, " ")
-	slog.Info("SIM status raw", "status", simStatus)
-
-	// Validate that response is actually from AT+CPIN? command
-	// After modem reset, we might get garbage or previous command output
-	if !strings.Contains(simStatus, "+CPIN:") {
-		slog.Error("Invalid AT+CPIN? response - not a CPIN response", "response", simStatus)
-		return NewDiagnosticError(ErrTypeSimNotDetected,
-			"Invalid SIM status response: %s (expected +CPIN:)", simStatus)
-	}
-
-	if strings.Contains(simStatus, "READY") {
+	slog.Info("SIM status", "status", cpinStatus)
+	switch cpinStatus {
+	case "READY":
 		slog.Info("SIM card is READY")
-		simReady = true
-	} else if strings.Contains(simStatus, "SIM PIN") {
-		slog.Error("SIM card requires PIN")
-		return NewDiagnosticError(ErrTypeSimPinRequired,
-			"SIM card requires PIN code")
-	} else if strings.Contains(simStatus, "SIM PUK") {
-		slog.Error("SIM card is PUK locked")
+	case "SIM PIN", "SIM PIN2", "PH-SIM PIN":
+		return NewDiagnosticError(ErrTypeSimPinRequired, "SIM card requires PIN code (%s)", cpinStatus)
+	case "SIM PUK", "SIM PUK2":
 		return NewDiagnosticError(ErrTypeSimPukLocked,
 			"SIM card is PUK locked (too many wrong PIN attempts)")
-	} else if strings.Contains(simStatus, "NOT INSERTED") {
-		slog.Error("No SIM card inserted")
-		return NewDiagnosticError(ErrTypeSimNotDetected,
-			"No SIM card inserted in modem")
-	} else if strings.Contains(simStatus, "NOT READY") {
-		slog.Warn("SIM card not ready yet")
-		return NewDiagnosticError(ErrTypeSimNotDetected,
-			"SIM card not ready (still initializing)")
-	} else {
-		// Unknown status - treat as error
-		slog.Error("Unknown SIM status", "status", simStatus)
-		return NewDiagnosticError(ErrTypeSimNotDetected,
-			"Unknown SIM status: %s", simStatus)
+	case "NOT INSERTED":
+		return NewDiagnosticError(ErrTypeSimNotDetected, "No SIM card inserted in modem")
+	case "NOT READY", "BUSY":
+		return NewDiagnosticError(ErrTypeSimNotDetected, "SIM card not ready (still initializing)")
+	default:
+		return NewDiagnosticError(ErrTypeSimNotDetected, "Unknown SIM status: %s", cpinStatus)
 	}
 
-	// Check signal quality
-	var noSignal bool
-	var signalChecked bool
-	var signalRSSI string
-	if resp, err := modem.Command("AT+CSQ"); err == nil {
-		slog.Info("Signal quality", "response", strings.Join(resp, " "))
-		// Parse signal: +CSQ: rssi,ber
-		// rssi: 0-31 (0=-113dBm, 31=-51dBm), 99=unknown
-		for _, line := range resp {
-			if strings.HasPrefix(line, "+CSQ:") {
-				signalChecked = true
-				parts := strings.Split(strings.TrimPrefix(line, "+CSQ:"), ",")
-				if len(parts) >= 1 {
-					rssi := strings.TrimSpace(parts[0])
-					signalRSSI = rssi
-					if rssi == "99" {
-						slog.Warn("SIGNAL: No signal or not detectable")
-						noSignal = true
-					} else if rssi == "0" {
-						slog.Warn("SIGNAL: Very weak signal (-113 dBm or less)")
-					} else {
-						slog.Info("SIGNAL: Signal detected", "rssi", rssi)
-					}
-				}
+	// Signal and registration share the startup grace window: both CSQ=99
+	// and a still-searching CREG are normal for the first seconds after
+	// power-on and must not produce an alert/recovery pair on every start.
+	checkRadio := func() (rssi, cregStat int, err error) {
+		resp, e := modem.Command("AT+CSQ")
+		if e != nil {
+			if IsTimeoutError(e) {
+				return 0, 0, NewSessionError(e)
 			}
+			return 0, 0, NewDiagnosticError(ErrTypeModemNotResponding, "AT+CSQ failed: %v", e)
 		}
-	} else {
-		slog.Warn("Could not check signal quality", "error", err)
-	}
-
-	if noSignal && signalChecked {
-		return NewDiagnosticError(ErrTypeNoSignal,
-			"No signal detected (CSQ=%s)", signalRSSI)
-	}
-
-	// Check network registration
-	var networkRegistered bool
-	var cregChecked bool
-	var networkStat string
-	checkNetwork := func() *DiagnosticError {
-		cregChecked = false
-		networkRegistered = false
-		networkStat = ""
-
-		resp, err := modem.Command("AT+CREG?")
-		if err != nil {
-			slog.Warn("Could not check network registration", "error", err)
-			return nil
+		rssi, ok := parseCSQ(resp)
+		if !ok {
+			return 0, 0, NewDiagnosticError(ErrTypeModemNotResponding,
+				"Invalid AT+CSQ response: %s", strings.Join(resp, " "))
 		}
-		slog.Info("Network registration", "response", strings.Join(resp, " "))
-		// Parse: +CREG: n,stat
-		// stat: 0=not registered, 1=registered home, 2=searching, 3=denied, 4=unknown, 5=roaming
-		for _, line := range resp {
-			if strings.HasPrefix(line, "+CREG:") {
-				cregChecked = true
-				parts := strings.Split(strings.TrimPrefix(line, "+CREG:"), ",")
-				if len(parts) >= 2 {
-					stat := strings.TrimSpace(parts[1])
-					networkStat = stat
-					switch stat {
-					case "0":
-						slog.Warn("NETWORK: Not registered, not searching")
-						if simReady {
-							slog.Warn("SIM is ready but not registered - network issue or no coverage")
-						}
-					case "1":
-						slog.Info("NETWORK: Registered on home network")
-						networkRegistered = true
-					case "2":
-						slog.Warn("NETWORK: Not registered, searching for network...")
-					case "3":
-						slog.Error("NETWORK: Registration denied by operator")
-						return NewDiagnosticError(ErrTypeNetworkDenied,
-							"Network operator denied registration")
-					case "4":
-						slog.Warn("NETWORK: Unknown registration status")
-					case "5":
-						slog.Info("NETWORK: Registered, roaming")
-						networkRegistered = true
-					}
-				}
+
+		resp, e = modem.Command("AT+CREG?")
+		if e != nil {
+			if IsTimeoutError(e) {
+				return 0, 0, NewSessionError(e)
 			}
+			return 0, 0, NewDiagnosticError(ErrTypeModemNotResponding, "AT+CREG? failed: %v", e)
 		}
-
-		return nil
-	}
-
-	if diagErr := checkNetwork(); diagErr != nil {
-		return diagErr
+		cregStat, ok = parseCREG(resp)
+		if !ok {
+			return 0, 0, NewDiagnosticError(ErrTypeModemNotResponding,
+				"Invalid AT+CREG? response: %s", strings.Join(resp, " "))
+		}
+		return rssi, cregStat, nil
 	}
 
 	waitedForNetwork := false
-	for simReady && cregChecked && !networkRegistered && networkGrace > 0 {
-		elapsed := time.Since(sessionStart)
-		if elapsed >= networkGrace {
+	for {
+		rssi, cregStat, err := checkRadio()
+		if err != nil {
+			return err
+		}
+		slog.Info("Radio status", "rssi", rssi, "creg_stat", cregStat)
+
+		if cregStat == 3 {
+			slog.Error("NETWORK: Registration denied by operator")
+			return NewDiagnosticError(ErrTypeNetworkDenied, "Network operator denied registration")
+		}
+
+		registered := cregStat == 1 || cregStat == 5
+		signalKnown := rssi != 99
+		if registered && signalKnown {
+			if rssi == 0 {
+				slog.Warn("SIGNAL: Very weak signal (-113 dBm or less)")
+			}
 			break
 		}
-		if networkStat != "0" && networkStat != "2" && networkStat != "4" {
-			break
+
+		elapsed := clk.Now().Sub(sessionStart)
+		if networkGrace <= 0 || elapsed >= networkGrace {
+			if !signalKnown {
+				slog.Warn("SIGNAL: No signal or not detectable after grace period")
+				return NewDiagnosticError(ErrTypeNoSignal, "No signal detected (CSQ=99)")
+			}
+			slog.Warn("NETWORK: Not registered after grace period", "creg_stat", cregStat)
+			return NewDiagnosticError(ErrTypeNetworkNotRegistered,
+				"Not registered on network (CREG=%d)", cregStat)
 		}
 
 		remaining := networkGrace - elapsed
@@ -401,38 +420,17 @@ func runModemDiagnostics(ctx context.Context, modem *SimpleAT, sessionStart time
 			wait = remaining
 		}
 		if !waitedForNetwork {
-			slog.Info("Waiting for network registration", "grace", networkGrace, "elapsed", elapsed)
+			slog.Info("Waiting for network registration/signal", "grace", networkGrace, "elapsed", elapsed)
 			waitedForNetwork = true
 		}
-
 		select {
 		case <-ctx.Done():
-			return nil
-		case <-time.After(wait):
-		}
-
-		if diagErr := checkNetwork(); diagErr != nil {
-			return diagErr
+			return ctx.Err()
+		case <-clk.After(wait):
 		}
 	}
 
-	// Treat missing registration as an error when SIM is ready and CREG was checked.
-	if simReady && cregChecked && !networkRegistered {
-		if networkStat == "" {
-			networkStat = "unknown"
-		}
-		return NewDiagnosticError(ErrTypeNetworkNotRegistered,
-			"Not registered on network (CREG=%s)", networkStat)
-	}
-
-	// Warn if SIM is ready but not registered
-	if simReady && !networkRegistered {
-		slog.Warn("SIM card is ready but NOT registered on network")
-		slog.Warn("This may be normal if modem just started - wait 30-60 seconds")
-		slog.Warn("If problem persists: check coverage, antenna, or SIM activation")
-	}
-
-	// Check operator
+	// Operator info is best-effort.
 	if resp, err := modem.Command("AT+COPS?"); err == nil {
 		slog.Info("Operator", "response", strings.Join(resp, " "))
 	}
@@ -447,27 +445,54 @@ func run(ctx context.Context, cfg *Config) error {
 		hostname = "unknown"
 	}
 
-	// Initialize Telegram bot (unless dry run)
-	var tgBot *bot.Bot
+	// Initialize Telegram bot (unless dry run).
+	// The sender is a nil interface in dry-run so nil checks work; a typed-nil
+	// *bot.Bot inside the interface would defeat them.
+	var sender TelegramSender
 	if !cfg.DryRun {
-		var err error
-		tgBot, err = bot.New(cfg.TelegramToken)
+		tgBot, err := bot.New(cfg.TelegramToken, bot.WithSkipGetMe())
 		if err != nil {
 			return fmt.Errorf("failed to create telegram bot: %w", err)
 		}
+		sender = tgBot
 		slog.Info("Telegram bot initialized")
 	} else {
 		slog.Warn("Running in DRY_RUN mode - messages will not be sent to Telegram")
 	}
 
 	// Create error notifier for sending diagnostic errors to Telegram
-	notifier := NewErrorNotifier(tgBot, cfg.ChatIDs, cfg.DryRun, hostname, cfg.TelegramSendTimeout)
+	notifier := NewErrorNotifier(sender, cfg.ChatIDs, cfg.DryRun, hostname, cfg.TelegramSendTimeout)
+
+	// The deliverer keeps per-chat cooldowns and the rejected-message set
+	// across modem session reopens.
+	deliverer := NewDeliverer(sender, notifier, cfg)
 
 	// Retry interval for modem connection issues
 	retryInterval := 30 * time.Second
+	// Transient session failures retry faster until the alert threshold.
+	sessionRetryInterval := 5 * time.Second
 
 	// Track if we need to reset modem on next attempt
 	needReset := false
+
+	// A single failed session (timeout, poisoned stream) is reopened quietly;
+	// only several consecutive failures mean the modem is really gone.
+	consecutiveSessionFailures := 0
+	const sessionFailureAlertThreshold = 3
+	escalator := &resetEscalator{}
+	onHealthy := func() {
+		consecutiveSessionFailures = 0
+		escalator.Healthy()
+	}
+
+	wait := func(d time.Duration) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-clk.After(d):
+			return true
+		}
+	}
 
 	// Main loop with retry logic
 	for {
@@ -479,7 +504,7 @@ func run(ctx context.Context, cfg *Config) error {
 		}
 
 		// Try to run the modem polling loop
-		err := runModemLoop(ctx, cfg, tgBot, notifier, needReset)
+		err := runModemLoop(ctx, cfg, deliverer, notifier, needReset, onHealthy)
 
 		if err == nil {
 			// Normal exit (context cancelled)
@@ -487,26 +512,49 @@ func run(ctx context.Context, cfg *Config) error {
 		}
 
 		// Check if it's a diagnostic error
-		if diagErr, ok := err.(*DiagnosticError); ok {
+		var diagErr *DiagnosticError
+		if errors.As(err, &diagErr) {
 			slog.Error("Modem diagnostic error", "type", errorTypeName(diagErr.Type), "error", diagErr.Message)
 			notifier.NotifyError(ctx, diagErr)
+			consecutiveSessionFailures = 0
 
-			// Determine if we need modem reset on next attempt
-			// SIM-related errors benefit from full modem reset
-			switch diagErr.Type {
-			case ErrTypeSimNotDetected, ErrTypeSimPinRequired, ErrTypeSimPukLocked, ErrTypeNetworkDenied:
+			// Determine if we need a modem reset on the next attempt.
+			needReset = needsModemReset(diagErr.Type)
+			if forced := escalator.Observe(diagErr.Type); forced && !needReset {
 				needReset = true
+				slog.Warn("Escalating to modem reset after repeated failures",
+					"type", errorTypeName(diagErr.Type), "streak", escalator.streak)
+			}
+			if needReset {
 				slog.Info("Will perform modem reset on next attempt")
-			default:
-				needReset = false
 			}
 
 			// Wait before retry
 			slog.Info("Will retry modem connection", "retry_in", retryInterval)
-			select {
-			case <-ctx.Done():
+			if !wait(retryInterval) {
 				return nil
-			case <-time.After(retryInterval):
+			}
+			continue
+		}
+
+		// Transport/session error: reopen quietly, alert only after repeated failures.
+		var sessErr *SessionError
+		if errors.As(err, &sessErr) {
+			consecutiveSessionFailures++
+			slog.Error("Modem session error",
+				"error", sessErr.Err,
+				"consecutive", consecutiveSessionFailures,
+				"alert_threshold", sessionFailureAlertThreshold,
+			)
+			needReset = false
+			if consecutiveSessionFailures >= sessionFailureAlertThreshold {
+				notifier.NotifyError(ctx, NewDiagnosticError(ErrTypeModemNotResponding,
+					"Modem session failed %d times in a row: %v", consecutiveSessionFailures, sessErr.Err))
+				if !wait(retryInterval) {
+					return nil
+				}
+			} else if !wait(sessionRetryInterval) {
+				return nil
 			}
 			continue
 		}
@@ -514,17 +562,183 @@ func run(ctx context.Context, cfg *Config) error {
 		// Non-diagnostic error - log and retry (no reset needed)
 		slog.Error("Modem loop error", "error", err)
 		needReset = false
-		select {
-		case <-ctx.Done():
+		if !wait(retryInterval) {
 			return nil
-		case <-time.After(retryInterval):
 		}
 	}
 }
 
-// runModemLoop handles serial port connection and SMS polling
-// needReset indicates if modem should be reset (e.g., after SIM error)
-func runModemLoop(ctx context.Context, cfg *Config, tgBot *bot.Bot, notifier *ErrorNotifier, needReset bool) error {
+// initModemSession performs the mandatory session setup. SMS polling must not
+// start unless every command here succeeded: with text mode still active the
+// CMGL transcript would be misparsed, with the wrong storage selected the tool
+// would inspect (and delete from) the wrong message store, and with delivery
+// URCs enabled the modem could interleave +CMT frames into responses.
+// Returns the SIM storage usage reported by CPMS (used, total; -1 if unknown).
+func initModemSession(modem ATCommander) (simUsed, simTotal int, err error) {
+	// Synchronize: absorb boot banners/garbage until the modem answers AT.
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		if _, lastErr = modem.Command("AT"); lastErr == nil {
+			break
+		}
+		if IsTimeoutError(lastErr) {
+			return -1, -1, NewSessionError(lastErr)
+		}
+	}
+	if lastErr != nil {
+		return -1, -1, NewDiagnosticError(ErrTypeModemNotResponding,
+			"Modem not responding during session init: %v", lastErr)
+	}
+
+	required := func(cmd string) ([]string, error) {
+		resp, cmdErr := modem.Command(cmd)
+		if cmdErr == nil {
+			return resp, nil
+		}
+		if IsTimeoutError(cmdErr) {
+			return nil, NewSessionError(cmdErr)
+		}
+		// A modem ERROR on a mandatory SMS command is most often a missing or
+		// not-ready SIM (on SIM800 firmware AT+CMGF=0 returns ERROR with no
+		// SIM). Probe the SIM so the whole SIM-out episode reports one error
+		// type (SIM Not Detected) instead of oscillating into Modem Init
+		// Failed, and so it inherits the SIM reset-and-recover path.
+		ready, probeErr := simReadyProbe(modem)
+		if probeErr != nil {
+			return nil, probeErr // transport failure → SessionError
+		}
+		if !ready {
+			return nil, NewDiagnosticError(ErrTypeSimNotDetected,
+				"SIM not ready (mandatory init command %s returned ERROR)", cmd)
+		}
+		return nil, NewDiagnosticError(ErrTypeModemInitFailed,
+			"Mandatory init command %s failed: %v", cmd, cmdErr)
+	}
+
+	if _, err := required("ATE0"); err != nil {
+		return -1, -1, err
+	}
+
+	if _, err := required("AT+CMGF=0"); err != nil {
+		return -1, -1, err
+	}
+	// Query the mode back: a modem that silently kept text mode would make the
+	// pipeline parse text output as PDUs.
+	if resp, err := required("AT+CMGF?"); err != nil {
+		return -1, -1, err
+	} else if joined := strings.Join(resp, " "); !strings.Contains(joined, "+CMGF: 0") {
+		return -1, -1, NewDiagnosticError(ErrTypeModemInitFailed,
+			"PDU mode not active after AT+CMGF=0 (got %q)", joined)
+	}
+
+	cpmsResp, err := required(`AT+CPMS="SM","SM","SM"`)
+	if err != nil {
+		return -1, -1, err
+	}
+	simUsed, simTotal = parseCPMSCounts(cpmsResp)
+
+	// Suppress SMS delivery indications while polling; +CMT/+CMTI frames
+	// interleaved into a CMGL transcript are a data-loss hazard.
+	if _, cnmiErr := modem.Command("AT+CNMI=2,0,0,0,0"); cnmiErr != nil {
+		if IsTimeoutError(cnmiErr) {
+			return simUsed, simTotal, NewSessionError(cnmiErr)
+		}
+		if _, fallbackErr := required("AT+CNMI=0,0,0,0,0"); fallbackErr != nil {
+			return simUsed, simTotal, fallbackErr
+		}
+	}
+
+	slog.Info("Modem session initialized", "sim_used", simUsed, "sim_total", simTotal)
+	return simUsed, simTotal, nil
+}
+
+// resetEscalator forces a last-resort AT+CFUN reset when the same diagnostic
+// condition (by alertGroup) repeats with no healthy session in between.
+// Wedge states whose type normally never resets (persistent command failures,
+// radio outages where a re-registration may help) get one escalated reset on
+// every escalateEvery-th consecutive occurrence instead of retrying forever.
+type resetEscalator struct {
+	lastGroup DiagnosticErrorType
+	streak    int
+}
+
+const escalateEvery = 3
+
+// Observe records a diagnostic failure and reports whether a reset should be
+// forced in addition to the type's own reset policy.
+func (e *resetEscalator) Observe(t DiagnosticErrorType) bool {
+	group := alertGroup(t)
+	if group == e.lastGroup {
+		e.streak++
+	} else {
+		e.lastGroup = group
+		e.streak = 1
+	}
+	return e.streak%escalateEvery == 0
+}
+
+// Healthy resets the streak after a fully initialized, diagnosed session.
+func (e *resetEscalator) Healthy() {
+	e.lastGroup = ErrTypeNone
+	e.streak = 0
+}
+
+// needsModemReset reports whether a diagnostic error type warrants a full
+// AT+CFUN reset before the next attempt. SIM-class errors benefit from a
+// reset; so does a mandatory-init failure, since a wedged modem (or a
+// hot-inserted SIM the modem has not re-read) only recovers via AT+CFUN.
+func needsModemReset(t DiagnosticErrorType) bool {
+	switch t {
+	case ErrTypeSimNotDetected, ErrTypeSimPinRequired, ErrTypeSimPukLocked,
+		ErrTypeNetworkDenied, ErrTypeModemInitFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+// simReadyProbe does a focused SIM readiness check used to reclassify a
+// mandatory-init ERROR. Returns (true,nil) only when AT+CPIN? clearly reports
+// READY; a transport failure is surfaced as a *SessionError, while a modem
+// ERROR (or any non-READY status) counts as "not ready" without erroring.
+func simReadyProbe(modem ATCommander) (bool, error) {
+	resp, err := modem.Command("AT+CPIN?")
+	if err != nil {
+		if IsTimeoutError(err) {
+			return false, NewSessionError(err)
+		}
+		return false, nil
+	}
+	status, ok := parseCPIN(resp)
+	return ok && status == "READY", nil
+}
+
+// parseCPMSCounts extracts (used, total) of the first storage from a +CPMS
+// response line; returns (-1, -1) when the response is unparseable.
+func parseCPMSCounts(resp []string) (int, int) {
+	for _, line := range resp {
+		if !strings.HasPrefix(line, "+CPMS:") {
+			continue
+		}
+		rest := strings.TrimPrefix(line, "+CPMS:")
+		var nums []int
+		for _, field := range strings.Split(rest, ",") {
+			field = strings.TrimSpace(strings.Trim(strings.TrimSpace(field), `"`))
+			if n, err := strconv.Atoi(field); err == nil {
+				nums = append(nums, n)
+			}
+		}
+		if len(nums) >= 2 {
+			return nums[0], nums[1]
+		}
+	}
+	return -1, -1
+}
+
+// runModemLoop handles serial port connection and SMS polling.
+// needReset indicates if modem should be reset (e.g., after SIM error);
+// onHealthy is called once the session is fully initialized and diagnosed.
+func runModemLoop(ctx context.Context, cfg *Config, deliverer *Deliverer, notifier *ErrorNotifier, needReset bool, onHealthy func()) error {
 	// Open serial port
 	slog.Debug("Opening serial port", "port", cfg.SerialPort, "baud", cfg.BaudRate)
 	serialCfg := &serial.Config{
@@ -548,47 +762,42 @@ func runModemLoop(ctx context.Context, cfg *Config, tgBot *bot.Bot, notifier *Er
 	if needReset {
 		slog.Info("Performing full modem reset (AT+CFUN) to recover from previous error...")
 		modem.Command("AT+CFUN=0") // Minimum functionality (turns off RF)
-		time.Sleep(2 * time.Second)
-		modem.Command("AT+CFUN=1")  // Full functionality (re-init SIM)
-		time.Sleep(5 * time.Second) // Give modem time to reset and detect SIM
-
-		// Flush any garbage from modem buffer after reset
-		// Send a few AT commands to synchronize
-		for i := 0; i < 3; i++ {
-			modem.Command("AT")
-			time.Sleep(200 * time.Millisecond)
+		if !sleepCtx(ctx, 2*time.Second) {
+			return nil
 		}
-		// Disable echo
-		modem.Command("ATE0")
-		time.Sleep(200 * time.Millisecond)
-
+		modem.Command("AT+CFUN=1") // Full functionality (re-init SIM)
+		if !sleepCtx(ctx, 5*time.Second) {
+			return nil
+		}
 		slog.Info("Modem reset complete")
 	}
 
-	sessionStart := time.Now()
+	sessionStart := clk.Now()
+
+	// Mandatory session initialization (sync, echo off, PDU mode, SIM storage, CNMI)
+	simUsed, simTotal, err := initModemSession(modem)
+	if err != nil {
+		return err
+	}
+	notifier.CheckStorage(ctx, simUsed, simTotal)
 
 	// Run detailed modem diagnostics
 	slog.Info("Running modem diagnostics...")
-	if diagErr := runModemDiagnostics(ctx, modem, sessionStart, cfg.NetworkRegGrace); diagErr != nil {
-		return diagErr
+	if err := runModemDiagnostics(ctx, modem, sessionStart, cfg.NetworkRegGrace); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil // shutting down: no alert, no recovery
+		}
+		return err
 	}
 
-	// Notify recovery if there was a previous error
+	// Never announce recovery while shutting down.
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	// Session is fully initialized and diagnosed.
+	onHealthy()
 	notifier.NotifyRecovery(ctx)
-
-	// Set PDU mode (AT+CMGF=0)
-	if _, err := modem.Command("AT+CMGF=0"); err != nil {
-		slog.Warn("Failed to set PDU mode", "error", err)
-	} else {
-		slog.Debug("PDU mode set")
-	}
-
-	// Set preferred message storage to SIM
-	if _, err := modem.Command("AT+CPMS=\"SM\",\"SM\",\"SM\""); err != nil {
-		slog.Warn("Failed to set message storage", "error", err)
-	} else {
-		slog.Debug("Message storage set to SIM")
-	}
 
 	// Main loop: poll for SMS messages
 	pollInterval := 10 * time.Second
@@ -600,28 +809,20 @@ func runModemLoop(ctx context.Context, cfg *Config, tgBot *bot.Bot, notifier *Er
 	healthTicker := time.NewTicker(healthCheckInterval)
 	defer healthTicker.Stop()
 
-	// Track consecutive timeout errors (not modem ERROR responses)
-	consecutiveTimeouts := 0
-	const maxConsecutiveTimeouts = 3
-
 	slog.Info("Starting SMS polling loop",
 		"poll_interval", pollInterval,
 		"health_check_interval", healthCheckInterval,
 	)
 
-	// handleError analyzes the error and returns DiagnosticError if we should exit the loop
-	handleError := func(err error) *DiagnosticError {
+	// handleError decides whether an error ends the session. Transport errors
+	// end it immediately: after a deadline the response stream cannot be
+	// trusted (a late reply would satisfy the wrong command), so the outer
+	// loop reopens the port. Repeated-session alerting happens there.
+	handleError := func(err error) error {
 		slog.Error("Error processing messages", "error", err)
 
-		// Check if it's a timeout/disconnect error (modem not responding)
 		if IsTimeoutError(err) {
-			consecutiveTimeouts++
-			slog.Warn("Modem timeout", "consecutive", consecutiveTimeouts, "max", maxConsecutiveTimeouts)
-			if consecutiveTimeouts >= maxConsecutiveTimeouts {
-				return NewDiagnosticError(ErrTypeModemNotResponding,
-					"Modem not responding after %d attempts: %v", consecutiveTimeouts, err)
-			}
-			return nil // Continue polling, might recover
+			return NewSessionError(err)
 		}
 
 		// Check if it's a modem ERROR response (modem responds but command fails)
@@ -630,6 +831,9 @@ func runModemLoop(ctx context.Context, cfg *Config, tgBot *bot.Bot, notifier *Er
 			slog.Warn("Modem returned ERROR - running diagnostics to determine cause")
 			// Run diagnostics to get specific error
 			if diagErr := runModemDiagnostics(ctx, modem, sessionStart, cfg.NetworkRegGrace); diagErr != nil {
+				if errors.Is(diagErr, context.Canceled) || errors.Is(diagErr, context.DeadlineExceeded) {
+					return nil
+				}
 				return diagErr
 			}
 			// Diagnostics passed but we still got ERROR - generic modem error
@@ -642,12 +846,10 @@ func runModemLoop(ctx context.Context, cfg *Config, tgBot *bot.Bot, notifier *Er
 	}
 
 	// Process immediately on start
-	if err := processMessages(ctx, modem, tgBot, cfg); err != nil {
-		if diagErr := handleError(err); diagErr != nil {
-			return diagErr
+	if err := processMessages(ctx, modem, deliverer, cfg, simTotal); err != nil {
+		if loopErr := handleError(err); loopErr != nil {
+			return loopErr
 		}
-	} else {
-		consecutiveTimeouts = 0
 	}
 
 	for {
@@ -661,27 +863,42 @@ func runModemLoop(ctx context.Context, cfg *Config, tgBot *bot.Bot, notifier *Er
 			if err := modem.Ping(); err != nil {
 				if IsTimeoutError(err) {
 					slog.Error("Modem health check failed - not responding", "error", err)
-					return NewDiagnosticError(ErrTypeModemNotResponding,
-						"Modem health check failed: %v", err)
+					return NewSessionError(err)
 				}
 				// Modem responds but with ERROR - run diagnostics
 				slog.Warn("Modem health check returned ERROR - running diagnostics")
 				if diagErr := runModemDiagnostics(ctx, modem, sessionStart, cfg.NetworkRegGrace); diagErr != nil {
+					if errors.Is(diagErr, context.Canceled) || errors.Is(diagErr, context.DeadlineExceeded) {
+						return nil
+					}
 					return diagErr
 				}
 			}
 			slog.Debug("Modem health check passed")
-			consecutiveTimeouts = 0
+			// Track SIM storage usage so a filling SIM is alerted before
+			// inbound SMS start being rejected.
+			if resp, cpmsErr := modem.Command("AT+CPMS?"); cpmsErr == nil {
+				used, total := parseCPMSCounts(resp)
+				notifier.CheckStorage(ctx, used, total)
+			}
 
 		case <-ticker.C:
-			if err := processMessages(ctx, modem, tgBot, cfg); err != nil {
-				if diagErr := handleError(err); diagErr != nil {
-					return diagErr
+			if err := processMessages(ctx, modem, deliverer, cfg, simTotal); err != nil {
+				if loopErr := handleError(err); loopErr != nil {
+					return loopErr
 				}
-			} else {
-				consecutiveTimeouts = 0
 			}
 		}
+	}
+}
+
+// sleepCtx waits for d unless the context ends first; returns false on cancellation.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-clk.After(d):
+		return true
 	}
 }
 
@@ -695,235 +912,369 @@ type SMSMessage struct {
 	TotalParts  int
 }
 
-func processMessages(ctx context.Context, modem *SimpleAT, tgBot *bot.Bot, cfg *Config) error {
+// PendingSMS is one deliverable message together with every SIM slot it owns.
+// Deletion authority travels with the message: only a fully delivered
+// PendingSMS may free exactly its own PartIndices.
+type PendingSMS struct {
+	Message     SMSMessage
+	PartIndices []int
+	// RawFallback marks a strictly framed but undecodable PDU forwarded as
+	// raw hex (Message.Text holds the PDU, RawReason the parse problem).
+	RawFallback bool
+	RawReason   string
+}
+
+// ListResult is the typed outcome of one CMGL listing.
+type ListResult struct {
+	Pending              []PendingSMS
+	StatusReports        []int    // recognized status reports: deleted without forwarding
+	Stale                []int    // multipart parts past MULTIPART_MAX_AGE
+	Conflicts            []string // multipart groups with conflicting duplicate parts
+	PendingParts         int      // incomplete multipart groups still waiting
+	MaxPendingTotalParts int
+}
+
+// ErrCMGLCorrupted marks a listing whose header/PDU framing failed
+// validation. Nothing from such a transcript may be forwarded or deleted, and
+// the session is reopened.
+var ErrCMGLCorrupted = errors.New("CMGL transcript corrupted")
+
+// cmglTimeout: a full SIM produces a far larger response than any other
+// command we send, so the listing gets its own bounded timeout.
+const cmglTimeout = 20 * time.Second
+
+func processMessages(ctx context.Context, modem ATCommander, deliverer *Deliverer, cfg *Config, simTotal int) error {
 	slog.Debug("Checking for new SMS messages")
 
-	// List all messages from SIM storage
-	messages, indicesToDelete, err := listSMSMessages(modem, cfg.MultipartMaxAge)
+	result, err := listSMSMessages(modem, cfg.MultipartMaxAge)
 	if err != nil {
 		return fmt.Errorf("failed to list SMS messages: %w", err)
 	}
 
-	if len(messages) == 0 {
-		if len(indicesToDelete) == 0 {
-			slog.Debug("No messages found")
-			return nil
-		}
-		slog.Warn("No complete messages, but stale multipart parts found", "count", len(indicesToDelete))
-		if cfg.DryRun {
-			slog.Info("DRY_RUN: Skipping SMS deletion", "indices", indicesToDelete)
-			return nil
-		}
-		unique := make(map[int]struct{}, len(indicesToDelete))
-		for _, idx := range indicesToDelete {
-			if _, ok := unique[idx]; ok {
-				continue
-			}
-			unique[idx] = struct{}{}
-			slog.Debug("Deleting stale SMS part from SIM", "index", idx)
-			if err := deleteSMS(modem, idx); err != nil {
-				slog.Error("Failed to delete stale SMS part", "error", err, "index", idx)
-			}
-		}
+	for _, conflict := range result.Conflicts {
+		slog.Warn("Multipart group with conflicting duplicate parts - not assembling", "group", conflict)
+	}
+	if result.PendingParts > 0 {
+		slog.Info("Incomplete multipart messages - waiting for more parts", "pending", result.PendingParts)
+	}
+	if simTotal > 0 && result.MaxPendingTotalParts > simTotal {
+		slog.Warn("Pending multipart message declares more parts than SIM storage can hold - it can never complete",
+			"total_parts", result.MaxPendingTotalParts, "sim_capacity", simTotal)
+	}
+
+	// Status reports are modem delivery receipts, not user content: delete
+	// them without forwarding (documented policy).
+	if err := deleteBatch(modem, cfg, result.StatusReports, "status report"); err != nil {
+		return err
+	}
+	// Stale multipart cleanup is independent of delivery success.
+	if err := deleteBatch(modem, cfg, result.Stale, "stale multipart part"); err != nil {
+		return err
+	}
+
+	if len(result.Pending) == 0 {
+		slog.Debug("No deliverable messages")
 		return nil
 	}
+	slog.Info("Found SMS messages", "count", len(result.Pending))
 
-	slog.Info("Found SMS messages", "count", len(messages))
-
-	// Track which indices we've successfully sent
-	var sentIndices []int
-
-	for _, msg := range messages {
-		slog.Debug("Processing SMS",
-			"index", msg.Index,
-			"from", msg.From,
-			"time", msg.Time,
-			"text_length", len(msg.Text),
-		)
-
-		// Format message for Telegram
-		text := formatTelegramMessage(msg)
-
-		// Send to all configured chats with retry
-		if err := sendToTelegramWithRetry(ctx, tgBot, cfg, text); err != nil {
-			// Don't delete message if sending failed
-			slog.Error("Failed to send to Telegram after retries", "error", err, "index", msg.Index)
-			return fmt.Errorf("failed to deliver SMS to Telegram: %w", err)
+	for _, pending := range result.Pending {
+		if ctx.Err() != nil {
+			return nil
 		}
 
-		sentIndices = append(sentIndices, msg.Index)
-		slog.Info("SMS forwarded successfully", "from", msg.From, "index", msg.Index)
-	}
+		slog.Debug("Processing SMS",
+			"index", pending.Message.Index,
+			"from", pending.Message.From,
+			"time", pending.Message.Time,
+			"text_length", len(pending.Message.Text),
+			"raw_fallback", pending.RawFallback,
+		)
 
-	// Delete all processed SMS indices (including multipart parts)
-	// Only delete after ALL messages are successfully sent
-	// NEVER delete in DRY_RUN mode
-	if cfg.DryRun {
-		slog.Info("DRY_RUN: Skipping SMS deletion", "indices", indicesToDelete)
-	} else {
-		unique := make(map[int]struct{}, len(indicesToDelete))
-		for _, idx := range indicesToDelete {
-			if _, ok := unique[idx]; ok {
-				continue
+		switch deliverer.Deliver(ctx, pending) {
+		case deliveryDone:
+			// Delete exactly this message's slots, immediately after its own
+			// successful delivery, so an unrelated later failure can never
+			// cause a duplicate of this message.
+			if err := deleteBatch(modem, cfg, pending.PartIndices, "forwarded SMS"); err != nil {
+				return err
 			}
-			unique[idx] = struct{}{}
-			slog.Debug("Deleting SMS from SIM", "index", idx)
-			if err := deleteSMS(modem, idx); err != nil {
-				slog.Error("Failed to delete SMS", "error", err, "index", idx)
-				// Continue deleting others - deletion failure is not critical
-			}
+			slog.Info("SMS forwarded successfully",
+				"from", pending.Message.From, "indices", pending.PartIndices)
+
+		case deliveryRejected:
+			// Permanently rejected: retained on SIM, alerted once, skip it
+			// and keep going - one poisoned message must not block the rest.
+			continue
+
+		case deliveryDeferred:
+			// Transient/rate-limit/config problem: it would hit the next
+			// messages too. Stop here; the next poll retries everything
+			// still on the SIM.
+			slog.Info("Delivery deferred - remaining messages will be retried next poll")
+			return nil
 		}
 	}
 
 	return nil
 }
 
-// RawSMS holds the raw parsed SMS with index for deletion
-type RawSMS struct {
-	Index int
-	PDU   *PDUMessage
+// deleteBatch deletes the given SIM slots. A transport/session error aborts
+// immediately (an unacknowledged delete on a desynced stream must not be
+// followed by more deletes); a synchronized modem ERROR is logged and skipped.
+func deleteBatch(modem ATCommander, cfg *Config, indices []int, kind string) error {
+	if len(indices) == 0 {
+		return nil
+	}
+	if cfg.DryRun {
+		slog.Info("DRY_RUN: Skipping SMS deletion", "kind", kind, "indices", indices)
+		return nil
+	}
+	for _, idx := range indices {
+		slog.Debug("Deleting SMS from SIM", "kind", kind, "index", idx)
+		if err := deleteSMS(modem, idx); err != nil {
+			if IsTimeoutError(err) {
+				return fmt.Errorf("deleting %s at index %d: %w", kind, idx, err)
+			}
+			slog.Error("Failed to delete SMS (modem ERROR)", "kind", kind, "index", idx, "error", err)
+		}
+	}
+	return nil
 }
 
-func listSMSMessages(modem *SimpleAT, maxAge time.Duration) ([]SMSMessage, []int, error) {
-	// AT+CMGL=4 lists all messages in PDU mode
-	// 4 = all messages
-	resp, err := modem.Command("AT+CMGL=4")
+// cmglRecord is one strictly validated header+PDU pair from a listing.
+type cmglRecord struct {
+	index  int
+	stat   int
+	pduHex string
+}
+
+func listSMSMessages(modem ATCommander, maxAge time.Duration) (*ListResult, error) {
+	// AT+CMGL=4 lists all messages in PDU mode (4 = all)
+	resp, err := modem.CommandWithTimeout("AT+CMGL=4", cmglTimeout)
 	if err != nil {
-		return nil, nil, fmt.Errorf("AT+CMGL command failed: %w", err)
+		return nil, fmt.Errorf("AT+CMGL command failed: %w", err)
 	}
 
 	slog.Debug("CMGL response", "lines", resp)
 
-	// First pass: parse all PDUs
-	var rawMessages []RawSMS
-	lines := resp
+	records, err := parseCMGLTranscript(resp)
+	if err != nil {
+		return nil, err
+	}
+
+	collector := NewMultipartCollector()
+	result := &ListResult{}
+
+	for _, rec := range records {
+		// Storage status: 0/1 = received unread/read (ours to forward),
+		// 2/3 = stored unsent/sent (not inbound traffic - leave untouched).
+		if rec.stat == 2 || rec.stat == 3 {
+			slog.Debug("Skipping stored outgoing message", "index", rec.index, "stat", rec.stat)
+			continue
+		}
+
+		pdu, parseErr := ParsePDU(rec.pduHex)
+		if parseErr != nil {
+			var notDeliver *NotDeliverError
+			var unsupported *UnsupportedEncodingError
+
+			switch {
+			case errors.As(parseErr, &notDeliver):
+				if notDeliver.MTI == 2 {
+					slog.Debug("Status report found", "index", rec.index)
+					result.StatusReports = append(result.StatusReports, rec.index)
+				} else {
+					// A stored SUBMIT under stat 0/1 is not ours to touch.
+					slog.Warn("Non-DELIVER PDU in received storage - leaving in place",
+						"index", rec.index, "mti", notDeliver.MTI)
+				}
+
+			case errors.As(parseErr, &unsupported):
+				msg := SMSMessage{Index: rec.index, Text: rec.pduHex}
+				if unsupported.Msg != nil {
+					msg.From = unsupported.Msg.Sender
+					msg.Time = unsupported.Msg.Timestamp
+				}
+				result.Pending = append(result.Pending, PendingSMS{
+					Message:     msg,
+					PartIndices: []int{rec.index},
+					RawFallback: true,
+					RawReason:   parseErr.Error(),
+				})
+
+			default: // malformed PDU
+				slog.Warn("Failed to parse PDU",
+					"index", rec.index,
+					"pdu_len", len(rec.pduHex),
+					"pdu_fingerprint", contentFingerprint(rec.pduHex),
+					"error", parseErr,
+				)
+				slog.Debug("Unparseable PDU content", "pdu", rec.pduHex)
+				result.Pending = append(result.Pending, PendingSMS{
+					Message:     SMSMessage{Index: rec.index, Text: rec.pduHex},
+					PartIndices: []int{rec.index},
+					RawFallback: true,
+					RawReason:   parseErr.Error(),
+				})
+			}
+			continue
+		}
+
+		if pdu.IsMultipart {
+			slog.Debug("Multipart SMS part",
+				"index", rec.index,
+				"ref", pdu.MultipartRef,
+				"part", pdu.PartNumber,
+				"total", pdu.TotalParts,
+			)
+		}
+
+		assembled, partIndices := collector.Add(rec.index, pdu)
+		if assembled == nil {
+			continue // incomplete or conflicted multipart
+		}
+		result.Pending = append(result.Pending, PendingSMS{
+			Message: SMSMessage{
+				Index:       partIndices[0],
+				From:        assembled.Sender,
+				Text:        assembled.Text,
+				Time:        assembled.Timestamp,
+				SMSC:        assembled.SMSC,
+				IsMultipart: assembled.IsMultipart,
+				TotalParts:  assembled.TotalParts,
+			},
+			PartIndices: partIndices,
+		})
+	}
+
+	result.PendingParts = collector.Pending()
+	result.Conflicts = collector.Conflicts()
+	result.MaxPendingTotalParts = collector.MaxPendingTotalParts()
+	if maxAge > 0 {
+		result.Stale = collector.StaleIndices(maxAge, clk.Now())
+		if len(result.Stale) > 0 {
+			slog.Warn("Stale multipart parts detected", "count", len(result.Stale), "max_age", maxAge)
+		}
+	}
+
+	return result, nil
+}
+
+// parseCMGLTranscript validates the header/PDU framing of a CMGL response.
+// Any inconsistency fails the whole listing: after at.go's URC filtering a
+// stray or short line means the transcript cannot be trusted, and forwarding
+// or deleting based on it risks losing a real SMS.
+func parseCMGLTranscript(lines []string) ([]cmglRecord, error) {
+	var records []cmglRecord
 
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
 		if !strings.HasPrefix(line, "+CMGL:") {
-			continue
+			return nil, fmt.Errorf("%w: unexpected line %q", ErrCMGLCorrupted, line)
 		}
 
-		// Parse header: +CMGL: <index>,<stat>,<alpha>,<length>
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		fields := strings.Split(parts[1], ",")
-		if len(fields) < 1 {
-			continue
-		}
-
-		index, err := strconv.Atoi(strings.TrimSpace(fields[0]))
+		index, stat, tpduLen, err := parseCMGLHeader(line)
 		if err != nil {
-			slog.Warn("Failed to parse message index", "line", line, "error", err)
-			continue
+			return nil, fmt.Errorf("%w: %v", ErrCMGLCorrupted, err)
 		}
 
-		// Next line should be the PDU
 		if i+1 >= len(lines) {
-			continue
+			return nil, fmt.Errorf("%w: header %q without PDU line", ErrCMGLCorrupted, line)
 		}
 		i++
 		pduStr := strings.TrimSpace(lines[i])
 
-		// Parse PDU using our custom parser
-		pdu, err := ParsePDU(pduStr)
-		if err != nil {
-			slog.Warn("Failed to parse PDU", "pdu", pduStr, "error", err)
-			// Still add message with raw data so we can forward it
-			rawMessages = append(rawMessages, RawSMS{
-				Index: index,
-				PDU: &PDUMessage{
-					Sender:    "unknown",
-					Timestamp: time.Now(),
-					Text:      fmt.Sprintf("[PDU parse error: %v]\nRaw: %s", err, pduStr),
-				},
-			})
-			continue
+		if err := validatePDULine(pduStr, tpduLen); err != nil {
+			return nil, fmt.Errorf("%w: index %d: %v", ErrCMGLCorrupted, index, err)
 		}
 
-		rawMessages = append(rawMessages, RawSMS{Index: index, PDU: pdu})
+		records = append(records, cmglRecord{index: index, stat: stat, pduHex: pduStr})
 	}
 
-	// Second pass: assemble multipart messages
-	collector := NewMultipartCollector()
-	var messages []SMSMessage
-	var indicesToDelete []int
-
-	for _, raw := range rawMessages {
-		if raw.PDU.IsMultipart {
-			slog.Debug("Multipart SMS part",
-				"index", raw.Index,
-				"ref", raw.PDU.MultipartRef,
-				"part", raw.PDU.PartNumber,
-				"total", raw.PDU.TotalParts,
-			)
-
-			assembled, partIndices := collector.Add(raw.Index, raw.PDU)
-			if assembled != nil {
-				messages = append(messages, SMSMessage{
-					Index:       raw.Index, // Use last part's index
-					From:        assembled.Sender,
-					Text:        assembled.Text,
-					Time:        assembled.Timestamp,
-					SMSC:        assembled.SMSC,
-					IsMultipart: true,
-					TotalParts:  raw.PDU.TotalParts,
-				})
-				indicesToDelete = append(indicesToDelete, partIndices...)
-			}
-		} else {
-			messages = append(messages, SMSMessage{
-				Index:       raw.Index,
-				From:        raw.PDU.Sender,
-				Text:        raw.PDU.Text,
-				Time:        raw.PDU.Timestamp,
-				SMSC:        raw.PDU.SMSC,
-				IsMultipart: false,
-				TotalParts:  1,
-			})
-			indicesToDelete = append(indicesToDelete, raw.Index)
-		}
-	}
-
-	// Warn about incomplete multipart messages
-	if pending := collector.Pending(); pending > 0 {
-		slog.Warn("Some multipart messages are incomplete - waiting for more parts", "pending", pending)
-	}
-
-	if maxAge > 0 {
-		now := time.Now()
-		stale := collector.StaleIndices(maxAge, now)
-		if len(stale) > 0 {
-			slog.Warn("Stale multipart parts detected", "count", len(stale), "max_age", maxAge)
-			indicesToDelete = append(indicesToDelete, stale...)
-		}
-	}
-
-	return messages, indicesToDelete, nil
+	return records, nil
 }
 
-func deleteSMS(modem *SimpleAT, index int) error {
+// parseCMGLHeader parses "+CMGL: <index>,<stat>,<alpha>,<length>" honoring
+// quoted alpha fields that may contain commas.
+func parseCMGLHeader(line string) (index, stat, tpduLen int, err error) {
+	rest := strings.TrimSpace(strings.TrimPrefix(line, "+CMGL:"))
+	fields := splitQuoted(rest)
+	if len(fields) < 3 {
+		return 0, 0, 0, fmt.Errorf("header %q has %d fields, want >= 3", line, len(fields))
+	}
+
+	index, err = strconv.Atoi(strings.TrimSpace(fields[0]))
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("bad index in header %q: %v", line, err)
+	}
+	// Text-mode listings quote the status ("REC UNREAD"); seeing one means
+	// PDU mode is not active and nothing in the transcript can be trusted.
+	stat, err = strconv.Atoi(strings.TrimSpace(fields[1]))
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("bad stat in header %q: %v", line, err)
+	}
+	tpduLen, err = strconv.Atoi(strings.TrimSpace(fields[len(fields)-1]))
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("bad length in header %q: %v", line, err)
+	}
+	return index, stat, tpduLen, nil
+}
+
+// splitQuoted splits a comma-separated field list, keeping quoted fields
+// (which may contain commas) intact.
+func splitQuoted(s string) []string {
+	var fields []string
+	var cur strings.Builder
+	inQuotes := false
+	for _, r := range s {
+		switch {
+		case r == '"':
+			inQuotes = !inQuotes
+		case r == ',' && !inQuotes:
+			fields = append(fields, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	fields = append(fields, cur.String())
+	return fields
+}
+
+// validatePDULine checks that the candidate PDU line is pure hex and its
+// byte count matches the header: total = 1 (SMSC length octet) + SMSC bytes
+// + <length> TPDU bytes. This is what proves the line really is the PDU
+// belonging to the preceding header.
+func validatePDULine(pduStr string, tpduLen int) error {
+	if pduStr == "" {
+		return fmt.Errorf("empty PDU line")
+	}
+	if len(pduStr)%2 != 0 {
+		return fmt.Errorf("odd hex length %d", len(pduStr))
+	}
+	data, err := hex.DecodeString(pduStr)
+	if err != nil {
+		return fmt.Errorf("not hex: %v", err)
+	}
+	smscLen := int(data[0])
+	expected := 1 + smscLen + tpduLen
+	if len(data) != expected {
+		return fmt.Errorf("PDU is %d bytes, header requires %d (SMSC %d + TPDU %d)",
+			len(data), expected, smscLen, tpduLen)
+	}
+	return nil
+}
+
+func deleteSMS(modem ATCommander, index int) error {
 	cmd := fmt.Sprintf("AT+CMGD=%d", index)
 	_, err := modem.Command(cmd)
 	return err
 }
 
+// formatTelegramMessage renders a single (non-chunked) SMS notification.
 func formatTelegramMessage(msg SMSMessage) string {
-	var sb strings.Builder
-	sb.WriteString("<b>SMS Received</b>\n\n")
-	sb.WriteString(fmt.Sprintf("<b>From:</b> <code>%s</code>\n", escapeHTML(msg.From)))
-	sb.WriteString(fmt.Sprintf("<b>Time:</b> %s\n", msg.Time.Format("2006-01-02 15:04:05")))
-	if msg.SMSC != "" {
-		sb.WriteString(fmt.Sprintf("<b>SMSC:</b> %s\n", escapeHTML(msg.SMSC)))
-	}
-	if msg.IsMultipart {
-		sb.WriteString(fmt.Sprintf("<b>Parts:</b> %d\n", msg.TotalParts))
-	}
-	sb.WriteString(fmt.Sprintf("\n%s", escapeHTML(msg.Text)))
-	return sb.String()
+	return buildTelegramMessages(PendingSMS{Message: msg})[0]
 }
 
 func escapeHTML(s string) string {
@@ -933,84 +1284,4 @@ func escapeHTML(s string) string {
 		">", "&gt;",
 	)
 	return replacer.Replace(s)
-}
-
-func sendToTelegramWithRetry(ctx context.Context, tgBot *bot.Bot, cfg *Config, text string) error {
-	if cfg.DryRun {
-		slog.Info("DRY_RUN: Would send to Telegram", "text", text, "chat_ids", cfg.ChatIDs)
-		return nil
-	}
-
-	if tgBot == nil {
-		return fmt.Errorf("telegram bot not initialized")
-	}
-
-	maxRetries := 10
-	baseDelay := 5 * time.Second
-	maxDelay := 5 * time.Minute
-
-	var sendErrors []error
-
-	for _, chatID := range cfg.ChatIDs {
-		delay := baseDelay
-		var lastErr error
-
-		for attempt := 1; attempt <= maxRetries; attempt++ {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-
-			slog.Debug("Sending to Telegram", "chat_id", chatID, "attempt", attempt)
-
-			sendCtx, cancel := context.WithTimeout(ctx, cfg.TelegramSendTimeout)
-			_, err := tgBot.SendMessage(sendCtx, &bot.SendMessageParams{
-				ChatID:    chatID,
-				Text:      text,
-				ParseMode: models.ParseModeHTML,
-			})
-			cancel()
-
-			if err == nil {
-				slog.Debug("Message sent successfully", "chat_id", chatID)
-				lastErr = nil
-				break
-			}
-			lastErr = err
-
-			slog.Warn("Failed to send to Telegram",
-				"chat_id", chatID,
-				"attempt", attempt,
-				"error", err,
-				"next_retry_in", delay,
-			)
-
-			if attempt == maxRetries {
-				break
-			}
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
-			}
-
-			// Exponential backoff with cap
-			delay = delay * 2
-			if delay > maxDelay {
-				delay = maxDelay
-			}
-		}
-
-		if lastErr != nil {
-			sendErrors = append(sendErrors, fmt.Errorf("failed to send to chat %d after %d attempts: %w", chatID, maxRetries, lastErr))
-		}
-	}
-
-	if len(sendErrors) > 0 {
-		return errors.Join(sendErrors...)
-	}
-
-	return nil
 }

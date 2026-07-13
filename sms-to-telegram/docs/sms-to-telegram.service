@@ -8,12 +8,14 @@ Type=simple
 Restart=always
 RestartSec=10
 
-# Configuration
-Environment=TELEGRAM_BOT_TOKEN=your-token-here
-Environment=TELEGRAM_CHAT_IDS=-100123456789
-Environment=SERIAL_PORT=/dev/ttyUSB0
-Environment=BAUD_RATE=115200
-Environment=LOG_LEVEL=INFO
+# Configuration lives in a root-owned 0600 environment file so the secrets
+# never appear in this world-readable unit. The installer creates it with:
+#   TELEGRAM_BOT_TOKEN=...
+#   TELEGRAM_CHAT_IDS=...
+#   SERIAL_PORT=...
+#   BAUD_RATE=...
+#   LOG_LEVEL=INFO
+EnvironmentFile=/opt/sms-to-telegram/env
 
 ExecStart=/usr/local/bin/sms-to-telegram
 

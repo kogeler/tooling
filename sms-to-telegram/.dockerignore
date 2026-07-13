@@ -1,0 +1,11 @@
+# Keep the Docker build context minimal: only source, go.mod/go.sum and
+# build inputs are needed. Local-only files must never reach the builder.
+.git
+.gitignore
+.gocache/
+.dockerignore
+sms-to-telegram
+tokens.sh
+*.md
+docs/
+Dockerfile
