@@ -13,7 +13,8 @@ inputs:
     description: >
       source-changes: projects with any changed files in the range; falls back
       to ALL projects when the range is unknown (new branch, dispatch) or when
-      .github/ itself changed - for test workflows.
+      the Go CI definition itself changed (.github/workflows/go-*,
+      .github/actions/go-projects-matrix/) - for test workflows.
       version-changes: projects whose .version file changed in the range;
       never falls back to "all" - for release workflows.
     required: false
@@ -101,8 +102,10 @@ runs:
             fi
           done | sort -u) || true
         else
-          if [ -z "$RANGE" ] || echo "$CHANGED_FILES" | grep -q '^\.github/'; then
-            # Unknown range, or the CI definition itself changed: test everything.
+          if [ -z "$RANGE" ] \
+             || echo "$CHANGED_FILES" | grep -qE '^\.github/(workflows/go-|actions/go-projects-matrix/)'; then
+            # Unknown range, or the Go CI definition itself changed: test
+            # everything. CI files of other pipelines do not retest Go.
             TARGETS="$ALL_PROJECTS"
           else
             TARGETS=$(echo "$CHANGED_FILES" | while read -r f; do
