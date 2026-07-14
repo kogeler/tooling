@@ -17,86 +17,97 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set_matrix.outputs.matrix }}
-      has_changes: ${{ steps.set_matrix.outputs.has_changes }}
+      matrix: ${{ steps.projects.outputs.result }}
+      has_changes: ${{ fromJSON(steps.projects.outputs.result).folders[0] != null }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+
+      - name: Locate Docker images to build
+        id: projects
+        uses: actions/github-script@v9
         with:
-          fetch-depth: 2 # Need at least 2 commits to compare
+          retries: 3
+          script: |
+            const fs = require('fs');
+            const path = require('path');
 
-      - name: Get folders with .version changes
-        id: get_changed_dirs
-        run: |
-          # Get list of changed files in this commit
-          echo "Checking for changed files in commit ${{ github.sha }}"
+            const workspace = process.env.GITHUB_WORKSPACE;
+            const projects = fs.readdirSync(workspace, { withFileTypes: true })
+              .filter((entry) => entry.isDirectory())
+              .map((entry) => entry.name)
+              .filter((folder) =>
+                fs.existsSync(path.join(workspace, folder, 'Dockerfile')) &&
+                fs.existsSync(path.join(workspace, folder, '.version'))
+              )
+              .sort();
 
-          # For push events, compare with the previous commit
-          if [ "${{ github.event_name }}" = "push" ]; then
-            # Get changed files between HEAD~1 and HEAD
-            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff-tree --no-commit-id --name-only -r ${{ github.sha }})
-          else
-            # Fallback for other events
-            CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r ${{ github.sha }})
-          fi
+            const { owner, repo } = context.repo;
+            const { data: account } = await github.rest.users.getByUsername({
+              username: owner,
+            });
+            const isOrganization = account.type === 'Organization';
+            const route = isOrganization
+              ? 'GET /orgs/{org}/packages/{package_type}/{package_name}/versions'
+              : 'GET /users/{username}/packages/{package_type}/{package_name}/versions';
+            const targets = [];
 
-          echo "Changed files:"
-          echo "$CHANGED_FILES"
+            for (const folder of projects) {
+              const version = fs.readFileSync(
+                path.join(workspace, folder, '.version'),
+                'utf8'
+              ).split(/\r?\n/).find((line) => line.trim())?.trim();
 
-          # Filter for .version files and extract folder names
-          CHANGED_DIRS=$(echo "$CHANGED_FILES" | grep '\.version$' | while read file; do
-            # Extract the folder name (first part of the path)
-            folder=$(echo "$file" | cut -d'/' -f1)
-            # Check if it's a top-level folder with both Dockerfile and .version
-            if [ -f "$folder/Dockerfile" ] && [ -f "$folder/.version" ]; then
-              echo "$folder"
-            fi
-          done | sort -u)
+              if (!version) {
+                throw new Error(`${folder}/.version is empty`);
+              }
 
-          echo "Folders with .version changes:"
-          echo "$CHANGED_DIRS"
+              const params = {
+                package_type: 'container',
+                package_name: `${repo}/${folder}`,
+                per_page: 100,
+                ...(isOrganization ? { org: owner } : { username: owner }),
+              };
+              let versions;
 
-          # Convert to JSON array
-          if [ -z "$CHANGED_DIRS" ]; then
-            JSON="[]"
-          else
-            JSON=$(echo "$CHANGED_DIRS" | jq -R -s -c 'split("\n")[:-1]')
-          fi
+              try {
+                versions = await github.paginate(route, params);
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+                versions = [];
+              }
 
-          echo "dirs=$JSON" >> $GITHUB_OUTPUT
+              const hasTag = (packageVersion, tag) =>
+                packageVersion.metadata?.container?.tags?.includes(tag);
+              const versionPackage = versions.find((item) => hasTag(item, version));
+              const latestPackage = versions.find((item) => hasTag(item, 'latest'));
 
-      - name: Debug changed directories
-        run: |
-          echo "Changed directories with .version: ${{ steps.get_changed_dirs.outputs.dirs }}"
+              if (!versionPackage) {
+                core.info(`${folder}: ${version} tag is not published`);
+                targets.push(folder);
+              } else if (!latestPackage || versionPackage.id !== latestPackage.id) {
+                core.info(`${folder}: latest does not point to ${version}`);
+                targets.push(folder);
+              } else {
+                core.info(`${folder}: ${version} is already published`);
+              }
+            }
 
-      - name: Set matrix
-        id: set_matrix
-        run: |
-          DIRS='${{ steps.get_changed_dirs.outputs.dirs }}'
-
-          # Check if we have any directories to build
-          if [ "$DIRS" = "[]" ] || [ -z "$DIRS" ]; then
-            echo "No folders with .version changes found"
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-            echo "matrix={\"folders\":[]}" >> $GITHUB_OUTPUT
-          else
-            echo "Found folders with .version changes"
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-            # Wrap it into {"folders": [...]} format
-            MATRIX_JSON=$(jq -c -n --argjson arr "$DIRS" '{folders: $arr}')
-            echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
-          fi
+            return { folders: targets };
 
       - name: Summary
+        env:
+          MATRIX: ${{ steps.projects.outputs.result }}
         run: |
-          if [ "${{ steps.set_matrix.outputs.has_changes }}" = "true" ]; then
+          if [ "${{ fromJSON(steps.projects.outputs.result).folders[0] != null }}" = "true" ]; then
             echo "### 🐳 Docker images to build" >> $GITHUB_STEP_SUMMARY
-            echo "${{ steps.get_changed_dirs.outputs.dirs }}" | jq -r '.[]' | while read dir; do
+            echo "$MATRIX" | jq -r '.folders[]' | while read -r dir; do
               echo "- $dir" >> $GITHUB_STEP_SUMMARY
             done
           else
-            echo "### ℹ️ No .version files changed" >> $GITHUB_STEP_SUMMARY
-            echo "No Docker images will be built in this run." >> $GITHUB_STEP_SUMMARY
+            echo "### ℹ️ All Docker images are current" >> $GITHUB_STEP_SUMMARY
           fi
 
   build_and_push:
