@@ -484,7 +484,7 @@ def main():
                 consecutive_failures += 1
 
                 if consecutive_failures >= max_consecutive_failures:
-                    logging.critical(f"Too many consecutive failures. Exiting.")
+                    logging.critical("Too many consecutive failures. Exiting.")
                     sys.exit(1)
 
             logging.debug(f"Waiting {config['interval']} seconds before the next check...")

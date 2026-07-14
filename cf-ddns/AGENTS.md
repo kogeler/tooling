@@ -1,0 +1,57 @@
+# cf-ddns — agent entry point
+
+Plan status: stage 0 in progress
+
+## What this is
+
+A single-module Python service that keeps one Cloudflare DNS A record pointed at
+this host's external IPv4 address. It polls public check-IP services, updates the
+record through the Cloudflare v4 API when the address changes, and exposes
+Prometheus metrics on an HTTP endpoint. It runs as a long-lived container process.
+
+## File map
+
+- `cf_ddns.py` — the entire service (config, API client, main loop, metrics).
+- `test_ddns.py` — legacy test suite (being replaced in plan Stage 1).
+- `requirements.txt` / `requirements-dev.txt` — pinned runtime / dev dependencies.
+- `Makefile` — venv, test, lint, clean targets (see below).
+- `Dockerfile` — `python:3.14-alpine`, non-root user, runs `cf_ddns.py`.
+- `.version` — release version; must match the Dockerfile `LABEL version`.
+- `tokens.sh` — **gitignored** real credentials for manual live checks against the
+  dedicated test record; never commit, never echo its values.
+- `TEST_DOCUMENTATION.md` — stale; scheduled for deletion in plan Stage 7.
+
+## How to work on it
+
+```sh
+make venv    # create ./venv and install pinned deps (idempotent)
+make test    # pytest with branch coverage
+make lint    # ruff check
+make clean   # remove venv and caches
+podman build -t cf-ddns cf-ddns/   # container build
+```
+
+Live manual check (mutates only the dedicated test host):
+`. tokens.sh && ./venv/bin/python cf_ddns.py`
+
+## Configuration (env vars)
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `CF_DDNS_TOKEN` | yes | — | Cloudflare API token with DNS edit rights |
+| `CF_DDNS_ZONE_ID` | yes | — | Cloudflare zone ID |
+| `CF_DDNS_HOST` | yes | — | FQDN of the managed A record |
+| `CF_DDNS_INTERVAL` | no | `10` | seconds between IP checks (≥1) |
+| `CF_DDNS_TTL` | no | `120` | record TTL |
+| `CF_DDNS_PROXIED` | no | `False` | `true` to proxy through Cloudflare |
+| `CF_DDNS_LOGLEVEL` | no | `INFO` | DEBUG/INFO/WARNING/ERROR/CRITICAL |
+| `CF_DDNS_METRICS_PORT` | no | `9101` | Prometheus endpoint port |
+
+## Ongoing refactor
+
+This module is being reworked in staged commits. The authoritative plan (stage
+ordering, frozen contracts, invariants, per-stage acceptance criteria) lives in
+`plans/cf-ddns-review/cf-ddns-fix-plan.md` (local, gitignored); background findings
+in `plans/cf-ddns-review/cf-ddns-review.md`. Follow the plan's execution rules —
+stages are strictly sequential and each ends with green `make test` + clean
+`make lint`.

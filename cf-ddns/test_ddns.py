@@ -10,19 +10,10 @@ Comprehensive test suite for cf-ddns-fixed service to verify all fixes.
 
 import unittest
 import os
-import sys
-import time
-import tempfile
-from unittest.mock import Mock, patch, MagicMock, call
+from unittest.mock import Mock, patch, MagicMock
 import requests
-from typing import Dict, Any
 
-# Add the parent directory to the path to import the module
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-# Import the functions from the fixed script
-from importlib.machinery import SourceFileLoader
-cf_ddns = SourceFileLoader("cf_ddns", "cf-ddns.py").load_module()
+import cf_ddns
 
 
 class TestDDNSInitialization(unittest.TestCase):
@@ -131,7 +122,8 @@ class TestRecordIdManagement(unittest.TestCase):
 
         with patch.object(cf_ddns, 'update_cloudflare_record') as mock_update:
             with patch.object(cf_ddns, 'get_dns_record') as mock_get:
-                with patch.object(cf_ddns, 'create_dns_record') as mock_create:
+                # patched so no real create can happen; the mock itself is unused
+                with patch.object(cf_ddns, 'create_dns_record'):
                     # First update fails
                     mock_update.side_effect = [False, True]
                     # Get new record ID
@@ -662,62 +654,3 @@ class TestIPHistory(unittest.TestCase):
                 mock_gauge.remove.assert_not_called()
 
 
-def run_comprehensive_tests():
-    """Run all tests with detailed output."""
-    print("=" * 60)
-    print("Running Comprehensive DDNS Service Tests")
-    print("=" * 60)
-
-    # Create test suite
-    loader = unittest.TestLoader()
-    suite = unittest.TestSuite()
-
-    # Add all test classes
-    test_classes = [
-        TestDDNSInitialization,
-        TestRecordIdManagement,
-        TestMetricsInitialization,
-        TestIPMetricInitialization,
-        TestIPValidation,
-        TestRetryLogic,
-        TestConfigValidation,
-        TestConsecutiveFailures,
-        TestCompleteScenarios,
-        TestIPHistory
-    ]
-
-    for test_class in test_classes:
-        suite.addTests(loader.loadTestsFromTestCase(test_class))
-
-    # Run tests with verbose output
-    runner = unittest.TextTestRunner(verbosity=2)
-    result = runner.run(suite)
-
-    # Print detailed summary
-    print("\n" + "=" * 60)
-    print("Test Summary:")
-    print("-" * 60)
-    print(f"Tests run: {result.testsRun}")
-    print(f"Failures: {len(result.failures)}")
-    print(f"Errors: {len(result.errors)}")
-    print(f"Skipped: {len(result.skipped)}")
-    print(f"Success rate: {((result.testsRun - len(result.failures) - len(result.errors)) / result.testsRun * 100):.1f}%")
-
-    if result.failures:
-        print("\nFailed tests:")
-        for test, traceback in result.failures:
-            print(f"  - {test}")
-
-    if result.errors:
-        print("\nTests with errors:")
-        for test, traceback in result.errors:
-            print(f"  - {test}")
-
-    print("=" * 60)
-
-    return result.wasSuccessful()
-
-
-if __name__ == "__main__":
-    success = run_comprehensive_tests()
-    sys.exit(0 if success else 1)

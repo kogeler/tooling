@@ -34,11 +34,11 @@ Install dependencies via pip:
 
 Make sure the script is executable:
 
-    chmod +x tooling/cf-ddns/cf-ddns.py
+    chmod +x tooling/cf-ddns/cf_ddns.py
 
 Then run the script:
 
-    ./tooling/cf-ddns/cf-ddns.py
+    ./tooling/cf-ddns/cf_ddns.py
 
 ---
 
