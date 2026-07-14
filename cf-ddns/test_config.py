@@ -15,6 +15,7 @@ OPTIONAL = (
     "CF_DDNS_TTL",
     "CF_DDNS_PROXIED",
     "CF_DDNS_METRICS_PORT",
+    "CF_DDNS_MAX_FAILURES",
 )
 
 
@@ -49,7 +50,20 @@ def test_defaults(required_env):
         "ttl": 120,
         "proxied": False,
         "metrics_port": 9101,
+        "max_failures": 10,
     }
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc", ""])
+def test_invalid_max_failures_exits(required_env, monkeypatch, value):
+    monkeypatch.setenv("CF_DDNS_MAX_FAILURES", value)
+    with pytest.raises(SystemExit):
+        cf_ddns.parse_env()
+
+
+def test_max_failures_accepted(required_env, monkeypatch):
+    monkeypatch.setenv("CF_DDNS_MAX_FAILURES", "3")
+    assert cf_ddns.parse_env()["max_failures"] == 3
 
 
 @pytest.mark.parametrize("value", ["0", "-5", "abc", ""])

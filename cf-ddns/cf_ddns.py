@@ -10,6 +10,7 @@ import time
 import random
 import logging
 import requests
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
@@ -155,6 +156,16 @@ def parse_env() -> Dict[str, Any]:
         logging.error(f"Invalid value for CF_DDNS_METRICS_PORT: {metrics_port_str}. {e}")
         sys.exit(1)
 
+    # Consecutive-failure budget shared by IP retrieval and DNS updates (H2)
+    max_failures_str = os.environ.get("CF_DDNS_MAX_FAILURES", "10")
+    try:
+        max_failures = int(max_failures_str)
+        if max_failures < 1:
+            raise ValueError("Max consecutive failures must be at least 1")
+    except ValueError as e:
+        logging.error(f"Invalid value for CF_DDNS_MAX_FAILURES: {max_failures_str}. {e}")
+        sys.exit(1)
+
     return {
         "token": token,
         "zone_id": zone_id,
@@ -162,7 +173,8 @@ def parse_env() -> Dict[str, Any]:
         "interval": interval,
         "ttl": ttl,
         "proxied": proxied,
-        "metrics_port": metrics_port
+        "metrics_port": metrics_port,
+        "max_failures": max_failures
     }
 
 
@@ -184,7 +196,26 @@ def validate_ipv4(ip: str) -> bool:
         return False
 
 
-def create_http_clients(token: str) -> Tuple[requests.Session, requests.Session]:
+@dataclass
+class DdnsState:
+    """Mutable loop state threaded through run_iteration() (frozen contract)."""
+
+    last_ip: Optional[str] = None
+    record_id: Optional[str] = None
+    ip_failures: int = 0         # consecutive external-IP retrieval failures
+    cf_failures: int = 0         # consecutive Cloudflare transient-failure iterations
+    fatal: Optional[str] = None  # unrecoverable outcome; main() exits when set
+
+
+@dataclass
+class HttpClients:
+    """The two persistent HTTP sessions (frozen contract)."""
+
+    cloudflare: requests.Session  # carries the bearer header; CF hosts only
+    check_ip: requests.Session    # never carries Cloudflare credentials
+
+
+def create_http_clients(token: str) -> HttpClients:
     """
     Create the two persistent HTTP sessions: an authenticated Cloudflare
     session and a plain check-IP session.
@@ -198,7 +229,7 @@ def create_http_clients(token: str) -> Tuple[requests.Session, requests.Session]
         "Content-Type": "application/json",
     })
     ip_session = requests.Session()
-    return cf_session, ip_session
+    return HttpClients(cloudflare=cf_session, check_ip=ip_session)
 
 
 class _CfResult(NamedTuple):
@@ -570,44 +601,45 @@ def initialize_metrics(config: Dict[str, Any]):
 
 def handle_dns_update(config: Dict[str, Any], record_id: Optional[str],
                       current_ip: str,
-                      cf_session: requests.Session) -> Tuple[bool, Optional[str]]:
+                      cf_session: requests.Session) -> Tuple[Outcome, Optional[str]]:
     """
-    Fail-closed DNS update orchestration.
+    DNS write orchestration (full decision table, C1 fix).
 
-    Invariant (C1): create_dns_record() is called only after a confirmed
-    ABSENT in the same attempt; TRANSIENT, PERMANENT, and AMBIGUOUS outcomes
-    never mutate anything.
+    Invariant: create_dns_record() is called only after a confirmed ABSENT in
+    the same iteration; TRANSIENT, PERMANENT, and AMBIGUOUS outcomes never
+    mutate anything; a create is never issued twice.
 
-    Returns (success, record_id).
-
-    # TODO(stage-3): replaced by the full decision table with DdnsState.
+    Returns (aggregated outcome, best-known record id). The aggregated
+    outcome is one of OK, TRANSIENT, PERMANENT, AMBIGUOUS.
     """
     zone_id = config["zone_id"]
     host = config["host"]
     ttl = config["ttl"]
     proxied = config["proxied"]
 
-    if record_id:
-        outcome = update_cloudflare_record(
-            cf_session, zone_id, record_id, host, current_ip, ttl, proxied
+    def _update(rid: str) -> Outcome:
+        return update_cloudflare_record(
+            cf_session, zone_id, rid, host, current_ip, ttl, proxied
         )
+
+    if record_id:
+        outcome = _update(record_id)
         if outcome is Outcome.OK:
-            return True, record_id
+            return Outcome.OK, record_id
         if outcome is not Outcome.GONE:
             # TRANSIENT or PERMANENT: nothing may be mutated this attempt.
-            return False, record_id
+            return outcome, record_id
         # The record id is confirmed dead — fall through to a fresh read.
         logging.info("Record is gone. Re-reading DNS state.")
-        record_id = None
 
     get_outcome, record = get_dns_record(cf_session, zone_id, host)
 
     if get_outcome is Outcome.OK:
-        new_record_id = record["id"]
-        outcome = update_cloudflare_record(
-            cf_session, zone_id, new_record_id, host, current_ip, ttl, proxied
-        )
-        return outcome is Outcome.OK, new_record_id
+        outcome = _update(record["id"])
+        if outcome is Outcome.GONE:
+            # Deleted between read and write; the next iteration re-reads.
+            return Outcome.TRANSIENT, None
+        return outcome, record["id"]
 
     if get_outcome is Outcome.ABSENT:
         logging.info("Creating new DNS record.")
@@ -615,11 +647,153 @@ def handle_dns_update(config: Dict[str, Any], record_id: Optional[str],
             cf_session, zone_id, host, current_ip, ttl, proxied
         )
         if create_outcome is Outcome.OK:
-            return True, new_record_id
-        return False, None
+            return Outcome.OK, new_record_id
+        if create_outcome is Outcome.EXISTS:
+            # Raced with another writer: adopt the existing record and update
+            # it — never issue a second create.
+            adopt_outcome, adopted = get_dns_record(cf_session, zone_id, host)
+            if adopt_outcome is Outcome.OK:
+                outcome = _update(adopted["id"])
+                if outcome is Outcome.GONE:
+                    return Outcome.TRANSIENT, None
+                return outcome, adopted["id"]
+            if adopt_outcome in (Outcome.PERMANENT, Outcome.AMBIGUOUS):
+                return adopt_outcome, None
+            # ABSENT-after-EXISTS or TRANSIENT: unstable — retry next iteration.
+            return Outcome.TRANSIENT, None
+        return create_outcome, None  # TRANSIENT or PERMANENT
 
-    # TRANSIENT, PERMANENT, or AMBIGUOUS read: fail closed, no create.
-    return False, None
+    # AMBIGUOUS, TRANSIENT, or PERMANENT read: fail closed, no create.
+    return get_outcome, None
+
+
+def startup_state(config: Dict[str, Any], clients: HttpClients) -> DdnsState:
+    """
+    Prime loop state from the existing DNS record and the current external IP.
+
+    A transient read failure leaves the state empty — the loop re-reads before
+    any write (C1). A PERMANENT or AMBIGUOUS read marks the state fatal.
+    """
+    state = DdnsState()
+    outcome, record_info = get_dns_record(
+        clients.cloudflare, config["zone_id"], config["host"]
+    )
+
+    if outcome is Outcome.OK:
+        state.last_ip = record_info["content"]
+        state.record_id = record_info["id"]
+        logging.info(f"Current DNS record found. Host: {config['host']}, IP: {state.last_ip}")
+    elif outcome is Outcome.ABSENT:
+        logging.warning(
+            f"No existing DNS record found for host '{config['host']}'. "
+            "Will create one on first IP retrieval."
+        )
+    elif outcome is Outcome.TRANSIENT:
+        logging.warning(
+            "Could not read DNS state at startup (transient); "
+            "the main loop will re-read before any write."
+        )
+    else:  # PERMANENT or AMBIGUOUS: a config/ownership problem — fail fast
+        state.fatal = outcome.value
+        return state
+
+    # Get current external IP and initialize metric
+    logging.info("Getting initial external IP...")
+    initial_ip = get_external_ip(clients.check_ip)
+    if initial_ip:
+        logging.info(f"Current external IP: {initial_ip}")
+        # Set current external IP metric to 1
+        prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=initial_ip).set(1)
+
+        # If DNS IP exists and differs from current IP, set it to 0
+        if state.last_ip and state.last_ip != initial_ip:
+            prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=state.last_ip).set(0)
+            logging.info(f"DNS IP {state.last_ip} differs from current IP {initial_ip}")
+    else:
+        logging.warning("Could not retrieve initial external IP")
+
+    return state
+
+
+def run_iteration(config: Dict[str, Any], state: DdnsState,
+                  clients: HttpClients) -> DdnsState:
+    """
+    One check/update cycle. Never sleeps and never exits — main() enforces
+    the failure policy on the returned state.
+    """
+    prometheus_metrics["last_ip_check_timestamp"].set(time.time())
+
+    current_ip = get_external_ip(clients.check_ip)
+
+    if current_ip is None:
+        state.ip_failures += 1
+        logging.error(
+            f"Could not retrieve external IP. "
+            f"Failure {state.ip_failures}/{config['max_failures']}"
+        )
+        return state
+    state.ip_failures = 0
+
+    if state.last_ip is not None and current_ip == state.last_ip:
+        logging.debug(f"External IP remains {current_ip}. No update required.")
+        return state
+
+    if state.last_ip is None:
+        logging.info(f"First IP retrieval. IP: {current_ip}")
+    else:
+        logging.info(f"IP changed from {state.last_ip} to {current_ip}. Updating DNS record.")
+
+    outcome, record_id = handle_dns_update(
+        config, state.record_id, current_ip, clients.cloudflare
+    )
+    state.record_id = record_id
+
+    if outcome is Outcome.OK:
+        state.cf_failures = 0
+        prometheus_metrics["ip_update_counter"].inc()
+        prometheus_metrics["last_ip_update_timestamp"].set(time.time())
+
+        # Update IP gauge - keep all IPs in history (bounded in stage 6)
+        if state.last_ip is not None:
+            prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=state.last_ip).set(0)
+        prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=current_ip).set(1)
+
+        state.last_ip = current_ip
+    elif outcome is Outcome.TRANSIENT:
+        state.cf_failures += 1
+        logging.error(
+            f"DNS update failed (transient). "
+            f"Failure {state.cf_failures}/{config['max_failures']}"
+        )
+    else:  # PERMANENT or AMBIGUOUS — unrecoverable, main() exits
+        state.fatal = outcome.value
+
+    return state
+
+
+def enforce_failure_policy(config: Dict[str, Any], state: DdnsState) -> None:
+    """
+    Exit fatally on unrecoverable outcomes or an exhausted consecutive-failure
+    budget (H2). Both failure classes share the same budget.
+    """
+    if state.fatal:
+        logging.critical(
+            f"Unrecoverable condition ({state.fatal}); exiting. "
+            "See the errors above — this will not heal by retrying."
+        )
+        sys.exit(1)
+
+    max_failures = config["max_failures"]
+    if state.ip_failures >= max_failures:
+        logging.critical(
+            f"Failed to retrieve the external IP {max_failures} consecutive times. Exiting."
+        )
+        sys.exit(1)
+    if state.cf_failures >= max_failures:
+        logging.critical(
+            f"DNS update failed {max_failures} consecutive times. Exiting."
+        )
+        sys.exit(1)
 
 
 def main():
@@ -633,112 +807,26 @@ def main():
     start_http_server(config["metrics_port"])
     logging.info(f"Prometheus metrics server started on port {config['metrics_port']}")
 
-    cf_session, ip_session = create_http_clients(config["token"])
+    clients = create_http_clients(config["token"])
 
-    # Get initial DNS record information to avoid unnecessary updates
-    outcome, record_info = get_dns_record(cf_session, config["zone_id"], config["host"])
-
-    if outcome is Outcome.OK:
-        last_ip = record_info["content"]
-        record_id = record_info["id"]
-        logging.info(f"Current DNS record found. Host: {config['host']}, IP: {last_ip}")
-    elif outcome is Outcome.ABSENT:
-        logging.warning(
-            f"No existing DNS record found for host '{config['host']}'. "
-            "Will create one on first IP retrieval."
-        )
-        last_ip = None
-        record_id = None
-    else:
-        logging.warning(
-            f"Could not read DNS state at startup ({outcome.value}); "
-            "the main loop will re-read before any write."
-        )
-        last_ip = None
-        record_id = None
-
-    # Get current external IP and initialize metric
-    logging.info("Getting initial external IP...")
-    initial_ip = get_external_ip(ip_session)
-    if initial_ip:
-        logging.info(f"Current external IP: {initial_ip}")
-        # Set current external IP metric to 1
-        prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=initial_ip).set(1)
-
-        # If DNS IP exists and differs from current IP, set it to 0
-        if last_ip and last_ip != initial_ip:
-            prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=last_ip).set(0)
-            logging.info(f"DNS IP {last_ip} differs from current IP {initial_ip}")
-    else:
-        logging.warning("Could not retrieve initial external IP")
-
-    consecutive_failures = 0
-    max_consecutive_failures = 10
+    state = startup_state(config, clients)
+    enforce_failure_policy(config, state)
 
     try:
         while True:
             try:
-                # Update check timestamp
-                prometheus_metrics["last_ip_check_timestamp"].set(time.time())
-
-                current_ip = get_external_ip(ip_session)
-
-                if current_ip is None:
-                    consecutive_failures += 1
-                    logging.error(f"Could not retrieve external IP. Failure {consecutive_failures}/{max_consecutive_failures}")
-
-                    if consecutive_failures >= max_consecutive_failures:
-                        logging.critical(f"Failed to retrieve IP {max_consecutive_failures} times. Exiting.")
-                        sys.exit(1)
-                else:
-                    consecutive_failures = 0  # Reset counter on success
-
-                    update_needed = (last_ip is None) or (current_ip != last_ip)
-
-                    if update_needed:
-                        if last_ip is None:
-                            logging.info(f"First IP retrieval. IP: {current_ip}")
-                        else:
-                            logging.info(f"IP changed from {last_ip} to {current_ip}. Updating DNS record.")
-
-                        # Handle DNS update with possible record recreation
-                        success, record_id = handle_dns_update(
-                            config, record_id, current_ip, cf_session
-                        )
-
-                        if success:
-                            # Update metrics
-                            prometheus_metrics["ip_update_counter"].inc()
-                            prometheus_metrics["last_ip_update_timestamp"].set(time.time())
-
-                            # Update IP gauge - keep all IPs in history
-                            if last_ip is not None:
-                                prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=last_ip).set(0)
-
-                            prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=current_ip).set(1)
-
-                            last_ip = current_ip
-                        else:
-                            logging.error("Failed to update DNS record after all attempts.")
-                    else:
-                        logging.debug(f"External IP remains {current_ip}. No update required.")
-
+                state = run_iteration(config, state, clients)
             except Exception as loop_error:
                 logging.exception(f"An error occurred in the main loop: {loop_error}")
-                consecutive_failures += 1
+                state.cf_failures += 1
 
-                if consecutive_failures >= max_consecutive_failures:
-                    logging.critical("Too many consecutive failures. Exiting.")
-                    sys.exit(1)
+            enforce_failure_policy(config, state)
 
             logging.debug(f"Waiting {config['interval']} seconds before the next check...")
             time.sleep(config["interval"])
 
     except KeyboardInterrupt:
         logging.info("Caught KeyboardInterrupt. Exiting gracefully.")
-    except Exception as e:
-        logging.exception(f"Unhandled exception in main: {e}")
-        sys.exit(1)
 
 
 if __name__ == "__main__":

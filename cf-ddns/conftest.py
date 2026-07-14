@@ -105,11 +105,31 @@ def ip_error_metric(monkeypatch):
 
 @pytest.fixture
 def config():
-    """A parsed-config dict as handle_dns_update() expects it."""
+    """A parsed-config dict as the orchestration functions expect it."""
     return {
         "token": "test_token",
         "zone_id": "test_zone",
         "host": "test.example.com",
         "ttl": 120,
         "proxied": False,
+        "interval": 10,
+        "metrics_port": 9101,
+        "max_failures": 10,
     }
+
+
+@pytest.fixture
+def loop_metrics(monkeypatch):
+    """Replace the metrics touched by the loop with mocks; return them."""
+    metrics = {
+        name: MagicMock()
+        for name in (
+            "ip_update_counter",
+            "ip_info_gauge",
+            "last_ip_check_timestamp",
+            "last_ip_update_timestamp",
+        )
+    }
+    for name, metric in metrics.items():
+        monkeypatch.setitem(cf_ddns.prometheus_metrics, name, metric)
+    return metrics

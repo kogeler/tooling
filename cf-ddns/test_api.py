@@ -22,9 +22,9 @@ def ok_get(records):
 
 
 def test_bearer_token_only_on_cloudflare_session():
-    cf_session, ip_session = cf_ddns.create_http_clients("secret-token")
-    assert cf_session.headers["Authorization"] == "Bearer secret-token"
-    assert "Authorization" not in ip_session.headers
+    clients = cf_ddns.create_http_clients("secret-token")
+    assert clients.cloudflare.headers["Authorization"] == "Bearer secret-token"
+    assert "Authorization" not in clients.check_ip.headers
 
 
 # --- get_dns_record ---------------------------------------------------------
