@@ -113,7 +113,12 @@ def ip_error_metric(monkeypatch):
 
 @pytest.fixture
 def config():
-    """A parsed-config dict as the orchestration functions expect it."""
+    """A parsed-config dict as the orchestration functions expect it.
+
+    confirm_cycles=1 keeps single-iteration scenarios simple; flap-damping
+    tests override it explicitly. reconcile_interval=3600 never fires within
+    a test unless the test injects its own clock.
+    """
     return {
         "token": "test_token",
         "zone_id": "test_zone",
@@ -123,6 +128,8 @@ def config():
         "interval": 10,
         "metrics_port": 9101,
         "max_failures": 10,
+        "reconcile_interval": 3600,
+        "confirm_cycles": 1,
     }
 
 
@@ -136,6 +143,7 @@ def loop_metrics(monkeypatch):
             "ip_info_gauge",
             "last_ip_check_timestamp",
             "last_ip_update_timestamp",
+            "unconfirmed_ip_counter",
         )
     }
     for name, metric in metrics.items():

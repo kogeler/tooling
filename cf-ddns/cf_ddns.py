@@ -5,11 +5,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import re
 import sys
 import time
 import random
 import signal
 import logging
+import ipaddress
 import threading
 import requests
 from dataclasses import dataclass
@@ -44,6 +46,30 @@ CHECK_IP_MAX_BODY_BYTES = 64
 # Cloudflare API error codes with special meaning for this utility.
 CF_CODE_RECORD_NOT_FOUND = 81044         # "Record does not exist"
 CF_CODES_RECORD_EXISTS = {81057, 81058}  # "record (with those settings) exists"
+
+# RFC 1123 hostname label (the stdlib idna codec passes ASCII labels through
+# unvalidated, so labels must be checked explicitly).
+_HOSTNAME_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _normalize_host(host_raw: str) -> str:
+    """
+    Normalize a hostname (lowercase, IDNA-encode, strip the root dot) and
+    validate it as a DNS name. Raises ValueError when invalid (M6).
+    """
+    host = host_raw.strip().rstrip(".").lower()
+    if not host:
+        raise ValueError("empty hostname")
+    try:
+        host = host.encode("idna").decode("ascii").lower()
+    except UnicodeError as e:
+        raise ValueError(f"IDNA encoding failed: {e}") from e
+    if len(host) > 253:
+        raise ValueError("hostname longer than 253 characters")
+    for label in host.split("."):
+        if not _HOSTNAME_LABEL_RE.match(label):
+            raise ValueError(f"invalid DNS label {label!r}")
+    return host
 
 
 class Outcome(str, Enum):
@@ -89,6 +115,10 @@ prometheus_metrics = {
         "cf_ddns_cloudflare_api_errors_total",
         "Number of Cloudflare API errors."
     ),
+    "unconfirmed_ip_counter": Counter(
+        "cf_ddns_unconfirmed_ip_readings_total",
+        "Number of new-IP readings discarded before confirmation."
+    ),
     "last_ip_check_timestamp": Gauge(
         "cf_ddns_last_ip_check_timestamp_seconds",
         "Unix timestamp of the last IP check."
@@ -127,20 +157,25 @@ def parse_env() -> Dict[str, Any]:
     Read and validate necessary environment variables.
     Returns a dictionary of configuration parameters or terminates the script if invalid.
     """
-    token = os.environ.get("CF_DDNS_TOKEN")
-    zone_id = os.environ.get("CF_DDNS_ZONE_ID")
-    host = os.environ.get("CF_DDNS_HOST")
+    token = (os.environ.get("CF_DDNS_TOKEN") or "").strip()
+    zone_id = (os.environ.get("CF_DDNS_ZONE_ID") or "").strip()
+    host_raw = (os.environ.get("CF_DDNS_HOST") or "").strip().rstrip(".")
 
-    if not all([token, zone_id, host]):
+    if not all([token, zone_id, host_raw]):
         logging.error(
-            "Environment variables CF_DDNS_TOKEN, CF_DDNS_ZONE_ID, and CF_DDNS_HOST must be set."
+            "Environment variables CF_DDNS_TOKEN, CF_DDNS_ZONE_ID, and CF_DDNS_HOST "
+            "must be set to non-empty values."
         )
         sys.exit(1)
 
-    interval_str = os.environ.get("CF_DDNS_INTERVAL", "10")
-    ttl_str = os.environ.get("CF_DDNS_TTL", "120")
-    proxied_str = os.environ.get("CF_DDNS_PROXIED", "False")
+    # Normalize and validate the hostname as an IDNA DNS name (M6)
+    try:
+        host = _normalize_host(host_raw)
+    except ValueError as e:
+        logging.error(f"Invalid value for CF_DDNS_HOST: {host_raw!r} is not a valid DNS name ({e}).")
+        sys.exit(1)
 
+    interval_str = os.environ.get("CF_DDNS_INTERVAL", "10")
     try:
         interval = int(interval_str)
         if interval < 1:
@@ -149,15 +184,41 @@ def parse_env() -> Dict[str, Any]:
         logging.error(f"Invalid value for CF_DDNS_INTERVAL: {interval_str}. {e}")
         sys.exit(1)
 
+    # TTL (M6): 1 = Cloudflare Auto, otherwise 30-86400 (30-59 Enterprise only)
+    ttl_str = os.environ.get("CF_DDNS_TTL", "120")
     try:
         ttl = int(ttl_str)
-        if ttl < 60:
-            logging.warning(f"TTL value {ttl} is very low. Cloudflare may override it.")
     except ValueError:
         logging.error(f"Invalid value for CF_DDNS_TTL: {ttl_str}.")
         sys.exit(1)
+    if ttl != 1 and not (30 <= ttl <= 86400):
+        logging.error(
+            f"Invalid value for CF_DDNS_TTL: {ttl}. "
+            "Cloudflare accepts 1 (Auto) or 30-86400 seconds."
+        )
+        sys.exit(1)
+    if 30 <= ttl <= 59:
+        logging.warning(
+            f"TTL {ttl} requires a Cloudflare Enterprise zone; "
+            "standard zones accept 60-86400."
+        )
 
-    proxied = proxied_str.lower() == "true"
+    # Proxied (M6): strict boolean — a typo must not silently disable the proxy
+    proxied_str = (os.environ.get("CF_DDNS_PROXIED", "False")).strip().lower()
+    if proxied_str not in ("true", "false"):
+        logging.error(
+            f"Invalid value for CF_DDNS_PROXIED: {proxied_str!r}. Use 'true' or 'false'."
+        )
+        sys.exit(1)
+    proxied = proxied_str == "true"
+
+    # Proxied records always use Cloudflare Auto TTL; normalize the effective
+    # TTL so reconciliation comparisons cannot flap forever (M6).
+    if proxied and ttl != 1:
+        logging.warning(
+            f"CF_DDNS_PROXIED=true forces TTL Auto (1); configured TTL {ttl} is ignored."
+        )
+        ttl = 1
 
     # Prometheus metrics endpoint port
     metrics_port_str = os.environ.get("CF_DDNS_METRICS_PORT", "9101")
@@ -179,6 +240,26 @@ def parse_env() -> Dict[str, Any]:
         logging.error(f"Invalid value for CF_DDNS_MAX_FAILURES: {max_failures_str}. {e}")
         sys.exit(1)
 
+    # Periodic reconciliation interval in seconds; 0 disables (M3)
+    reconcile_str = os.environ.get("CF_DDNS_RECONCILE_INTERVAL", "3600")
+    try:
+        reconcile_interval = int(reconcile_str)
+        if reconcile_interval < 0:
+            raise ValueError("Reconcile interval must be 0 (disabled) or positive")
+    except ValueError as e:
+        logging.error(f"Invalid value for CF_DDNS_RECONCILE_INTERVAL: {reconcile_str}. {e}")
+        sys.exit(1)
+
+    # A changed IP must be observed this many consecutive iterations (M9/R2)
+    confirm_str = os.environ.get("CF_DDNS_CONFIRM_CYCLES", "2")
+    try:
+        confirm_cycles = int(confirm_str)
+        if confirm_cycles < 1:
+            raise ValueError("Confirm cycles must be at least 1")
+    except ValueError as e:
+        logging.error(f"Invalid value for CF_DDNS_CONFIRM_CYCLES: {confirm_str}. {e}")
+        sys.exit(1)
+
     return {
         "token": token,
         "zone_id": zone_id,
@@ -187,26 +268,29 @@ def parse_env() -> Dict[str, Any]:
         "ttl": ttl,
         "proxied": proxied,
         "metrics_port": metrics_port,
-        "max_failures": max_failures
+        "max_failures": max_failures,
+        "reconcile_interval": reconcile_interval,
+        "confirm_cycles": confirm_cycles
     }
 
 
 def validate_ipv4(ip: str) -> bool:
     """
-    Validate IPv4 address format.
-    Returns True if valid, False otherwise.
+    Validate that `ip` is a strictly formatted, globally routable unicast
+    IPv4 address — the only thing a public DDNS record may contain (M7/L1).
+
+    Rejects malformed forms (leading zeros, whitespace, signs) and
+    non-public ranges: private, loopback, link-local, CGNAT, unspecified,
+    reserved, broadcast — and multicast explicitly, because `is_global`
+    alone is True for multicast addresses.
     """
-    try:
-        parts = ip.split('.')
-        if len(parts) != 4:
-            return False
-        for part in parts:
-            num = int(part)
-            if not (0 <= num <= 255):
-                return False
-        return True
-    except (ValueError, AttributeError):
+    if not isinstance(ip, str):
         return False
+    try:
+        address = ipaddress.IPv4Address(ip)
+    except ValueError:
+        return False
+    return address.is_global and not address.is_multicast
 
 
 @dataclass
@@ -218,6 +302,10 @@ class DdnsState:
     ip_failures: int = 0         # consecutive external-IP retrieval failures
     cf_failures: int = 0         # consecutive Cloudflare transient-failure iterations
     fatal: Optional[str] = None  # unrecoverable outcome; main() exits when set
+    force_update: bool = False   # settings drift detected; rewrite on next pass (M2)
+    pending_ip: Optional[str] = None  # candidate new IP awaiting confirmation (M9)
+    pending_seen: int = 0             # consecutive observations of pending_ip
+    last_reconcile: Optional[float] = None  # monotonic ts of last reconciliation (M3)
 
 
 @dataclass
@@ -604,6 +692,7 @@ def initialize_metrics(config: Dict[str, Any]):
     # Initialize other counters with 0
     prometheus_metrics["ip_update_counter"]._value.set(0)
     prometheus_metrics["cf_api_error_counter"]._value.set(0)
+    prometheus_metrics["unconfirmed_ip_counter"]._value.set(0)
 
     # Initialize timestamps with 0 (never checked/updated)
     prometheus_metrics["last_ip_check_timestamp"].set(0)
@@ -701,6 +790,18 @@ def startup_state(config: Dict[str, Any], clients: HttpClients) -> DdnsState:
         state.last_ip = record_info["content"]
         state.record_id = record_info["id"]
         logging.info(f"Current DNS record found. Host: {config['host']}, IP: {state.last_ip}")
+
+        # Startup reconciliation (M2): converge ttl/proxied even when the IP
+        # is unchanged. config["ttl"] is already the effective desired TTL
+        # (Auto for proxied records), so this cannot flap.
+        if (record_info["ttl"] != config["ttl"]
+                or record_info["proxied"] != config["proxied"]):
+            logging.info(
+                f"Record settings drift: ttl {record_info['ttl']} -> {config['ttl']}, "
+                f"proxied {record_info['proxied']} -> {config['proxied']}. "
+                "Will rewrite on the next iteration."
+            )
+            state.force_update = True
     elif outcome is Outcome.ABSENT:
         logging.warning(
             f"No existing DNS record found for host '{config['host']}'. "
@@ -733,11 +834,60 @@ def startup_state(config: Dict[str, Any], clients: HttpClients) -> DdnsState:
     return state
 
 
+def _reconcile(config: Dict[str, Any], state: DdnsState,
+               clients: HttpClients) -> Optional[str]:
+    """
+    Periodic reconciliation (M3): re-read the record and detect external
+    drift. Returns the IP to (re)write, or None when converged. Errors are
+    counted/marked on the state; creation stays inside handle_dns_update
+    behind its confirmed-ABSENT invariant (C1).
+    """
+    logging.debug("Reconciliation: re-reading DNS state.")
+    outcome, record = get_dns_record(
+        clients.cloudflare, config["zone_id"], config["host"],
+        stop_event=shutdown_event
+    )
+
+    if outcome is Outcome.OK:
+        if record["id"] != state.record_id:
+            logging.warning(
+                f"Reconciliation: record id changed externally "
+                f"({state.record_id} -> {record['id']}); adopting."
+            )
+            state.record_id = record["id"]
+        if (record["content"] != state.last_ip
+                or record["ttl"] != config["ttl"]
+                or record["proxied"] != config["proxied"]):
+            logging.warning("Reconciliation: record drifted externally; converging.")
+            return state.last_ip
+        logging.debug("Reconciliation: record matches the desired state.")
+        return None
+    if outcome is Outcome.ABSENT:
+        logging.warning("Reconciliation: record was deleted externally; recreating.")
+        state.record_id = None
+        return state.last_ip
+    if outcome is Outcome.TRANSIENT:
+        if not shutdown_event.is_set():
+            state.cf_failures += 1
+            logging.error(
+                f"Reconciliation read failed (transient). "
+                f"Failure {state.cf_failures}/{config['max_failures']}"
+            )
+        return None
+    state.fatal = outcome.value  # PERMANENT or AMBIGUOUS
+    return None
+
+
 def run_iteration(config: Dict[str, Any], state: DdnsState,
-                  clients: HttpClients) -> DdnsState:
+                  clients: HttpClients, *, now=time.monotonic) -> DdnsState:
     """
     One check/update cycle. Never sleeps and never exits — main() enforces
     the failure policy on the returned state.
+
+    A changed external IP is written only after `confirm_cycles` consecutive
+    identical readings (M9/R2). Reconciliation and force_update writes reuse
+    the already-confirmed IP and are exempt from confirmation. `now` is the
+    monotonic clock, injectable for tests.
     """
     if shutdown_event.is_set():
         return state
@@ -757,31 +907,86 @@ def run_iteration(config: Dict[str, Any], state: DdnsState,
         return state
     state.ip_failures = 0
 
-    if state.last_ip is not None and current_ip == state.last_ip:
-        logging.debug(f"External IP remains {current_ip}. No update required.")
+    write_ip: Optional[str] = None
+    ip_changed = current_ip != state.last_ip
+
+    if ip_changed:
+        # Flap damping (M9): a new IP must be confirmed over consecutive
+        # readings before it may touch DNS.
+        if current_ip == state.pending_ip:
+            state.pending_seen += 1
+        else:
+            if state.pending_ip is not None:
+                logging.warning(
+                    f"Discarding unconfirmed IP reading {state.pending_ip}; "
+                    f"now observing {current_ip}."
+                )
+                prometheus_metrics["unconfirmed_ip_counter"].inc()
+            state.pending_ip = current_ip
+            state.pending_seen = 1
+
+        if state.pending_seen >= config["confirm_cycles"]:
+            write_ip = current_ip
+        else:
+            logging.info(
+                f"New IP {current_ip} observed "
+                f"({state.pending_seen}/{config['confirm_cycles']} confirmations); "
+                "not writing yet."
+            )
+    else:
+        if state.pending_ip is not None:
+            logging.warning(
+                f"Discarding unconfirmed IP reading {state.pending_ip}; "
+                f"the external IP settled back to {state.last_ip}."
+            )
+            prometheus_metrics["unconfirmed_ip_counter"].inc()
+            state.pending_ip = None
+            state.pending_seen = 0
+
+        if state.force_update:
+            # Startup-detected settings drift (M2): rewrite the confirmed IP.
+            write_ip = current_ip
+        elif config["reconcile_interval"]:
+            ts = now()
+            if state.last_reconcile is None:
+                state.last_reconcile = ts
+            elif ts - state.last_reconcile >= config["reconcile_interval"]:
+                state.last_reconcile = ts
+                write_ip = _reconcile(config, state, clients)
+                if state.fatal:
+                    return state
+
+    if write_ip is None:
+        if not ip_changed:
+            logging.debug(f"External IP remains {current_ip}. No update required.")
         return state
 
     if state.last_ip is None:
-        logging.info(f"First IP retrieval. IP: {current_ip}")
+        logging.info(f"First confirmed IP: {write_ip}. Creating DNS record.")
+    elif write_ip != state.last_ip:
+        logging.info(f"IP changed from {state.last_ip} to {write_ip}. Updating DNS record.")
     else:
-        logging.info(f"IP changed from {state.last_ip} to {current_ip}. Updating DNS record.")
+        logging.info(f"Rewriting DNS record for {write_ip} to converge settings.")
 
     outcome, record_id = handle_dns_update(
-        config, state.record_id, current_ip, clients.cloudflare
+        config, state.record_id, write_ip, clients.cloudflare
     )
     state.record_id = record_id
 
     if outcome is Outcome.OK:
         state.cf_failures = 0
+        state.force_update = False
+        state.pending_ip = None
+        state.pending_seen = 0
         prometheus_metrics["ip_update_counter"].inc()
         prometheus_metrics["last_ip_update_timestamp"].set(time.time())
 
         # Update IP gauge - keep all IPs in history (bounded in stage 6)
-        if state.last_ip is not None:
+        if state.last_ip is not None and state.last_ip != write_ip:
             prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=state.last_ip).set(0)
-        prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=current_ip).set(1)
+        prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=write_ip).set(1)
 
-        state.last_ip = current_ip
+        state.last_ip = write_ip
     elif outcome is Outcome.TRANSIENT:
         if shutdown_event.is_set():
             return state  # failure caused by shutdown, not by the API

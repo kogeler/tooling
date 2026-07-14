@@ -53,10 +53,13 @@ the failure budget, so a stop during degraded conditions still exits 0.
 | `CF_DDNS_ZONE_ID` | yes | — | Cloudflare zone ID |
 | `CF_DDNS_HOST` | yes | — | FQDN of the managed A record |
 | `CF_DDNS_INTERVAL` | no | `10` | seconds between IP checks (≥1) |
-| `CF_DDNS_TTL` | no | `120` | record TTL |
-| `CF_DDNS_PROXIED` | no | `False` | `true` to proxy through Cloudflare |
+| `CF_DDNS_TTL` | no | `120` | record TTL: `1` (Auto) or 30–86400; forced to `1` when proxied |
+| `CF_DDNS_PROXIED` | no | `false` | strictly `true`/`false`; typos exit with an error |
 | `CF_DDNS_LOGLEVEL` | no | `INFO` | DEBUG/INFO/WARNING/ERROR/CRITICAL |
 | `CF_DDNS_METRICS_PORT` | no | `9101` | Prometheus endpoint port |
+| `CF_DDNS_MAX_FAILURES` | no | `10` | consecutive-failure budget (IP retrieval / DNS updates) before exit 1 |
+| `CF_DDNS_RECONCILE_INTERVAL` | no | `3600` | seconds between full DNS re-reads (external-drift repair); `0` disables |
+| `CF_DDNS_CONFIRM_CYCLES` | no | `2` | consecutive readings required before a new IP is written; `1` = immediate |
 
 ## Ongoing refactor
 

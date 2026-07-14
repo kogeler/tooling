@@ -10,15 +10,15 @@ from conftest import FakeResponse, FakeSession
 
 import cf_ddns
 
+# Only globally routable unicast IPv4 addresses are valid DDNS content (M7)
 VALID_IPS = [
     "1.2.3.4",
-    "192.168.1.1",
-    "0.0.0.0",
-    "255.255.255.255",
-    "10.0.0.1",
+    "8.8.8.8",
+    "93.184.216.34",
+    "138.199.6.244",
 ]
 
-INVALID_IPS = [
+MALFORMED_IPS = [
     "not.an.ip.address",
     "256.256.256.256",
     "1.2.3",
@@ -28,7 +28,30 @@ INVALID_IPS = [
     None,
     "192.168.1.-1",
     "192.168.1.256",
+    # strict parsing (L1): forms the old int()-based validator accepted
+    "192.168.001.1",
+    "1. 2.3.4",
+    "+1.2.3.4",
+    "1_0.2.3.4",
+    " 1.2.3.4 ",
 ]
+
+NON_PUBLIC_IPS = [
+    "0.0.0.0",           # unspecified
+    "127.0.0.1",         # loopback
+    "10.0.0.1",          # RFC1918
+    "172.16.0.1",        # RFC1918
+    "192.168.1.1",       # RFC1918
+    "169.254.10.10",     # link-local
+    "100.64.0.1",        # CGNAT
+    "224.0.0.1",         # multicast (is_global=True — must be excluded explicitly)
+    "239.255.255.250",   # multicast
+    "233.1.1.1",         # GLOP multicast
+    "240.0.0.1",         # reserved
+    "255.255.255.255",   # limited broadcast
+]
+
+INVALID_IPS = MALFORMED_IPS + NON_PUBLIC_IPS
 
 
 @pytest.mark.parametrize("ip", VALID_IPS)
