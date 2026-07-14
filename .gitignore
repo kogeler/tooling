@@ -6,6 +6,7 @@ traffic-masking/*.log
 .gocache
 tokens.sh
 node_modules
+.claude
 
 # binaries
 sms-to-telegram/sms-to-telegram
