@@ -7,10 +7,14 @@
 import os
 import sys
 import time
+import random
 import logging
 import requests
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from enum import Enum
 from urllib.parse import urlparse
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, NamedTuple, Tuple
 
 from prometheus_client import start_http_server, Counter, Gauge
 
@@ -18,6 +22,38 @@ check_ip_services = [
     "https://checkip.amazonaws.com",
     "https://api.ipify.org/?format=text"
 ]
+
+CF_API_BASE = "https://api.cloudflare.com/client/v4"
+
+# (connect, read) timeouts; the read timeout stays well below a container's
+# default 10s stop grace period so shutdown is bounded by one in-flight read.
+DEFAULT_TIMEOUT = (3.05, 5)
+DEFAULT_MAX_RETRIES = 3
+
+# A 429 Retry-After longer than this ends the call as TRANSIENT instead of
+# stalling the iteration; the loop cadence and failure counters take over.
+RETRY_AFTER_CAP_SECONDS = 60
+
+# A check-IP response should contain a single IPv4 address; anything larger
+# is a provider failure and must not be buffered.
+CHECK_IP_MAX_BODY_BYTES = 64
+
+# Cloudflare API error codes with special meaning for this utility.
+CF_CODE_RECORD_NOT_FOUND = 81044         # "Record does not exist"
+CF_CODES_RECORD_EXISTS = {81057, 81058}  # "record (with those settings) exists"
+
+
+class Outcome(str, Enum):
+    """Classified result of a Cloudflare API call (frozen contract)."""
+
+    OK = "ok"                # request succeeded
+    ABSENT = "absent"        # confirmed: no record (HTTP 200, empty result list)
+    GONE = "gone"            # record id invalid (HTTP 404 and/or CF code 81044)
+    EXISTS = "exists"        # create refused: record already exists (81057, 81058)
+    AMBIGUOUS = "ambiguous"  # multiple matching A records; do not guess ownership
+    TRANSIENT = "transient"  # network / 5xx / 429 — retries exhausted
+    PERMANENT = "permanent"  # other 4xx (auth, validation) — not retryable
+
 
 # Prometheus metrics map
 prometheus_metrics = {
@@ -148,88 +184,295 @@ def validate_ipv4(ip: str) -> bool:
         return False
 
 
-def get_external_ip() -> Optional[str]:
+def create_http_clients(token: str) -> Tuple[requests.Session, requests.Session]:
     """
-    Attempt to retrieve external IP address from check services.
+    Create the two persistent HTTP sessions: an authenticated Cloudflare
+    session and a plain check-IP session.
+
+    The bearer token lives only on the Cloudflare session; the check-IP
+    session must never carry credentials.
+    """
+    cf_session = requests.Session()
+    cf_session.headers.update({
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    })
+    ip_session = requests.Session()
+    return cf_session, ip_session
+
+
+class _CfResult(NamedTuple):
+    """Internal classified result of one Cloudflare API exchange."""
+
+    kind: str                # "ok" | "api_error" | "http_error" | "transient"
+    status_code: Optional[int]
+    body: Optional[Dict[str, Any]]
+    codes: Tuple[int, ...]   # Cloudflare error codes extracted from the body
+
+
+def _wait(delay: float, stop_event=None) -> None:
+    """Sleep; interruptible when a stop event is provided (wired in Stage 4)."""
+    if stop_event is not None:
+        stop_event.wait(timeout=delay)
+    else:
+        time.sleep(delay)
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff (1s, 2s, ...) with a small jitter."""
+    return 2 ** (attempt - 1) + random.uniform(0, 0.5)
+
+
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Parse a Retry-After header (delta-seconds or HTTP-date) into seconds."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+
+
+def _extract_error_codes(body: Any) -> Tuple[int, ...]:
+    """Pull Cloudflare error codes out of a (possibly malformed) response body."""
+    if not isinstance(body, dict):
+        return ()
+    codes = []
+    for error in body.get("errors") or []:
+        if isinstance(error, dict) and isinstance(error.get("code"), int):
+            codes.append(error["code"])
+    return tuple(codes)
+
+
+def _cf_request(session: requests.Session, method: str, url: str, *,
+                json_body: Optional[Dict[str, Any]] = None,
+                params: Optional[Dict[str, str]] = None,
+                timeout: Tuple[float, float] = DEFAULT_TIMEOUT,
+                max_retries: int = DEFAULT_MAX_RETRIES,
+                idempotent: bool = True,
+                validate=None,
+                stop_event=None) -> _CfResult:
+    """
+    One classified Cloudflare API exchange with bounded retries.
+
+    Network errors, 5xx, in-budget 429s, and protocol failures (malformed
+    "success" bodies) are retried with backoff — but only for idempotent
+    calls. A non-idempotent POST gets a single attempt: any uncertain outcome
+    is reported as transient so the caller re-reads state instead of blindly
+    re-sending. Other 4xx and explicit API refusals are never retried.
+    """
+    attempts = max_retries if idempotent else 1
+    last = _CfResult("transient", None, None, ())
+
+    for attempt in range(1, attempts + 1):
+        if stop_event is not None and stop_event.is_set():
+            return _CfResult("transient", None, None, ())
+
+        retry_delay = None
+        try:
+            response = session.request(
+                method, url, json=json_body, params=params, timeout=timeout
+            )
+        except requests.exceptions.RequestException as e:
+            logging.error(
+                f"{method} {url}: network error (attempt {attempt}/{attempts}): {e}"
+            )
+            prometheus_metrics["cf_api_error_counter"].inc()
+            last = _CfResult("transient", None, None, ())
+            retry_delay = _backoff_delay(attempt)
+        else:
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            codes = _extract_error_codes(body)
+            status = response.status_code
+
+            if 200 <= status < 300:
+                if isinstance(body, dict) and body.get("success") is True:
+                    problem = validate(body) if validate else None
+                    if problem is None:
+                        return _CfResult("ok", status, body, codes)
+                    # success:true with a malformed result is a protocol
+                    # failure, never OK — retryable for idempotent calls.
+                    logging.error(f"{method} {url}: malformed API response: {problem}")
+                    prometheus_metrics["cf_api_error_counter"].inc()
+                    last = _CfResult("transient", status, body, codes)
+                    retry_delay = _backoff_delay(attempt)
+                elif isinstance(body, dict) and body.get("success") is False:
+                    logging.error(
+                        f"{method} {url}: Cloudflare API error, codes {list(codes)}: "
+                        f"{body.get('errors')}"
+                    )
+                    prometheus_metrics["cf_api_error_counter"].inc()
+                    return _CfResult("api_error", status, body, codes)
+                else:
+                    logging.error(
+                        f"{method} {url}: malformed API response "
+                        f"(HTTP {status}, non-conforming body)"
+                    )
+                    prometheus_metrics["cf_api_error_counter"].inc()
+                    last = _CfResult("transient", status, body, codes)
+                    retry_delay = _backoff_delay(attempt)
+            elif status == 429:
+                prometheus_metrics["cf_api_error_counter"].inc()
+                advertised = _parse_retry_after(response.headers.get("Retry-After"))
+                if advertised is not None and advertised > RETRY_AFTER_CAP_SECONDS:
+                    logging.warning(
+                        f"{method} {url}: rate limited, Retry-After "
+                        f"{advertised:.0f}s exceeds the "
+                        f"{RETRY_AFTER_CAP_SECONDS}s budget; giving up this call"
+                    )
+                    return _CfResult("transient", status, body, codes)
+                logging.warning(f"{method} {url}: rate limited (429)")
+                last = _CfResult("transient", status, body, codes)
+                retry_delay = (advertised if advertised is not None
+                               else _backoff_delay(attempt))
+            elif status >= 500:
+                logging.error(
+                    f"{method} {url}: server error HTTP {status} "
+                    f"(attempt {attempt}/{attempts})"
+                )
+                prometheus_metrics["cf_api_error_counter"].inc()
+                last = _CfResult("transient", status, body, codes)
+                retry_delay = _backoff_delay(attempt)
+            else:
+                # Remaining 4xx: a definitive answer (auth, validation, not
+                # found). Retrying cannot change it — classify and return.
+                errors = body.get("errors") if isinstance(body, dict) else None
+                logging.error(
+                    f"{method} {url}: HTTP {status}, codes {list(codes)}: {errors}"
+                )
+                prometheus_metrics["cf_api_error_counter"].inc()
+                return _CfResult("http_error", status, body, codes)
+
+        if attempt < attempts and retry_delay is not None:
+            _wait(retry_delay, stop_event)
+
+    return last
+
+
+def _validate_record(record: Any) -> bool:
+    """Schema check for one DNS record object from the API."""
+    return (
+        isinstance(record, dict)
+        and isinstance(record.get("id"), str) and bool(record["id"])
+        and isinstance(record.get("content"), str)
+        and isinstance(record.get("ttl"), int)
+        and isinstance(record.get("proxied"), bool)
+    )
+
+
+def get_external_ip(ip_session: requests.Session, *,
+                    stop_event=None) -> Optional[str]:
+    """
+    Retrieve the external IPv4 address from the check services.
     Returns the IP address as a string, or None if all attempts fail.
     """
     for service in check_ip_services:
+        if stop_event is not None and stop_event.is_set():
+            return None
+        hostname = urlparse(service).hostname
         try:
-            response = requests.get(service, timeout=10)
-            response.raise_for_status()
-            ip = response.text.strip()
+            response = ip_session.get(service, timeout=DEFAULT_TIMEOUT, stream=True)
+            try:
+                response.raise_for_status()
+                data = b""
+                for chunk in response.iter_content(
+                        chunk_size=CHECK_IP_MAX_BODY_BYTES + 1):
+                    data += chunk
+                    if len(data) > CHECK_IP_MAX_BODY_BYTES:
+                        raise ValueError(
+                            f"response exceeds {CHECK_IP_MAX_BODY_BYTES} bytes"
+                        )
+                ip = data.decode("utf-8").strip()
+            finally:
+                response.close()
 
-            # Validate IP format
             if validate_ipv4(ip):
                 return ip
-            else:
-                logging.error(f"Invalid IP format received from {service}: {ip}")
-                prometheus_metrics["ip_retrieval_error_counter"].labels(
-                    check_ip_service_host=urlparse(service).hostname).inc()
+            logging.error(f"Invalid IP format received from {service}: {ip!r}")
 
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, ValueError) as e:
             logging.error(f"Error retrieving external IP from {service}: {e}")
-            prometheus_metrics["ip_retrieval_error_counter"].labels(
-                check_ip_service_host=urlparse(service).hostname).inc()
+
+        prometheus_metrics["ip_retrieval_error_counter"].labels(
+            check_ip_service_host=hostname).inc()
 
     return None
 
 
-def get_dns_record(token: str, zone_id: str, host: str, max_retries: int = 3) -> Optional[Dict[str, Any]]:
+def get_dns_record(cf_session: requests.Session, zone_id: str, host: str, *,
+                   stop_event=None) -> Tuple[Outcome, Optional[Dict[str, Any]]]:
     """
-    Retrieve DNS A record information from Cloudflare with retry logic.
-    Returns a dictionary with record information or None if not found or on error.
+    Read the A record for `host`.
+
+    Returns (OK, record) | (ABSENT, None) | (AMBIGUOUS, None)
+    | (TRANSIENT, None) | (PERMANENT, None). ABSENT is reported only on a
+    confirmed empty result — never on an error (C1).
     """
-    url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type=A&name={host}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+    url = f"{CF_API_BASE}/zones/{zone_id}/dns_records"
 
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            data = response.json()
+    def _validate(body: Dict[str, Any]) -> Optional[str]:
+        records = body.get("result")
+        if not isinstance(records, list):
+            return "result is not a list"
+        for record in records:
+            if not _validate_record(record):
+                return f"malformed record object: {record!r}"
+        return None
 
-            if not data.get("success"):
-                logging.error(f"Cloudflare API returned an error: {data}")
-                prometheus_metrics["cf_api_error_counter"].inc()
-                return None
+    result = _cf_request(
+        cf_session, "GET", url,
+        params={"type": "A", "name": host},
+        validate=_validate,
+        stop_event=stop_event,
+    )
 
-            results = data.get("result", [])
-            if not results:
-                logging.warning(f"No DNS A record found for host '{host}'.")
-                return None
+    if result.kind == "ok":
+        records = result.body["result"]
+        if not records:
+            logging.debug(f"No DNS A record found for host '{host}'.")
+            return Outcome.ABSENT, None
+        if len(records) > 1:
+            ids = [record["id"] for record in records]
+            logging.error(
+                f"{len(records)} A records exist for host '{host}' ({ids}); "
+                "refusing to guess ownership. Remove the duplicates manually."
+            )
+            return Outcome.AMBIGUOUS, None
+        record = records[0]
+        return Outcome.OK, {
+            "id": record["id"],
+            "content": record["content"],  # Current IP in DNS
+            "ttl": record["ttl"],
+            "proxied": record["proxied"],
+        }
+    if result.kind == "transient":
+        return Outcome.TRANSIENT, None
+    return Outcome.PERMANENT, None
 
-            record = results[0]
-            return {
-                "id": record.get("id"),
-                "content": record.get("content"),  # Current IP in DNS
-                "ttl": record.get("ttl"),
-                "proxied": record.get("proxied")
-            }
 
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Attempt {attempt + 1}/{max_retries}: Error retrieving DNS record: {e}")
-            prometheus_metrics["cf_api_error_counter"].inc()
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff
-
-    return None
-
-
-def create_dns_record(token: str, zone_id: str, host: str, ip: str,
-                     ttl: int, proxied: bool, max_retries: int = 3) -> Optional[str]:
+def create_dns_record(cf_session: requests.Session, zone_id: str, host: str,
+                      ip: str, ttl: int, proxied: bool, *,
+                      stop_event=None) -> Tuple[Outcome, Optional[str]]:
     """
-    Create a new A record in Cloudflare with retry logic.
-    Returns the record ID on success or None on failure.
+    Create a new A record. POST is not idempotent, so there is exactly one
+    attempt; any uncertain outcome returns TRANSIENT and the caller must GET
+    before deciding whether another create is allowed.
+
+    Returns (OK, record_id) | (EXISTS, None) | (TRANSIENT, None)
+    | (PERMANENT, None).
     """
-    url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+    url = f"{CF_API_BASE}/zones/{zone_id}/dns_records"
     data = {
         "type": "A",
         "name": host,
@@ -238,41 +481,43 @@ def create_dns_record(token: str, zone_id: str, host: str, ip: str,
         "proxied": proxied
     }
 
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(url, json=data, headers=headers, timeout=10)
-            response.raise_for_status()
-            result = response.json()
+    def _validate(body: Dict[str, Any]) -> Optional[str]:
+        record = body.get("result")
+        if not (isinstance(record, dict)
+                and isinstance(record.get("id"), str) and record["id"]):
+            return f"result has no usable record id: {record!r}"
+        return None
 
-            if result.get("success"):
-                record_id = result.get("result", {}).get("id")
-                logging.info(f"DNS A record for host {host} created with IP {ip}.")
-                return record_id
-            else:
-                logging.error(f"Failed to create DNS record. Cloudflare API error: {result}")
-                prometheus_metrics["cf_api_error_counter"].inc()
+    result = _cf_request(
+        cf_session, "POST", url,
+        json_body=data,
+        idempotent=False,
+        validate=_validate,
+        stop_event=stop_event,
+    )
 
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Attempt {attempt + 1}/{max_retries}: Error creating DNS record: {e}")
-            prometheus_metrics["cf_api_error_counter"].inc()
+    if result.kind == "ok":
+        record_id = result.body["result"]["id"]
+        logging.info(f"DNS A record for host {host} created with IP {ip}.")
+        return Outcome.OK, record_id
+    if result.kind in ("api_error", "http_error"):
+        if CF_CODES_RECORD_EXISTS.intersection(result.codes):
+            logging.warning(f"A record for host {host} already exists; not created.")
+            return Outcome.EXISTS, None
+        return Outcome.PERMANENT, None
+    return Outcome.TRANSIENT, None
 
-        if attempt < max_retries - 1:
-            time.sleep(2 ** attempt)  # Exponential backoff
 
-    return None
-
-
-def update_cloudflare_record(token: str, zone_id: str, record_id: str, host: str,
-                           new_ip: str, ttl: int, proxied: bool, max_retries: int = 3) -> bool:
+def update_cloudflare_record(cf_session: requests.Session, zone_id: str,
+                             record_id: str, host: str, new_ip: str, ttl: int,
+                             proxied: bool, *, stop_event=None) -> Outcome:
     """
-    Update an A record in Cloudflare via API with retry logic.
-    Returns True on success and False otherwise.
+    Update the A record via PATCH (edit), sending only the fields this
+    utility owns so unmanaged metadata (comment, tags, settings) survives.
+
+    Returns OK | GONE | TRANSIENT | PERMANENT.
     """
-    url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+    url = f"{CF_API_BASE}/zones/{zone_id}/dns_records/{record_id}"
     data = {
         "type": "A",
         "name": host,
@@ -281,34 +526,22 @@ def update_cloudflare_record(token: str, zone_id: str, record_id: str, host: str
         "proxied": proxied
     }
 
-    for attempt in range(max_retries):
-        try:
-            response = requests.put(url, json=data, headers=headers, timeout=10)
-            response.raise_for_status()
-            result = response.json()
+    result = _cf_request(
+        cf_session, "PATCH", url,
+        json_body=data,
+        stop_event=stop_event,
+    )
 
-            if result.get("success"):
-                logging.info(f"DNS record for host {host} successfully updated to IP {new_ip}.")
-                return True
-            else:
-                logging.error(f"Cloudflare API returned an error: {result}")
-                prometheus_metrics["cf_api_error_counter"].inc()
-
-                # Check if error indicates record doesn't exist
-                errors = result.get("errors", [])
-                for error in errors:
-                    if error.get("code") == 81058:  # Record not found
-                        logging.warning("Record ID is invalid. Will try to recreate.")
-                        return False
-
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Attempt {attempt + 1}/{max_retries}: Error updating DNS record: {e}")
-            prometheus_metrics["cf_api_error_counter"].inc()
-
-        if attempt < max_retries - 1:
-            time.sleep(2 ** attempt)  # Exponential backoff
-
-    return False
+    if result.kind == "ok":
+        logging.info(f"DNS record for host {host} successfully updated to IP {new_ip}.")
+        return Outcome.OK
+    if result.kind in ("api_error", "http_error"):
+        if (result.status_code == 404
+                or CF_CODE_RECORD_NOT_FOUND in result.codes):
+            logging.warning(f"DNS record {record_id} no longer exists (host {host}).")
+            return Outcome.GONE
+        return Outcome.PERMANENT
+    return Outcome.TRANSIENT
 
 
 def initialize_metrics(config: Dict[str, Any]):
@@ -336,60 +569,57 @@ def initialize_metrics(config: Dict[str, Any]):
 
 
 def handle_dns_update(config: Dict[str, Any], record_id: Optional[str],
-                     current_ip: str) -> Tuple[bool, Optional[str]]:
+                      current_ip: str,
+                      cf_session: requests.Session) -> Tuple[bool, Optional[str]]:
     """
-    Handle DNS update logic including record recreation if needed.
-    Returns (success, new_record_id)
+    Fail-closed DNS update orchestration.
+
+    Invariant (C1): create_dns_record() is called only after a confirmed
+    ABSENT in the same attempt; TRANSIENT, PERMANENT, and AMBIGUOUS outcomes
+    never mutate anything.
+
+    Returns (success, record_id).
+
+    # TODO(stage-3): replaced by the full decision table with DdnsState.
     """
-    success = False
-    new_record_id = record_id
+    zone_id = config["zone_id"]
+    host = config["host"]
+    ttl = config["ttl"]
+    proxied = config["proxied"]
 
     if record_id:
-        # Try to update existing record
-        success = update_cloudflare_record(
-            config["token"],
-            config["zone_id"],
-            record_id,
-            config["host"],
-            current_ip,
-            config["ttl"],
-            config["proxied"]
+        outcome = update_cloudflare_record(
+            cf_session, zone_id, record_id, host, current_ip, ttl, proxied
         )
+        if outcome is Outcome.OK:
+            return True, record_id
+        if outcome is not Outcome.GONE:
+            # TRANSIENT or PERMANENT: nothing may be mutated this attempt.
+            return False, record_id
+        # The record id is confirmed dead — fall through to a fresh read.
+        logging.info("Record is gone. Re-reading DNS state.")
+        record_id = None
 
-        # If update failed (possibly due to invalid record ID), try to get new one
-        if not success:
-            logging.info("Update failed. Attempting to retrieve current record ID.")
-            record_info = get_dns_record(config["token"], config["zone_id"], config["host"])
-            if record_info:
-                new_record_id = record_info.get("id")
-                if new_record_id:
-                    success = update_cloudflare_record(
-                        config["token"],
-                        config["zone_id"],
-                        new_record_id,
-                        config["host"],
-                        current_ip,
-                        config["ttl"],
-                        config["proxied"]
-                    )
-            else:
-                # Record doesn't exist anymore
-                new_record_id = None
+    get_outcome, record = get_dns_record(cf_session, zone_id, host)
 
-    # If no record exists or update failed, create new one
-    if not success and not new_record_id:
+    if get_outcome is Outcome.OK:
+        new_record_id = record["id"]
+        outcome = update_cloudflare_record(
+            cf_session, zone_id, new_record_id, host, current_ip, ttl, proxied
+        )
+        return outcome is Outcome.OK, new_record_id
+
+    if get_outcome is Outcome.ABSENT:
         logging.info("Creating new DNS record.")
-        new_record_id = create_dns_record(
-            config["token"],
-            config["zone_id"],
-            config["host"],
-            current_ip,
-            config["ttl"],
-            config["proxied"]
+        create_outcome, new_record_id = create_dns_record(
+            cf_session, zone_id, host, current_ip, ttl, proxied
         )
-        success = (new_record_id is not None)
+        if create_outcome is Outcome.OK:
+            return True, new_record_id
+        return False, None
 
-    return success, new_record_id
+    # TRANSIENT, PERMANENT, or AMBIGUOUS read: fail closed, no create.
+    return False, None
 
 
 def main():
@@ -403,21 +633,33 @@ def main():
     start_http_server(config["metrics_port"])
     logging.info(f"Prometheus metrics server started on port {config['metrics_port']}")
 
-    # Get initial DNS record information to avoid unnecessary updates
-    record_info = get_dns_record(config["token"], config["zone_id"], config["host"])
+    cf_session, ip_session = create_http_clients(config["token"])
 
-    if record_info:
-        last_ip = record_info.get("content")
-        record_id = record_info.get("id")
+    # Get initial DNS record information to avoid unnecessary updates
+    outcome, record_info = get_dns_record(cf_session, config["zone_id"], config["host"])
+
+    if outcome is Outcome.OK:
+        last_ip = record_info["content"]
+        record_id = record_info["id"]
         logging.info(f"Current DNS record found. Host: {config['host']}, IP: {last_ip}")
+    elif outcome is Outcome.ABSENT:
+        logging.warning(
+            f"No existing DNS record found for host '{config['host']}'. "
+            "Will create one on first IP retrieval."
+        )
+        last_ip = None
+        record_id = None
     else:
-        logging.warning(f"No existing DNS record found for host '{config['host']}'. Will create one on first IP retrieval.")
+        logging.warning(
+            f"Could not read DNS state at startup ({outcome.value}); "
+            "the main loop will re-read before any write."
+        )
         last_ip = None
         record_id = None
 
     # Get current external IP and initialize metric
     logging.info("Getting initial external IP...")
-    initial_ip = get_external_ip()
+    initial_ip = get_external_ip(ip_session)
     if initial_ip:
         logging.info(f"Current external IP: {initial_ip}")
         # Set current external IP metric to 1
@@ -439,7 +681,7 @@ def main():
                 # Update check timestamp
                 prometheus_metrics["last_ip_check_timestamp"].set(time.time())
 
-                current_ip = get_external_ip()
+                current_ip = get_external_ip(ip_session)
 
                 if current_ip is None:
                     consecutive_failures += 1
@@ -460,7 +702,9 @@ def main():
                             logging.info(f"IP changed from {last_ip} to {current_ip}. Updating DNS record.")
 
                         # Handle DNS update with possible record recreation
-                        success, record_id = handle_dns_update(config, record_id, current_ip)
+                        success, record_id = handle_dns_update(
+                            config, record_id, current_ip, cf_session
+                        )
 
                         if success:
                             # Update metrics
