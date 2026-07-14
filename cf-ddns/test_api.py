@@ -34,9 +34,17 @@ def test_get_ok(api_error_metric):
     session = FakeSession([ok_get([RECORD])])
     outcome, record = cf_ddns.get_dns_record(session, "zone", "host")
     assert outcome is Outcome.OK
-    assert record == RECORD
+    assert record == {**RECORD, "modified_on": None}
     method, url, kwargs = session.calls[0]
     assert kwargs["params"] == {"type": "A", "name": "host"}
+
+
+def test_get_ok_projects_modified_on(api_error_metric):
+    stamped = dict(RECORD, modified_on="2026-07-14T10:00:00Z")
+    session = FakeSession([ok_get([stamped])])
+    outcome, record = cf_ddns.get_dns_record(session, "zone", "host")
+    assert outcome is Outcome.OK
+    assert record["modified_on"] == "2026-07-14T10:00:00Z"
 
 
 def test_get_empty_result_is_absent(api_error_metric):
@@ -94,7 +102,7 @@ def test_get_transient_failures_retried_with_backoff(api_error_metric,
     session = FakeSession([failure, failure, ok_get([RECORD])])
     outcome, record = cf_ddns.get_dns_record(session, "zone", "host")
     assert outcome is Outcome.OK
-    assert record == RECORD
+    assert record == {**RECORD, "modified_on": None}
     assert sleep_calls == [1, 2]
 
 

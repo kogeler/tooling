@@ -52,10 +52,24 @@ def test_defaults(required_env):
         "ttl": 120,
         "proxied": False,
         "metrics_port": 9101,
+        "metrics_addr": "0.0.0.0",
         "max_failures": 10,
         "reconcile_interval": 3600,
         "confirm_cycles": 2,
     }
+
+
+@pytest.mark.parametrize("value", ["127.0.0.1", "0.0.0.0", "::1"])
+def test_valid_metrics_addr_accepted(required_env, monkeypatch, value):
+    monkeypatch.setenv("CF_DDNS_METRICS_ADDR", value)
+    assert cf_ddns.parse_env()["metrics_addr"] == value
+
+
+@pytest.mark.parametrize("value", ["localhost", "nonsense", "1.2.3"])
+def test_invalid_metrics_addr_exits(required_env, monkeypatch, value):
+    monkeypatch.setenv("CF_DDNS_METRICS_ADDR", value)
+    with pytest.raises(SystemExit):
+        cf_ddns.parse_env()
 
 
 @pytest.mark.parametrize("var", REQUIRED)

@@ -31,5 +31,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Switch to the non-privileged user
 USER pyuser
 
+# Prometheus metrics endpoint (default port)
+EXPOSE 9101
+
+# Process-liveness check only: proves the metrics endpoint answers, not that
+# DNS is synchronized. Shell form so the env var expands.
+HEALTHCHECK CMD wget -q -O /dev/null "http://127.0.0.1:${CF_DDNS_METRICS_PORT:-9101}/metrics" || exit 1
+
 # By default, run the script
 CMD ["python", "cf_ddns.py"]

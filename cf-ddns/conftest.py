@@ -127,6 +127,7 @@ def config():
         "proxied": False,
         "interval": 10,
         "metrics_port": 9101,
+        "metrics_addr": "0.0.0.0",
         "max_failures": 10,
         "reconcile_interval": 3600,
         "confirm_cycles": 1,
@@ -140,10 +141,12 @@ def loop_metrics(monkeypatch):
         name: MagicMock()
         for name in (
             "ip_update_counter",
+            "ip_changes_counter",
             "ip_info_gauge",
             "last_ip_check_timestamp",
             "last_ip_update_timestamp",
             "unconfirmed_ip_counter",
+            "record_modified_timestamp",
         )
     }
     for name, metric in metrics.items():

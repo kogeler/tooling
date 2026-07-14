@@ -162,3 +162,14 @@ def test_main_cleans_up_even_on_fatal_startup(wired_main):
     wired_main["httpd"].shutdown.assert_called_once()
     wired_main["clients"].cloudflare.close.assert_called_once()
     wired_main["run_loop"].assert_not_called()
+
+
+def test_main_exits_cleanly_when_metrics_port_is_taken(wired_main):
+    """L5: a bind failure must be a CRITICAL + exit 1, not a raw traceback."""
+    wired_main["start_http_server"].side_effect = OSError(98, "Address already in use")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cf_ddns.main()
+
+    assert exc_info.value.code == 1
+    wired_main["create_http_clients"].assert_not_called()

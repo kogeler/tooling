@@ -28,7 +28,9 @@ make venv    # create ./venv and install pinned deps (idempotent)
 make test    # pytest with branch coverage
 make lint    # ruff check
 make clean   # remove venv and caches
-podman build -t cf-ddns cf-ddns/   # container build
+# --format docker is required for podman to keep the HEALTHCHECK
+# (OCI images do not support it); plain `docker build` keeps it natively
+podman build --format docker -t cf-ddns cf-ddns/
 ```
 
 Live manual check (mutates only the dedicated test host):
@@ -57,6 +59,7 @@ the failure budget, so a stop during degraded conditions still exits 0.
 | `CF_DDNS_PROXIED` | no | `false` | strictly `true`/`false`; typos exit with an error |
 | `CF_DDNS_LOGLEVEL` | no | `INFO` | DEBUG/INFO/WARNING/ERROR/CRITICAL |
 | `CF_DDNS_METRICS_PORT` | no | `9101` | Prometheus endpoint port |
+| `CF_DDNS_METRICS_ADDR` | no | `0.0.0.0` | Prometheus endpoint bind address (must be a valid IP) |
 | `CF_DDNS_MAX_FAILURES` | no | `10` | consecutive-failure budget (IP retrieval / DNS updates) before exit 1 |
 | `CF_DDNS_RECONCILE_INTERVAL` | no | `3600` | seconds between full DNS re-reads (external-drift repair); `0` disables |
 | `CF_DDNS_CONFIRM_CYCLES` | no | `2` | consecutive readings required before a new IP is written; `1` = immediate |

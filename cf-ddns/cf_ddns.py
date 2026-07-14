@@ -21,7 +21,11 @@ from enum import Enum
 from urllib.parse import urlparse
 from typing import Optional, Dict, Any, NamedTuple, Tuple
 
-from prometheus_client import start_http_server, Counter, Gauge
+from prometheus_client import (
+    REGISTRY, CollectorRegistry, Counter, Gauge, Info, start_http_server,
+)
+
+__version__ = "1.1.0"
 
 check_ip_services = [
     "https://checkip.amazonaws.com",
@@ -95,39 +99,74 @@ def _handle_signal(signum, frame):
     shutdown_event.set()
 
 
-# Prometheus metrics map
-prometheus_metrics = {
-    "ip_update_counter": Counter(
-        "cf_ddns_ip_updates_total",
-        "Number of times the IP address was updated."
-    ),
-    "ip_info_gauge": Gauge(
-        "cf_ddns_ip_info",
-        "Indicator for IP addresses used per host (1 for current IP, 0 for old IPs).",
-        ["cf_host", "ip"]
-    ),
-    "ip_retrieval_error_counter": Counter(
-        "cf_ddns_ip_retrieval_errors_total",
-        "Number of times external IP retrieval from specific service failed.",
-        ["check_ip_service_host"]
-    ),
-    "cf_api_error_counter": Counter(
-        "cf_ddns_cloudflare_api_errors_total",
-        "Number of Cloudflare API errors."
-    ),
-    "unconfirmed_ip_counter": Counter(
-        "cf_ddns_unconfirmed_ip_readings_total",
-        "Number of new-IP readings discarded before confirmation."
-    ),
-    "last_ip_check_timestamp": Gauge(
-        "cf_ddns_last_ip_check_timestamp_seconds",
-        "Unix timestamp of the last IP check."
-    ),
-    "last_ip_update_timestamp": Gauge(
-        "cf_ddns_last_ip_update_timestamp_seconds",
-        "Unix timestamp of the last successful IP update."
-    )
-}
+def create_metrics(registry: CollectorRegistry = REGISTRY) -> Dict[str, Any]:
+    """
+    Build the Prometheus metrics map. The registry is injectable so tests can
+    use a fresh CollectorRegistry; production uses the default REGISTRY that
+    start_http_server() serves.
+    """
+    return {
+        "ip_update_counter": Counter(
+            "cf_ddns_ip_updates_total",
+            "Number of successful DNS record writes (creations, IP changes, "
+            "and reconciliation rewrites).",
+            registry=registry
+        ),
+        "ip_changes_counter": Counter(
+            "cf_ddns_ip_changes_total",
+            "Number of successful writes that replaced a known, different "
+            "previous IP. Restart re-sync, first-run creation, and settings "
+            "reconciliation do not count. Alert on this for real IP changes.",
+            registry=registry
+        ),
+        "ip_info_gauge": Gauge(
+            "cf_ddns_ip_info",
+            "Current managed IP per host (single series, value 1).",
+            ["cf_host", "ip"],
+            registry=registry
+        ),
+        "ip_retrieval_error_counter": Counter(
+            "cf_ddns_ip_retrieval_errors_total",
+            "Number of times external IP retrieval from specific service failed.",
+            ["check_ip_service_host"],
+            registry=registry
+        ),
+        "cf_api_error_counter": Counter(
+            "cf_ddns_cloudflare_api_errors_total",
+            "Number of Cloudflare API errors.",
+            registry=registry
+        ),
+        "unconfirmed_ip_counter": Counter(
+            "cf_ddns_unconfirmed_ip_readings_total",
+            "Number of new-IP readings discarded before confirmation.",
+            registry=registry
+        ),
+        "last_ip_check_timestamp": Gauge(
+            "cf_ddns_last_ip_check_timestamp_seconds",
+            "Unix timestamp of the last IP check.",
+            registry=registry
+        ),
+        "last_ip_update_timestamp": Gauge(
+            "cf_ddns_last_ip_update_timestamp_seconds",
+            "Unix timestamp of the last successful DNS write by this process "
+            "(0 after a restart until this process writes).",
+            registry=registry
+        ),
+        "record_modified_timestamp": Gauge(
+            "cf_ddns_record_modified_timestamp_seconds",
+            "Cloudflare modified_on of the managed record as of the last "
+            "read. Provider state: includes manual and other-writer edits.",
+            registry=registry
+        ),
+        "build_info": Info(
+            "cf_ddns_build",
+            "Build/version information.",
+            registry=registry
+        ),
+    }
+
+
+prometheus_metrics = create_metrics()
 
 
 def configure_logging():
@@ -230,6 +269,17 @@ def parse_env() -> Dict[str, Any]:
         logging.error(f"Invalid value for CF_DDNS_METRICS_PORT: {metrics_port_str}. {e}")
         sys.exit(1)
 
+    # Prometheus metrics bind address (L5)
+    metrics_addr = (os.environ.get("CF_DDNS_METRICS_ADDR", "0.0.0.0")).strip()
+    try:
+        ipaddress.ip_address(metrics_addr)
+    except ValueError:
+        logging.error(
+            f"Invalid value for CF_DDNS_METRICS_ADDR: {metrics_addr!r} "
+            "is not an IP address."
+        )
+        sys.exit(1)
+
     # Consecutive-failure budget shared by IP retrieval and DNS updates (H2)
     max_failures_str = os.environ.get("CF_DDNS_MAX_FAILURES", "10")
     try:
@@ -268,6 +318,7 @@ def parse_env() -> Dict[str, Any]:
         "ttl": ttl,
         "proxied": proxied,
         "metrics_port": metrics_port,
+        "metrics_addr": metrics_addr,
         "max_failures": max_failures,
         "reconcile_interval": reconcile_interval,
         "confirm_cycles": confirm_cycles
@@ -587,6 +638,8 @@ def get_dns_record(cf_session: requests.Session, zone_id: str, host: str, *,
             "content": record["content"],  # Current IP in DNS
             "ttl": record["ttl"],
             "proxied": record["proxied"],
+            # provider timestamp; feeds cf_ddns_record_modified_timestamp_seconds
+            "modified_on": record.get("modified_on"),
         }
     if result.kind == "transient":
         return Outcome.TRANSIENT, None
@@ -676,29 +729,34 @@ def update_cloudflare_record(cf_session: requests.Session, zone_id: str,
     return Outcome.TRANSIENT
 
 
+def _record_modified_ts(record_info: Dict[str, Any]) -> Optional[float]:
+    """Parse the record's ISO-8601 modified_on into a Unix timestamp."""
+    value = record_info.get("modified_on")
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        logging.debug(f"Unparseable modified_on value: {value!r}")
+        return None
+
+
 def initialize_metrics(config: Dict[str, Any]):
     """
-    Initialize all Prometheus metrics with zero values.
+    Materialize labeled metric children and static info so all series exist
+    from startup. Unlabeled counters and gauges already exist at 0 upon
+    registration — no private-API pokes are needed (M5).
     """
-    # Initialize error counters for each IP check service
     for service in check_ip_services:
         hostname = urlparse(service).hostname
         if hostname:
-            # Create metric with initial value of 0
             prometheus_metrics["ip_retrieval_error_counter"].labels(
                 check_ip_service_host=hostname
-            )._value.set(0)
+            )
 
-    # Initialize other counters with 0
-    prometheus_metrics["ip_update_counter"]._value.set(0)
-    prometheus_metrics["cf_api_error_counter"]._value.set(0)
-    prometheus_metrics["unconfirmed_ip_counter"]._value.set(0)
+    prometheus_metrics["build_info"].info({"version": __version__})
 
-    # Initialize timestamps with 0 (never checked/updated)
-    prometheus_metrics["last_ip_check_timestamp"].set(0)
-    prometheus_metrics["last_ip_update_timestamp"].set(0)
-
-    logging.debug("All metrics initialized with zero values.")
+    logging.debug("Metrics initialized.")
 
 
 def handle_dns_update(config: Dict[str, Any], record_id: Optional[str],
@@ -791,6 +849,15 @@ def startup_state(config: Dict[str, Any], clients: HttpClients) -> DdnsState:
         state.record_id = record_info["id"]
         logging.info(f"Current DNS record found. Host: {config['host']}, IP: {state.last_ip}")
 
+        # The record's content is the last confirmed managed value — it, not
+        # an unconfirmed one-off reading, primes the current-IP series (M4/R1).
+        # A restart therefore restores the exact same single series.
+        prometheus_metrics["ip_info_gauge"].labels(
+            cf_host=config["host"], ip=state.last_ip).set(1)
+        modified_ts = _record_modified_ts(record_info)
+        if modified_ts is not None:
+            prometheus_metrics["record_modified_timestamp"].set(modified_ts)
+
         # Startup reconciliation (M2): converge ttl/proxied even when the IP
         # is unchanged. config["ttl"] is already the effective desired TTL
         # (Auto for proxied records), so this cannot flap.
@@ -803,9 +870,11 @@ def startup_state(config: Dict[str, Any], clients: HttpClients) -> DdnsState:
             )
             state.force_update = True
     elif outcome is Outcome.ABSENT:
+        # No gauge series yet: it appears only after a confirmed write —
+        # never from an unconfirmed one-off reading (M4/R1).
         logging.warning(
             f"No existing DNS record found for host '{config['host']}'. "
-            "Will create one on first IP retrieval."
+            "Will create one once the external IP is confirmed."
         )
     elif outcome is Outcome.TRANSIENT:
         logging.warning(
@@ -814,22 +883,6 @@ def startup_state(config: Dict[str, Any], clients: HttpClients) -> DdnsState:
         )
     else:  # PERMANENT or AMBIGUOUS: a config/ownership problem — fail fast
         state.fatal = outcome.value
-        return state
-
-    # Get current external IP and initialize metric
-    logging.info("Getting initial external IP...")
-    initial_ip = get_external_ip(clients.check_ip, stop_event=shutdown_event)
-    if initial_ip:
-        logging.info(f"Current external IP: {initial_ip}")
-        # Set current external IP metric to 1
-        prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=initial_ip).set(1)
-
-        # If DNS IP exists and differs from current IP, set it to 0
-        if state.last_ip and state.last_ip != initial_ip:
-            prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=state.last_ip).set(0)
-            logging.info(f"DNS IP {state.last_ip} differs from current IP {initial_ip}")
-    else:
-        logging.warning("Could not retrieve initial external IP")
 
     return state
 
@@ -849,6 +902,9 @@ def _reconcile(config: Dict[str, Any], state: DdnsState,
     )
 
     if outcome is Outcome.OK:
+        modified_ts = _record_modified_ts(record)
+        if modified_ts is not None:
+            prometheus_metrics["record_modified_timestamp"].set(modified_ts)
         if record["id"] != state.record_id:
             logging.warning(
                 f"Reconciliation: record id changed externally "
@@ -981,10 +1037,15 @@ def run_iteration(config: Dict[str, Any], state: DdnsState,
         prometheus_metrics["ip_update_counter"].inc()
         prometheus_metrics["last_ip_update_timestamp"].set(time.time())
 
-        # Update IP gauge - keep all IPs in history (bounded in stage 6)
+        # Single-series gauge invariant (M4): set the new IP, then remove the
+        # old series entirely (removing a missing labelset is a no-op in the
+        # pinned prometheus_client). Prometheus keeps history server-side.
+        prometheus_metrics["ip_info_gauge"].labels(
+            cf_host=config["host"], ip=write_ip).set(1)
         if state.last_ip is not None and state.last_ip != write_ip:
-            prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=state.last_ip).set(0)
-        prometheus_metrics["ip_info_gauge"].labels(cf_host=config["host"], ip=write_ip).set(1)
+            prometheus_metrics["ip_info_gauge"].remove(config["host"], state.last_ip)
+            # A real IP change: a known previous IP was replaced (R1).
+            prometheus_metrics["ip_changes_counter"].inc()
 
         state.last_ip = write_ip
     elif outcome is Outcome.TRANSIENT:
@@ -1058,9 +1119,22 @@ def main():
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    # Start Prometheus metrics server
-    httpd, metrics_thread = start_http_server(config["metrics_port"])
-    logging.info(f"Prometheus metrics server started on port {config['metrics_port']}")
+    # Start Prometheus metrics server (serves the default REGISTRY that
+    # create_metrics() populated)
+    try:
+        httpd, metrics_thread = start_http_server(
+            config["metrics_port"], addr=config["metrics_addr"]
+        )
+    except OSError as e:
+        logging.critical(
+            f"Cannot bind the metrics endpoint on "
+            f"{config['metrics_addr']}:{config['metrics_port']}: {e}"
+        )
+        sys.exit(1)
+    logging.info(
+        f"Prometheus metrics server started on "
+        f"{config['metrics_addr']}:{config['metrics_port']}"
+    )
 
     clients = create_http_clients(config["token"])
 
