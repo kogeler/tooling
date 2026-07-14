@@ -68,6 +68,14 @@ class FakeSession:
         return self._next()
 
 
+@pytest.fixture(autouse=True)
+def _reset_shutdown_event():
+    """Keep the global shutdown event clean across tests."""
+    cf_ddns.shutdown_event.clear()
+    yield
+    cf_ddns.shutdown_event.clear()
+
+
 @pytest.fixture
 def required_env(monkeypatch):
     """Set the three required environment variables to test values."""

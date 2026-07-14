@@ -34,6 +34,17 @@ podman build -t cf-ddns cf-ddns/   # container build
 Live manual check (mutates only the dedicated test host):
 `. tokens.sh && ./venv/bin/python cf_ddns.py`
 
+## Graceful shutdown
+
+SIGTERM and SIGINT set a global shutdown event. Every wait (loop interval, retry
+backoff, Retry-After) and every new HTTP attempt observes it; after the signal no
+new request starts and no DNS mutation is issued. The shutdown bound is **one
+in-flight read timeout (5s) plus a small margin** — a synchronous request already
+on the wire cannot be cancelled, only awaited. Normal (interval-wait) stops
+return in well under a second; the container's default 10s grace period is
+always sufficient. Failures caused by the shutdown itself do not count toward
+the failure budget, so a stop during degraded conditions still exits 0.
+
 ## Configuration (env vars)
 
 | Variable | Required | Default | Meaning |

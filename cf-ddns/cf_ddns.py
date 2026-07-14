@@ -8,7 +8,9 @@ import os
 import sys
 import time
 import random
+import signal
 import logging
+import threading
 import requests
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -54,6 +56,17 @@ class Outcome(str, Enum):
     AMBIGUOUS = "ambiguous"  # multiple matching A records; do not guess ownership
     TRANSIENT = "transient"  # network / 5xx / 429 — retries exhausted
     PERMANENT = "permanent"  # other 4xx (auth, validation) — not retryable
+
+
+# Set by SIGTERM/SIGINT; every wait and every new HTTP attempt observes it.
+# Shutdown is bounded by one in-flight read timeout plus scheduling margin.
+shutdown_event = threading.Event()
+
+
+def _handle_signal(signum, frame):
+    """Signal handler: request a graceful shutdown."""
+    logging.info(f"Received {signal.Signals(signum).name}; shutting down.")
+    shutdown_event.set()
 
 
 # Prometheus metrics map
@@ -619,7 +632,8 @@ def handle_dns_update(config: Dict[str, Any], record_id: Optional[str],
 
     def _update(rid: str) -> Outcome:
         return update_cloudflare_record(
-            cf_session, zone_id, rid, host, current_ip, ttl, proxied
+            cf_session, zone_id, rid, host, current_ip, ttl, proxied,
+            stop_event=shutdown_event
         )
 
     if record_id:
@@ -632,7 +646,8 @@ def handle_dns_update(config: Dict[str, Any], record_id: Optional[str],
         # The record id is confirmed dead — fall through to a fresh read.
         logging.info("Record is gone. Re-reading DNS state.")
 
-    get_outcome, record = get_dns_record(cf_session, zone_id, host)
+    get_outcome, record = get_dns_record(cf_session, zone_id, host,
+                                         stop_event=shutdown_event)
 
     if get_outcome is Outcome.OK:
         outcome = _update(record["id"])
@@ -644,14 +659,16 @@ def handle_dns_update(config: Dict[str, Any], record_id: Optional[str],
     if get_outcome is Outcome.ABSENT:
         logging.info("Creating new DNS record.")
         create_outcome, new_record_id = create_dns_record(
-            cf_session, zone_id, host, current_ip, ttl, proxied
+            cf_session, zone_id, host, current_ip, ttl, proxied,
+            stop_event=shutdown_event
         )
         if create_outcome is Outcome.OK:
             return Outcome.OK, new_record_id
         if create_outcome is Outcome.EXISTS:
             # Raced with another writer: adopt the existing record and update
             # it — never issue a second create.
-            adopt_outcome, adopted = get_dns_record(cf_session, zone_id, host)
+            adopt_outcome, adopted = get_dns_record(cf_session, zone_id, host,
+                                                    stop_event=shutdown_event)
             if adopt_outcome is Outcome.OK:
                 outcome = _update(adopted["id"])
                 if outcome is Outcome.GONE:
@@ -676,7 +693,8 @@ def startup_state(config: Dict[str, Any], clients: HttpClients) -> DdnsState:
     """
     state = DdnsState()
     outcome, record_info = get_dns_record(
-        clients.cloudflare, config["zone_id"], config["host"]
+        clients.cloudflare, config["zone_id"], config["host"],
+        stop_event=shutdown_event
     )
 
     if outcome is Outcome.OK:
@@ -699,7 +717,7 @@ def startup_state(config: Dict[str, Any], clients: HttpClients) -> DdnsState:
 
     # Get current external IP and initialize metric
     logging.info("Getting initial external IP...")
-    initial_ip = get_external_ip(clients.check_ip)
+    initial_ip = get_external_ip(clients.check_ip, stop_event=shutdown_event)
     if initial_ip:
         logging.info(f"Current external IP: {initial_ip}")
         # Set current external IP metric to 1
@@ -721,11 +739,16 @@ def run_iteration(config: Dict[str, Any], state: DdnsState,
     One check/update cycle. Never sleeps and never exits — main() enforces
     the failure policy on the returned state.
     """
+    if shutdown_event.is_set():
+        return state
+
     prometheus_metrics["last_ip_check_timestamp"].set(time.time())
 
-    current_ip = get_external_ip(clients.check_ip)
+    current_ip = get_external_ip(clients.check_ip, stop_event=shutdown_event)
 
     if current_ip is None:
+        if shutdown_event.is_set():
+            return state  # failure caused by shutdown, not by the network
         state.ip_failures += 1
         logging.error(
             f"Could not retrieve external IP. "
@@ -760,6 +783,8 @@ def run_iteration(config: Dict[str, Any], state: DdnsState,
 
         state.last_ip = current_ip
     elif outcome is Outcome.TRANSIENT:
+        if shutdown_event.is_set():
+            return state  # failure caused by shutdown, not by the API
         state.cf_failures += 1
         logging.error(
             f"DNS update failed (transient). "
@@ -796,6 +821,25 @@ def enforce_failure_policy(config: Dict[str, Any], state: DdnsState) -> None:
         sys.exit(1)
 
 
+def run_loop(config: Dict[str, Any], state: DdnsState,
+             clients: HttpClients) -> None:
+    """
+    The main loop: iterate, enforce the failure policy, wait interruptibly.
+    Returns when the shutdown event is set.
+    """
+    while not shutdown_event.is_set():
+        try:
+            state = run_iteration(config, state, clients)
+        except Exception as loop_error:
+            logging.exception(f"An error occurred in the main loop: {loop_error}")
+            state.cf_failures += 1
+
+        enforce_failure_policy(config, state)
+
+        logging.debug(f"Waiting {config['interval']} seconds before the next check...")
+        shutdown_event.wait(timeout=config["interval"])
+
+
 def main():
     configure_logging()
     config = parse_env()
@@ -803,30 +847,29 @@ def main():
     # Initialize Prometheus metrics with zero values
     initialize_metrics(config)
 
+    # Graceful shutdown: SIGTERM (container stop) and SIGINT (Ctrl+C) both
+    # set the shutdown event; waits and new HTTP attempts observe it, so the
+    # exit is bounded by one in-flight read timeout plus a small margin.
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     # Start Prometheus metrics server
-    start_http_server(config["metrics_port"])
+    httpd, metrics_thread = start_http_server(config["metrics_port"])
     logging.info(f"Prometheus metrics server started on port {config['metrics_port']}")
 
     clients = create_http_clients(config["token"])
 
-    state = startup_state(config, clients)
-    enforce_failure_policy(config, state)
-
     try:
-        while True:
-            try:
-                state = run_iteration(config, state, clients)
-            except Exception as loop_error:
-                logging.exception(f"An error occurred in the main loop: {loop_error}")
-                state.cf_failures += 1
-
-            enforce_failure_policy(config, state)
-
-            logging.debug(f"Waiting {config['interval']} seconds before the next check...")
-            time.sleep(config["interval"])
-
-    except KeyboardInterrupt:
-        logging.info("Caught KeyboardInterrupt. Exiting gracefully.")
+        state = startup_state(config, clients)
+        enforce_failure_policy(config, state)
+        run_loop(config, state, clients)
+        logging.info("Shutting down.")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        metrics_thread.join(timeout=5)
+        clients.cloudflare.close()
+        clients.check_ip.close()
 
 
 if __name__ == "__main__":

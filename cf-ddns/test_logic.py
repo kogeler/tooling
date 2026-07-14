@@ -113,7 +113,8 @@ def test_first_run_creates_after_confirmed_absent(monkeypatch, config):
 
     assert result == (Outcome.OK, "new_record_id")
     mocks["create_dns_record"].assert_called_once_with(
-        CF_SESSION, "test_zone", "test.example.com", "1.2.3.4", 120, False
+        CF_SESSION, "test_zone", "test.example.com", "1.2.3.4", 120, False,
+        stop_event=cf_ddns.shutdown_event
     )
     mocks["update_cloudflare_record"].assert_not_called()
 
