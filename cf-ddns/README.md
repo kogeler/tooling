@@ -1,123 +1,232 @@
 # Cloudflare DDNS Updater
 
-A Python script that dynamically updates a Cloudflare DNS A record with your external IP. The script also exposes Prometheus metrics for monitoring DDNS updates and errors.
+A single-module Python service that keeps one Cloudflare DNS A record pointed at
+this host's external IPv4 address. It polls public check-IP services, writes
+through the Cloudflare v4 API only after the new address is confirmed, converges
+the record back when it drifts or disappears, and exposes Prometheus metrics.
 
 ---
 
 ## Features
 
-- **Dynamic DNS Update:** Automatically updates the specified Cloudflare DNS record when your external IP changes.
-- **Prometheus Metrics:** Exposes comprehensive metrics for monitoring:
-  - IP update counters and timestamps
-  - IP usage tracking with historical data
-  - Error tracking for IP retrieval and Cloudflare API
-- **Robust Error Handling:** Retry logic with exponential backoff for API calls
-- **Record Management:** Automatic record creation and recreation if needed
-- **Environment Variable Configuration:** All settings are controlled via environment variables.
+- **Confirmed dynamic DNS updates:** a changed external IP must be observed in
+  consecutive checks (`CF_DDNS_CONFIRM_CYCLES`) before DNS is touched — one bogus
+  reading from a check service can never rewrite production DNS.
+- **Reconciliation:** ttl/proxied config drift is converged at startup; the record
+  is re-read periodically (`CF_DDNS_RECONCILE_INTERVAL`) to repair external edits
+  and deletions.
+- **Classified error handling:** permanent API refusals (auth, validation) fail
+  fast with exit 1; transient failures (network, 5xx, 429 with `Retry-After`)
+  retry with bounded exponential backoff; record writes use PATCH so unmanaged
+  metadata (comments, tags, settings) survives.
+- **Fail-closed record management:** a record is created only after a confirmed
+  "no record exists" API answer; multiple A records for the host halt the service
+  instead of guessing ownership.
+- **Graceful shutdown:** SIGTERM/SIGINT exit cleanly in well under a second
+  (bounded by one in-flight read timeout, max ~5s).
+- **Prometheus metrics** with restart-safe alerting semantics (see below).
 
 ---
 
 ## Prerequisites
 
-- Python 3.6 or higher.
-- Python packages:
-  - `requests`
-  - `prometheus_client`
-
-Install dependencies via pip:
-
-    pip install requests prometheus_client
+- Python 3.11 or newer (the container image ships 3.14).
+- Pinned dependencies from `requirements.txt` (`requests`, `prometheus_client`).
 
 ---
 
 ## Usage
 
-Make sure the script is executable:
+Local (uses the project venv):
 
-    chmod +x tooling/cf-ddns/cf_ddns.py
+    make venv
+    . tokens.sh                # or export CF_DDNS_* yourself
+    ./venv/bin/python cf_ddns.py
 
-Then run the script:
+Container:
 
-    ./tooling/cf-ddns/cf_ddns.py
+    # --format docker is required for podman to keep the HEALTHCHECK
+    # (OCI images do not support it); plain `docker build` keeps it natively
+    podman build --format docker -t cf-ddns .
+    podman run -d -e CF_DDNS_TOKEN -e CF_DDNS_ZONE_ID -e CF_DDNS_HOST cf-ddns
 
 ---
 
 ## Environment Variables
 
-The following environment variables must be set:
+Required:
 
-- **CF_DDNS_TOKEN**  
-  Cloudflare API token with sufficient permissions to manage DNS records.
+| Variable | Meaning |
+|---|---|
+| `CF_DDNS_TOKEN` | Cloudflare API token with DNS edit rights for the zone |
+| `CF_DDNS_ZONE_ID` | Cloudflare zone ID |
+| `CF_DDNS_HOST` | FQDN of the managed A record; normalized (lowercase, IDNA) and validated |
 
-- **CF_DDNS_ZONE_ID**  
-  Cloudflare zone ID where your DNS record is hosted.
+Optional:
 
-- **CF_DDNS_HOST**  
-  The fully qualified domain name (FQDN) to update (e.g., `subdomain.example.com`).
+| Variable | Default | Meaning |
+|---|---|---|
+| `CF_DDNS_INTERVAL` | `10` | seconds between IP checks (≥1) |
+| `CF_DDNS_TTL` | `120` | record TTL: `1` (Auto) or `30`–`86400`; 30–59 needs an Enterprise zone; forced to `1` when proxied |
+| `CF_DDNS_PROXIED` | `false` | strictly `true`/`false` (case-insensitive); anything else is a startup error |
+| `CF_DDNS_LOGLEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL` |
+| `CF_DDNS_METRICS_PORT` | `9101` | Prometheus endpoint port |
+| `CF_DDNS_METRICS_ADDR` | `0.0.0.0` | Prometheus endpoint bind address (must be a valid IP) |
+| `CF_DDNS_MAX_FAILURES` | `10` | consecutive-failure budget (per class: IP retrieval / DNS updates) before exit 1 |
+| `CF_DDNS_RECONCILE_INTERVAL` | `3600` | seconds between full record re-reads; `0` disables reconciliation |
+| `CF_DDNS_CONFIRM_CYCLES` | `2` | consecutive identical readings before a new IP is written; `1` restores immediate updates |
 
-Optional variables:
+Retrieved IPs are accepted only when they are strictly formatted, globally
+routable **unicast** IPv4 addresses — private, loopback, link-local, CGNAT,
+multicast, reserved, and broadcast ranges are rejected.
 
-- **CF_DDNS_INTERVAL**  
-  Interval in seconds between IP checks. Default: `10`.
+---
 
-- **CF_DDNS_TTL**  
-  Time To Live (TTL) for the DNS record. Default: `120`.
+## Error handling
 
-- **CF_DDNS_PROXIED**  
-  Set to `"True"` (case-insensitive) if the record should be proxied by Cloudflare. Default: `"False"`.
+Every Cloudflare API exchange is classified:
 
-- **CF_DDNS_LOGLEVEL**  
-  Logging level. Acceptable values: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Default: `INFO`.
+| Class | Examples | Behavior |
+|---|---|---|
+| permanent | 400/401/403, invalid token/zone | no retry; `CRITICAL` + exit 1 (a config error cannot heal by retrying) |
+| gone | HTTP 404 / error 81044 on update | record vanished: re-read, then update or recreate |
+| exists | error 81057/81058 on create | adopt the existing record; never create twice |
+| ambiguous | multiple A records for the host | no mutation; `CRITICAL` + exit 1 (see runbook below) |
+| transient | network errors, 5xx, 429 | bounded retries with backoff; 429 honors `Retry-After` up to a 60s budget |
 
-- **CF_DDNS_METRICS_PORT**  
-  Port where the Prometheus metrics endpoint is exposed. Default: `9101`.
+Create (POST) is not idempotent, so it gets exactly one attempt; after an
+uncertain result the service re-reads state instead of blindly re-sending.
+A record is only ever created after a confirmed empty read in the same pass.
+
+### Runbook: AMBIGUOUS halt
+
+With `restart: unless-stopped` the fail-closed exit becomes a visible restart
+loop — intentionally: better a crash loop than mutating a record the service
+does not own. To resolve: list the A records for the host (dashboard, API, or
+`dig +short <host>`), delete the stale duplicates, restart the service.
 
 ---
 
 ## Prometheus Metrics
 
-The following metrics are exposed under `/metrics`:
+Exposed under `http://<CF_DDNS_METRICS_ADDR>:<CF_DDNS_METRICS_PORT>/metrics`:
 
-- **cf_ddns_ip_updates_total**  
-  A counter that increments each time the IP address is successfully updated.
+| Metric | Meaning |
+|---|---|
+| `cf_ddns_ip_changes_total` | successful writes that replaced a known, **different** previous IP — the "my IP actually changed" signal; restart re-sync, first-run creation, and settings rewrites do not count |
+| `cf_ddns_ip_updates_total` | every successful DNS write (creations, changes, reconciliation rewrites) |
+| `cf_ddns_ip_info{cf_host, ip}` | **single series**: the current managed IP, value 1; the previous IP's series is removed on change (Prometheus keeps history server-side) |
+| `cf_ddns_unconfirmed_ip_readings_total` | new-IP readings discarded before confirmation — a rising rate flags a flaky check service |
+| `cf_ddns_ip_retrieval_errors_total{check_ip_service_host}` | failures per check-IP service |
+| `cf_ddns_cloudflare_api_errors_total` | Cloudflare API errors (including retried transients) |
+| `cf_ddns_last_ip_check_timestamp_seconds` | when the loop last checked the external IP |
+| `cf_ddns_last_ip_update_timestamp_seconds` | last successful write **by this process** (0 after a restart until it writes) |
+| `cf_ddns_record_modified_timestamp_seconds` | the record's `modified_on` as of the last read — provider state, includes manual edits |
+| `cf_ddns_build_info{version}` | build/version marker |
 
-- **cf_ddns_ip_info{cf_host, ip}**  
-  A gauge indicating IP usage. The current IP is set to `1`, and previous IP values remain at `0` for historical tracking.
+## Monitoring & alerting (restart-safe)
 
-- **cf_ddns_ip_retrieval_errors_total{check_ip_service_host}**  
-  A counter that increments when an error occurs while retrieving the external IP from a specific service (e.g., `checkip.amazonaws.com` or `api.ipify.org`).
+Process metrics necessarily reset when the service restarts. These rules do not
+page on restart artifacts:
 
-- **cf_ddns_cloudflare_api_errors_total**  
-  A counter that increments when Cloudflare API calls fail.
+```yaml
+# The managed IP actually changed
+- alert: CfDdnsIpChanged
+  expr: increase(cf_ddns_ip_changes_total[15m]) > 0
 
-- **cf_ddns_last_ip_check_timestamp_seconds**  
-  A gauge with the Unix timestamp of the last IP check.
+# Scrape target is down
+- alert: CfDdnsDown
+  expr: up{job="cf-ddns"} == 0
+  for: 5m
 
-- **cf_ddns_last_ip_update_timestamp_seconds**  
-  A gauge with the Unix timestamp of the last successful IP update.
+# Service stopped checking (guarded against the startup-zero artifact)
+- alert: CfDdnsStalled
+  expr: >
+    (time() - cf_ddns_last_ip_check_timestamp_seconds > 300)
+    and (time() - process_start_time_seconds > 300)
+  for: 5m
 
-Access the metrics at:
+# Cloudflare API errors observed (warning level; includes retried transients)
+- alert: CfDdnsApiErrors
+  expr: increase(cf_ddns_cloudflare_api_errors_total[15m]) > 0
 
-    http://<HOST>:<CF_DDNS_METRICS_PORT>/metrics
+# A check-IP service keeps returning unconfirmed readings
+- alert: CfDdnsFlakyIpSource
+  expr: increase(cf_ddns_unconfirmed_ip_readings_total[1h]) > 3
+```
+
+**Anti-patterns** — do *not* alert on `changes(cf_ddns_ip_info[...])`, on series
+appearance/disappearance, or on `cf_ddns_ip_updates_total`: all of them still
+see restarts and reconciliation rewrites.
+
+The container healthcheck proves only process liveness (the metrics endpoint
+answers), not that DNS is synchronized.
 
 ---
 
-## Advanced Features
+## Deployment
 
-### Retry Logic
-The script implements exponential backoff retry logic for:
-- DNS record retrieval (up to 3 attempts)
-- DNS record creation (up to 3 attempts)  
-- DNS record updates (up to 3 attempts)
+The failure policy relies on the supervisor restarting the process — a restart
+policy is required. Exactly **one active writer** may manage a given
+`(zone, host, record type)`; rolling updates must avoid overlap when instances
+can observe different egress IPs.
 
-### Error Handling
-- Automatic handling of "record not found" errors (Cloudflare error code 81058)
-- Automatic record recreation if the record ID becomes invalid
-- Consecutive failure tracking with graceful shutdown after 10 failures
+```yaml
+# docker-compose.yml
+services:
+  cf-ddns:
+    image: cf-ddns
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    ports:
+      - "127.0.0.1:9101:9101"   # publish metrics on an internal interface only
+    environment:
+      CF_DDNS_TOKEN: "..."
+      CF_DDNS_ZONE_ID: "..."
+      CF_DDNS_HOST: "host.example.com"
+```
 
-### IP Validation
-- IPv4 address format validation for all retrieved IPs
-- Multiple IP retrieval services for redundancy
+---
+
+## Testing
+
+```sh
+make venv    # create ./venv and install pinned runtime+dev deps
+make test    # pytest with branch coverage
+make lint    # ruff check
+
+# run a single test
+./venv/bin/python -m pytest test_logic.py -k reconcile -v
+```
+
+Test layout (pytest-native; every test exercises production code):
+
+| File | Covers |
+|---|---|
+| `test_config.py` | `parse_env` validation and normalization |
+| `test_validation.py` | IP validation, check-IP retrieval |
+| `test_api.py` | Cloudflare API layer: outcome classification, retries, payloads |
+| `test_logic.py` | orchestration: decision table, flap damping, reconciliation, failure policy |
+| `test_lifecycle.py` | signals, interruptible waits, `main()` cleanup |
+| `test_metrics.py` | metric semantics against a fresh registry, restart-safe contract |
+| `conftest.py` | shared fixtures (`FakeResponse`, `FakeSession`, metric mocks) |
+
+ERROR/WARNING log lines during a test run are expected — they are the output of
+failure-path tests, not real failures.
+
+CI integration:
+
+```yaml
+# Example GitHub Actions
+- name: Test cf-ddns
+  run: |
+    cd tooling/cf-ddns
+    make test
+    make lint
+```
 
 ---
 
@@ -129,8 +238,8 @@ This project is licensed under the [Apache License 2.0](../LICENSE).
 
 ## Notes
 
-- Ensure that your Cloudflare API token, zone ID, and host are correctly provided.
-- The script fetches the external IP via HTTPS from two services: `checkip.amazonaws.com` and `api.ipify.org`.
-- Monitor Prometheus metrics to stay aware of DNS update activity and potential errors.
-- The script maintains historical IP information in metrics for tracking purposes.
-- All API calls include proper error handling and retry mechanisms for reliability.
+- The external IP is fetched via HTTPS from `checkip.amazonaws.com` and
+  `api.ipify.org` (response bodies are size-capped and strictly validated).
+- The Cloudflare bearer token is sent only to `api.cloudflare.com` — the
+  check-IP services are queried by a separate, credential-free HTTP session.
+- Only IPv4 A records are managed; IPv6/AAAA is out of scope.

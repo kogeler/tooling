@@ -1,10 +1,10 @@
-# Copyright © 2025 kogeler
+# Copyright © 2026 kogeler
 # SPDX-License-Identifier: Apache-2.0
 
 """Tests for the orchestration layer: handle_dns_update decision table,
 run_iteration, startup_state, and the failure policy.
 
-Core invariant (C1): create_dns_record() is called only after a confirmed
+Core invariant: create_dns_record() is called only after a confirmed
 ABSENT in the same iteration; TRANSIENT/PERMANENT/AMBIGUOUS never mutate.
 """
 
@@ -150,7 +150,7 @@ def test_create_exists_then_unstable_read_is_transient(monkeypatch, config):
     mocks["update_cloudflare_record"].assert_not_called()
 
 
-# --- C1 regressions: errors must never lead to a create ---------------------
+# --- regressions: errors must never lead to a create ---------------------
 
 
 @pytest.mark.parametrize("outcome", [
@@ -280,7 +280,7 @@ def test_iteration_unrecoverable_outcome_sets_fatal(monkeypatch, config,
     assert state.fatal == outcome.value
 
 
-# --- flap damping (M9/R2) ----------------------------------------------------
+# --- flap damping ----------------------------------------------------
 
 
 def test_single_deviant_reading_never_writes(monkeypatch, config, loop_metrics):
@@ -372,7 +372,7 @@ def test_first_run_creation_requires_confirmation(monkeypatch, config,
     assert state.last_ip == "9.9.9.9"
 
 
-# --- force_update (M2) --------------------------------------------------------
+# --- force_update --------------------------------------------------------
 
 
 def test_force_update_rewrites_confirmed_ip_immediately(monkeypatch, config,
@@ -426,7 +426,7 @@ def test_startup_proxied_record_matches_normalized_config(monkeypatch,
     assert state.force_update is False
 
 
-# --- periodic reconciliation (M3) ----------------------------------------------
+# --- periodic reconciliation ----------------------------------------------
 
 
 def _reconcile_setup(monkeypatch, config, *, get, handle=(Outcome.OK, "rid")):

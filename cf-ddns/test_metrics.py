@@ -1,9 +1,9 @@
-# Copyright © 2025 kogeler
+# Copyright © 2026 kogeler
 # SPDX-License-Identifier: Apache-2.0
 
 """Metrics tests against a fresh CollectorRegistry: single-series ip_info
-invariant, write-vs-change split, restart-safe semantics (R1), and the ban
-on prometheus_client private APIs (M5).
+invariant, write-vs-change split, restart-safe semantics, and the ban
+on prometheus_client private APIs.
 """
 
 import inspect
@@ -53,7 +53,7 @@ def _patch_loop(monkeypatch, *, ip, handle):
         monkeypatch.setattr(cf_ddns, name, mock)
 
 
-# --- M5: no private API access --------------------------------------------------
+# --- no private API access --------------------------------------------------
 
 
 def test_no_private_value_pokes_in_source():
@@ -74,7 +74,7 @@ def test_initialize_metrics_materializes_children(registry, config):
     assert sample(registry, "cf_ddns_last_ip_update_timestamp_seconds") == 0
 
 
-# --- M4: single-series ip_info invariant ----------------------------------------
+# --- single-series ip_info invariant ----------------------------------------
 
 
 def test_ip_change_leaves_single_series(registry, monkeypatch, config):
@@ -125,7 +125,7 @@ def test_settings_rewrite_is_a_write_not_a_change(registry, monkeypatch,
     assert series_count(registry, "cf_ddns_ip_info") == 1
 
 
-# --- R1: restart-safe semantics --------------------------------------------------
+# --- restart-safe semantics --------------------------------------------------
 
 
 def test_restart_with_unchanged_ip_is_metrically_quiet(registry, monkeypatch,

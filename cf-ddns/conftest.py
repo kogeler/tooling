@@ -1,4 +1,4 @@
-# Copyright © 2025 kogeler
+# Copyright © 2026 kogeler
 # SPDX-License-Identifier: Apache-2.0
 
 """Shared fixtures and helpers for the cf-ddns test suite."""

@@ -1,4 +1,4 @@
-# Copyright © 2025 kogeler
+# Copyright © 2026 kogeler
 # SPDX-License-Identifier: Apache-2.0
 
 """Tests for IP validation and external-IP retrieval."""
@@ -10,7 +10,7 @@ from conftest import FakeResponse, FakeSession
 
 import cf_ddns
 
-# Only globally routable unicast IPv4 addresses are valid DDNS content (M7)
+# Only globally routable unicast IPv4 addresses are valid DDNS content
 VALID_IPS = [
     "1.2.3.4",
     "8.8.8.8",
@@ -28,7 +28,7 @@ MALFORMED_IPS = [
     None,
     "192.168.1.-1",
     "192.168.1.256",
-    # strict parsing (L1): forms the old int()-based validator accepted
+    # strict parsing: forms the old int()-based validator accepted
     "192.168.001.1",
     "1. 2.3.4",
     "+1.2.3.4",

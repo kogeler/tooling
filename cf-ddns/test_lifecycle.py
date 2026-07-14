@@ -1,4 +1,4 @@
-# Copyright © 2025 kogeler
+# Copyright © 2026 kogeler
 # SPDX-License-Identifier: Apache-2.0
 
 """Tests for graceful shutdown: signal handling, interruptible waits,
@@ -165,7 +165,7 @@ def test_main_cleans_up_even_on_fatal_startup(wired_main):
 
 
 def test_main_exits_cleanly_when_metrics_port_is_taken(wired_main):
-    """L5: a bind failure must be a CRITICAL + exit 1, not a raw traceback."""
+    """A bind failure must be a CRITICAL + exit 1, not a raw traceback."""
     wired_main["start_http_server"].side_effect = OSError(98, "Address already in use")
 
     with pytest.raises(SystemExit) as exc_info:

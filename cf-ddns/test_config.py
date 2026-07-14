@@ -1,4 +1,4 @@
-# Copyright © 2025 kogeler
+# Copyright © 2026 kogeler
 # SPDX-License-Identifier: Apache-2.0
 
 """Tests for parse_env() configuration handling."""

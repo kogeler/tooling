@@ -25,7 +25,7 @@ from prometheus_client import (
     REGISTRY, CollectorRegistry, Counter, Gauge, Info, start_http_server,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 check_ip_services = [
     "https://checkip.amazonaws.com",
@@ -59,7 +59,7 @@ _HOSTNAME_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 def _normalize_host(host_raw: str) -> str:
     """
     Normalize a hostname (lowercase, IDNA-encode, strip the root dot) and
-    validate it as a DNS name. Raises ValueError when invalid (M6).
+    validate it as a DNS name. Raises ValueError when invalid.
     """
     host = host_raw.strip().rstrip(".").lower()
     if not host:
@@ -77,7 +77,7 @@ def _normalize_host(host_raw: str) -> str:
 
 
 class Outcome(str, Enum):
-    """Classified result of a Cloudflare API call (frozen contract)."""
+    """Classified result of a Cloudflare API call."""
 
     OK = "ok"                # request succeeded
     ABSENT = "absent"        # confirmed: no record (HTTP 200, empty result list)
@@ -207,7 +207,7 @@ def parse_env() -> Dict[str, Any]:
         )
         sys.exit(1)
 
-    # Normalize and validate the hostname as an IDNA DNS name (M6)
+    # Normalize and validate the hostname as an IDNA DNS name
     try:
         host = _normalize_host(host_raw)
     except ValueError as e:
@@ -223,7 +223,7 @@ def parse_env() -> Dict[str, Any]:
         logging.error(f"Invalid value for CF_DDNS_INTERVAL: {interval_str}. {e}")
         sys.exit(1)
 
-    # TTL (M6): 1 = Cloudflare Auto, otherwise 30-86400 (30-59 Enterprise only)
+    # TTL: 1 = Cloudflare Auto, otherwise 30-86400 (30-59 Enterprise only)
     ttl_str = os.environ.get("CF_DDNS_TTL", "120")
     try:
         ttl = int(ttl_str)
@@ -242,7 +242,7 @@ def parse_env() -> Dict[str, Any]:
             "standard zones accept 60-86400."
         )
 
-    # Proxied (M6): strict boolean — a typo must not silently disable the proxy
+    # Proxied: strict boolean — a typo must not silently disable the proxy
     proxied_str = (os.environ.get("CF_DDNS_PROXIED", "False")).strip().lower()
     if proxied_str not in ("true", "false"):
         logging.error(
@@ -252,7 +252,7 @@ def parse_env() -> Dict[str, Any]:
     proxied = proxied_str == "true"
 
     # Proxied records always use Cloudflare Auto TTL; normalize the effective
-    # TTL so reconciliation comparisons cannot flap forever (M6).
+    # TTL so reconciliation comparisons cannot flap forever.
     if proxied and ttl != 1:
         logging.warning(
             f"CF_DDNS_PROXIED=true forces TTL Auto (1); configured TTL {ttl} is ignored."
@@ -269,7 +269,7 @@ def parse_env() -> Dict[str, Any]:
         logging.error(f"Invalid value for CF_DDNS_METRICS_PORT: {metrics_port_str}. {e}")
         sys.exit(1)
 
-    # Prometheus metrics bind address (L5)
+    # Prometheus metrics bind address
     metrics_addr = (os.environ.get("CF_DDNS_METRICS_ADDR", "0.0.0.0")).strip()
     try:
         ipaddress.ip_address(metrics_addr)
@@ -280,7 +280,7 @@ def parse_env() -> Dict[str, Any]:
         )
         sys.exit(1)
 
-    # Consecutive-failure budget shared by IP retrieval and DNS updates (H2)
+    # Consecutive-failure budget shared by IP retrieval and DNS updates
     max_failures_str = os.environ.get("CF_DDNS_MAX_FAILURES", "10")
     try:
         max_failures = int(max_failures_str)
@@ -290,7 +290,7 @@ def parse_env() -> Dict[str, Any]:
         logging.error(f"Invalid value for CF_DDNS_MAX_FAILURES: {max_failures_str}. {e}")
         sys.exit(1)
 
-    # Periodic reconciliation interval in seconds; 0 disables (M3)
+    # Periodic reconciliation interval in seconds; 0 disables
     reconcile_str = os.environ.get("CF_DDNS_RECONCILE_INTERVAL", "3600")
     try:
         reconcile_interval = int(reconcile_str)
@@ -300,7 +300,7 @@ def parse_env() -> Dict[str, Any]:
         logging.error(f"Invalid value for CF_DDNS_RECONCILE_INTERVAL: {reconcile_str}. {e}")
         sys.exit(1)
 
-    # A changed IP must be observed this many consecutive iterations (M9/R2)
+    # A changed IP must be observed this many consecutive iterations
     confirm_str = os.environ.get("CF_DDNS_CONFIRM_CYCLES", "2")
     try:
         confirm_cycles = int(confirm_str)
@@ -328,7 +328,7 @@ def parse_env() -> Dict[str, Any]:
 def validate_ipv4(ip: str) -> bool:
     """
     Validate that `ip` is a strictly formatted, globally routable unicast
-    IPv4 address — the only thing a public DDNS record may contain (M7/L1).
+    IPv4 address — the only thing a public DDNS record may contain.
 
     Rejects malformed forms (leading zeros, whitespace, signs) and
     non-public ranges: private, loopback, link-local, CGNAT, unspecified,
@@ -346,22 +346,22 @@ def validate_ipv4(ip: str) -> bool:
 
 @dataclass
 class DdnsState:
-    """Mutable loop state threaded through run_iteration() (frozen contract)."""
+    """Mutable loop state threaded through run_iteration()."""
 
     last_ip: Optional[str] = None
     record_id: Optional[str] = None
     ip_failures: int = 0         # consecutive external-IP retrieval failures
     cf_failures: int = 0         # consecutive Cloudflare transient-failure iterations
     fatal: Optional[str] = None  # unrecoverable outcome; main() exits when set
-    force_update: bool = False   # settings drift detected; rewrite on next pass (M2)
-    pending_ip: Optional[str] = None  # candidate new IP awaiting confirmation (M9)
+    force_update: bool = False   # settings drift detected; rewrite on next pass
+    pending_ip: Optional[str] = None  # candidate new IP awaiting confirmation
     pending_seen: int = 0             # consecutive observations of pending_ip
-    last_reconcile: Optional[float] = None  # monotonic ts of last reconciliation (M3)
+    last_reconcile: Optional[float] = None  # monotonic ts of last reconciliation
 
 
 @dataclass
 class HttpClients:
-    """The two persistent HTTP sessions (frozen contract)."""
+    """The two persistent HTTP sessions."""
 
     cloudflare: requests.Session  # carries the bearer header; CF hosts only
     check_ip: requests.Session    # never carries Cloudflare credentials
@@ -394,7 +394,7 @@ class _CfResult(NamedTuple):
 
 
 def _wait(delay: float, stop_event=None) -> None:
-    """Sleep; interruptible when a stop event is provided (wired in Stage 4)."""
+    """Sleep; interruptible when a stop event is provided."""
     if stop_event is not None:
         stop_event.wait(timeout=delay)
     else:
@@ -600,7 +600,7 @@ def get_dns_record(cf_session: requests.Session, zone_id: str, host: str, *,
 
     Returns (OK, record) | (ABSENT, None) | (AMBIGUOUS, None)
     | (TRANSIENT, None) | (PERMANENT, None). ABSENT is reported only on a
-    confirmed empty result — never on an error (C1).
+    confirmed empty result — never on an error.
     """
     url = f"{CF_API_BASE}/zones/{zone_id}/dns_records"
 
@@ -745,7 +745,7 @@ def initialize_metrics(config: Dict[str, Any]):
     """
     Materialize labeled metric children and static info so all series exist
     from startup. Unlabeled counters and gauges already exist at 0 upon
-    registration — no private-API pokes are needed (M5).
+    registration — no private-API pokes are needed.
     """
     for service in check_ip_services:
         hostname = urlparse(service).hostname
@@ -763,7 +763,7 @@ def handle_dns_update(config: Dict[str, Any], record_id: Optional[str],
                       current_ip: str,
                       cf_session: requests.Session) -> Tuple[Outcome, Optional[str]]:
     """
-    DNS write orchestration (full decision table, C1 fix).
+    DNS write orchestration (full decision table).
 
     Invariant: create_dns_record() is called only after a confirmed ABSENT in
     the same iteration; TRANSIENT, PERMANENT, and AMBIGUOUS outcomes never
@@ -836,7 +836,7 @@ def startup_state(config: Dict[str, Any], clients: HttpClients) -> DdnsState:
     Prime loop state from the existing DNS record and the current external IP.
 
     A transient read failure leaves the state empty — the loop re-reads before
-    any write (C1). A PERMANENT or AMBIGUOUS read marks the state fatal.
+    any write. A PERMANENT or AMBIGUOUS read marks the state fatal.
     """
     state = DdnsState()
     outcome, record_info = get_dns_record(
@@ -850,7 +850,7 @@ def startup_state(config: Dict[str, Any], clients: HttpClients) -> DdnsState:
         logging.info(f"Current DNS record found. Host: {config['host']}, IP: {state.last_ip}")
 
         # The record's content is the last confirmed managed value — it, not
-        # an unconfirmed one-off reading, primes the current-IP series (M4/R1).
+        # an unconfirmed one-off reading, primes the current-IP series.
         # A restart therefore restores the exact same single series.
         prometheus_metrics["ip_info_gauge"].labels(
             cf_host=config["host"], ip=state.last_ip).set(1)
@@ -858,7 +858,7 @@ def startup_state(config: Dict[str, Any], clients: HttpClients) -> DdnsState:
         if modified_ts is not None:
             prometheus_metrics["record_modified_timestamp"].set(modified_ts)
 
-        # Startup reconciliation (M2): converge ttl/proxied even when the IP
+        # Startup reconciliation: converge ttl/proxied even when the IP
         # is unchanged. config["ttl"] is already the effective desired TTL
         # (Auto for proxied records), so this cannot flap.
         if (record_info["ttl"] != config["ttl"]
@@ -871,7 +871,7 @@ def startup_state(config: Dict[str, Any], clients: HttpClients) -> DdnsState:
             state.force_update = True
     elif outcome is Outcome.ABSENT:
         # No gauge series yet: it appears only after a confirmed write —
-        # never from an unconfirmed one-off reading (M4/R1).
+        # never from an unconfirmed one-off reading.
         logging.warning(
             f"No existing DNS record found for host '{config['host']}'. "
             "Will create one once the external IP is confirmed."
@@ -890,10 +890,10 @@ def startup_state(config: Dict[str, Any], clients: HttpClients) -> DdnsState:
 def _reconcile(config: Dict[str, Any], state: DdnsState,
                clients: HttpClients) -> Optional[str]:
     """
-    Periodic reconciliation (M3): re-read the record and detect external
+    Periodic reconciliation: re-read the record and detect external
     drift. Returns the IP to (re)write, or None when converged. Errors are
     counted/marked on the state; creation stays inside handle_dns_update
-    behind its confirmed-ABSENT invariant (C1).
+    behind its confirmed-ABSENT invariant.
     """
     logging.debug("Reconciliation: re-reading DNS state.")
     outcome, record = get_dns_record(
@@ -941,7 +941,7 @@ def run_iteration(config: Dict[str, Any], state: DdnsState,
     the failure policy on the returned state.
 
     A changed external IP is written only after `confirm_cycles` consecutive
-    identical readings (M9/R2). Reconciliation and force_update writes reuse
+    identical readings. Reconciliation and force_update writes reuse
     the already-confirmed IP and are exempt from confirmation. `now` is the
     monotonic clock, injectable for tests.
     """
@@ -967,7 +967,7 @@ def run_iteration(config: Dict[str, Any], state: DdnsState,
     ip_changed = current_ip != state.last_ip
 
     if ip_changed:
-        # Flap damping (M9): a new IP must be confirmed over consecutive
+        # Flap damping: a new IP must be confirmed over consecutive
         # readings before it may touch DNS.
         if current_ip == state.pending_ip:
             state.pending_seen += 1
@@ -1000,7 +1000,7 @@ def run_iteration(config: Dict[str, Any], state: DdnsState,
             state.pending_seen = 0
 
         if state.force_update:
-            # Startup-detected settings drift (M2): rewrite the confirmed IP.
+            # Startup-detected settings drift: rewrite the confirmed IP.
             write_ip = current_ip
         elif config["reconcile_interval"]:
             ts = now()
@@ -1037,14 +1037,14 @@ def run_iteration(config: Dict[str, Any], state: DdnsState,
         prometheus_metrics["ip_update_counter"].inc()
         prometheus_metrics["last_ip_update_timestamp"].set(time.time())
 
-        # Single-series gauge invariant (M4): set the new IP, then remove the
+        # Single-series gauge invariant: set the new IP, then remove the
         # old series entirely (removing a missing labelset is a no-op in the
         # pinned prometheus_client). Prometheus keeps history server-side.
         prometheus_metrics["ip_info_gauge"].labels(
             cf_host=config["host"], ip=write_ip).set(1)
         if state.last_ip is not None and state.last_ip != write_ip:
             prometheus_metrics["ip_info_gauge"].remove(config["host"], state.last_ip)
-            # A real IP change: a known previous IP was replaced (R1).
+            # A real IP change: a known previous IP was replaced.
             prometheus_metrics["ip_changes_counter"].inc()
 
         state.last_ip = write_ip
@@ -1065,7 +1065,7 @@ def run_iteration(config: Dict[str, Any], state: DdnsState,
 def enforce_failure_policy(config: Dict[str, Any], state: DdnsState) -> None:
     """
     Exit fatally on unrecoverable outcomes or an exhausted consecutive-failure
-    budget (H2). Both failure classes share the same budget.
+    budget. Both failure classes share the same budget.
     """
     if state.fatal:
         logging.critical(

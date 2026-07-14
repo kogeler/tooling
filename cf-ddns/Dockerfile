@@ -6,7 +6,7 @@ FROM python:3.14-alpine
 
 LABEL maintainer="kogeler"
 LABEL description="Cloudflare DDNS Updater"
-LABEL version="1.1.0"
+LABEL version="1.2.0"
 
 # Use environment variables so that Python won't create .pyc files
 # and the output is written directly to stdout (unbuffered).

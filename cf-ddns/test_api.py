@@ -1,4 +1,4 @@
-# Copyright © 2025 kogeler
+# Copyright © 2026 kogeler
 # SPDX-License-Identifier: Apache-2.0
 
 """Classification tests for the Cloudflare API layer (Outcome contract)."""
@@ -176,7 +176,7 @@ def test_create_existing_record_is_exists(api_error_metric, response):
 def test_create_uncertain_outcome_single_post_no_retry(api_error_metric,
                                                        sleep_calls, failure):
     # POST is not idempotent: one attempt only, TRANSIENT so the caller
-    # re-reads state instead of blindly re-sending (C1 companion rule).
+    # re-reads state instead of blindly re-sending.
     session = FakeSession([failure])
     outcome, record_id = cf_ddns.create_dns_record(
         session, "zone", "host", "1.2.3.4", 120, False
