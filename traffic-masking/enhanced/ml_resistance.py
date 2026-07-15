@@ -11,8 +11,7 @@ Machine Learning resistant traffic generation module
 import random
 import time
 import math
-from typing import Dict, List, Tuple, Any, Optional
-from enum import Enum
+from typing import Dict, List, Tuple, Any
 from collections import deque
 
 

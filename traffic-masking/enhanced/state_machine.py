@@ -10,7 +10,7 @@ Protocol state machine for realistic traffic pattern generation
 
 import random
 import time
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, Any, Tuple
 from enum import Enum
 from collections import deque, defaultdict
 

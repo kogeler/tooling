@@ -9,7 +9,6 @@ Adaptive timing model for realistic network delay simulation
 """
 
 import random
-import time
 from collections import deque
 from typing import Optional, Dict, Any
 

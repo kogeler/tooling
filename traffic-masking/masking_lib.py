@@ -21,15 +21,12 @@ import os
 import struct
 import random
 import socket
-import hashlib
 import time
 import math
 from enum import Enum
 from dataclasses import dataclass
-from collections import deque
 from typing import Iterator, List, Optional, Sequence, Tuple, Dict, Any, Union, Callable
 
-import time  # Add time import for rate control
 
 try:
     import numpy as np
@@ -42,7 +39,7 @@ try:
     from enhanced.correlation import CorrelationBreaker
     from enhanced.ml_resistance import MLResistantGenerator
     from enhanced.entropy import EntropyEnhancer
-    from enhanced.state_machine import ProtocolStateMachine
+    from enhanced.state_machine import ProtocolStateMachine  # noqa: F401  (availability probe)
     ENHANCED_AVAILABLE = True
 except ImportError:
     ENHANCED_AVAILABLE = False
@@ -89,7 +86,7 @@ class ProtocolMimicry:
                 self.correlation_breaker = CorrelationBreaker()
                 self.ml_resistant = MLResistantGenerator()
                 self.timing_model = AdaptiveTimingModel()
-            except:
+            except Exception:
                 self.enhanced = False
 
     @staticmethod
@@ -225,7 +222,7 @@ class DynamicObfuscator:
             try:
                 self.timing_model = AdaptiveTimingModel()
                 self.entropy_enhancer = EntropyEnhancer()
-            except:
+            except Exception:
                 self.enhanced = False
 
     def obfuscate(self, payload: bytes, profile: Optional[TrafficProfile] = None, base_delay: float = 0.0) -> Tuple[List[bytes], float]:
@@ -383,7 +380,7 @@ def _generate_payload(size: int, entropy: float = 1.0) -> bytes:
         try:
             enhancer = EntropyEnhancer()
             return enhancer.generate_realistic_encrypted_payload(size, content_type='mixed')
-        except:
+        except Exception:
             pass
 
     # Fast path for high entropy (most common case)
@@ -427,8 +424,6 @@ def stream_generator(
     if min_mbps is not None and max_mbps is not None:
         # Floating rate mode - start at a random position for variety
         current_mbps = random.uniform(min_mbps, max_mbps)
-        rate_velocity = random.uniform(-0.5, 0.5) * (max_mbps - min_mbps)  # Initial velocity
-        rate_acceleration = 0.0  # Acceleration
         last_rate_update = time.time()
         use_floating_rate = True
     elif target_mbps is not None:
@@ -445,14 +440,12 @@ def stream_generator(
     rate_window_start = time.time()
 
     # Use enhanced features if available
-    enhanced_generator = None
     if ENHANCED_AVAILABLE and target_mbps and target_mbps > 10:  # Only use enhanced for high rates
         try:
-            ml_generator = MLResistantGenerator()
-            timing_model = AdaptiveTimingModel(base_rtt=0.001)  # Lower base RTT for higher throughput
-            enhanced_generator = True
-        except:
-            enhanced_generator = None
+            MLResistantGenerator()
+            AdaptiveTimingModel(base_rtt=0.001)  # Lower base RTT for higher throughput
+        except Exception:
+            pass
 
     steps = ProtocolMimicry.for_profile(profile)
     if not steps:
@@ -483,7 +476,6 @@ def stream_generator(
     rate_pattern_phase = random.uniform(0, 2 * math.pi)  # Random starting phase
     dwell_at_boundary = False
     dwell_remaining = 0
-    last_boundary_visited = 'none'  # Track last boundary
 
     while True:
         # Update floating rate if enabled
@@ -509,7 +501,6 @@ def stream_generator(
                             current_mbps = max_mbps
                         else:
                             current_mbps = min_mbps
-                        rate_velocity = 0
                         dwell_at_boundary = True
                         dwell_remaining = random.uniform(2.0, 5.0)
 
@@ -518,11 +509,6 @@ def stream_generator(
                     dwell_remaining -= dt
                     if dwell_remaining <= 0:
                         dwell_at_boundary = False
-                        # Strong push away from boundary
-                        if current_mbps <= min_mbps + 0.1:
-                            rate_velocity = rate_range * random.uniform(1.0, 2.0)
-                        else:
-                            rate_velocity = -rate_range * random.uniform(1.0, 2.0)
                     else:
                         # Stay exactly at boundary
                         if current_mbps < rate_center:
