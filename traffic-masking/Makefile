@@ -35,8 +35,8 @@ test-live: venv           ## run only the live end-to-end tests
 lint: venv                ## static checks
 	$(RUFF) check .
 
-run-server: venv          ## demo server (floating 2-8 Mbps, advanced)
-	$(PYTHON) traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced --profile mixed --insecure-diagnostic
+run-server: venv          ## demo server (experimental mixed profile, capped at 8 Mbps)
+	$(PYTHON) traffic_masking_server.py --shape-mode profile --profile mixed --max-mbps 8 --insecure-diagnostic
 
 run-client: venv          ## demo client against 127.0.0.1
 	$(PYTHON) traffic_masking_client.py --server 127.0.0.1 --advanced --uplink-profile mixed --insecure-diagnostic

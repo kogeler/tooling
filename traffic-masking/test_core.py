@@ -3,6 +3,7 @@
 
 """Fast in-process smoke tests for the core library (characterization baseline)."""
 
+import random
 import socket
 
 import pytest
@@ -25,26 +26,33 @@ def test_parse_profile_known_and_fallback():
 
 @pytest.mark.parametrize("profile", list(TrafficProfile))
 def test_for_profile_is_nonempty(profile):
-    steps = ProtocolMimicry.for_profile(profile)
+    steps = ProtocolMimicry.for_profile(profile, rng=random.Random(profile.value))
     assert len(steps) > 0
 
 
 def test_obfuscator_produces_fragments():
-    obf = DynamicObfuscator()
+    obf = DynamicObfuscator(rng=random.Random(1))
     fragments, delay = obf.obfuscate(b"test packet data")
     assert len(fragments) > 0
     assert delay >= 0
 
 
 def test_stream_generator_fixed_rate_yields():
-    gen = stream_generator(TrafficProfile.MIXED, target_mbps=1.0)
+    gen = stream_generator(
+        TrafficProfile.MIXED, target_mbps=1.0, rng=random.Random(2)
+    )
     fragments, delay = next(gen)
     assert len(fragments) > 0
     assert delay > 0
 
 
 def test_stream_generator_floating_rate_yields():
-    gen = stream_generator(TrafficProfile.MIXED, min_mbps=1.0, max_mbps=5.0)
+    gen = stream_generator(
+        TrafficProfile.MIXED,
+        min_mbps=1.0,
+        max_mbps=5.0,
+        rng=random.Random(3),
+    )
     fragments, delay = next(gen)
     assert len(fragments) > 0
     assert delay > 0

@@ -45,9 +45,9 @@ sudo sed -i 's|/usr/bin/python3|/opt/traffic-masking/venv/bin/python|g' \
 
 ### Server Configuration
 
-The server service is configured with maximum security features:
-- Floating rate: 3-10 Mbps
-- Advanced mode with ML resistance
+The server service is configured with authenticated experimental profile shaping:
+- Native mixed-profile offered load capped at 10 Mbps
+- Profile mode (the cap does not increase native offered load)
 - RTP headers and random padding
 - Maximum entropy (1.0)
 
@@ -61,7 +61,7 @@ Example override to change rate:
 [Service]
 ExecStart=
 ExecStart=/opt/traffic-masking/venv/bin/python /opt/traffic-masking/traffic_masking_server.py \
-    --min-mbps 1 --max-mbps 5 --advanced --profile video \
+    --shape-mode profile --max-mbps 5 --profile video \
     --psk-file /etc/traffic-masking/control.psk
 ```
 

@@ -15,13 +15,12 @@ WorkingDirectory=/opt/traffic-masking
 # Environment
 Environment="PYTHONUNBUFFERED=1"
 
-# Maximum configuration with floating rate
+# Experimental native profile with an explicit ceiling
 ExecStart=/usr/bin/python3 /opt/traffic-masking/traffic_masking_server.py \
     --host 0.0.0.0 \
     --port 8888 \
-    --min-mbps 3 \
     --max-mbps 10 \
-    --advanced \
+    --shape-mode profile \
     --profile mixed \
     --header rtp \
     --padding random \

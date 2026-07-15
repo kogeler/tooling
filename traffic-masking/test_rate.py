@@ -1,13 +1,13 @@
 # Copyright © 2026 kogeler
 # SPDX-License-Identifier: Apache-2.0
 
-"""Rate correctness: decimal-Mbps conversion and pacing budget accounting."""
+"""Rate correctness: decimal units and reservation-based pacing."""
 
 import masking_lib
 import pytest
 from conftest import TEST_PSK
-from masking_lib import ProtocolMimicry, mbps_to_bytes_per_second
-from traffic_masking_server import MaskingTrafficServer, _budget_bytes, _RateBudget
+from masking_lib import ProtocolMimicry, RateLimiter, mbps_to_bytes_per_second
+from traffic_masking_server import MaskingTrafficServer
 
 
 class FakeClock:
@@ -57,50 +57,40 @@ def test_file_transfer_profile_uses_decimal_mbps(monkeypatch):
     assert first_step.size / first_step.delay == pytest.approx(125_000)
 
 
-def test_budget_zero_for_nonpositive_inputs():
-    assert _budget_bytes(0, 1.0) == 0
-    assert _budget_bytes(-5, 1.0) == 0
-    assert _budget_bytes(125_000, 0.0) == 0
-    assert _budget_bytes(125_000, -1.0) == 0
-
-
-def test_budget_caps_idle_gap_to_one_tick():
-    # A long idle gap must not turn into accumulated credit: at most one
-    # scheduling tick of bytes is granted no matter how much time passed.
-    rate = 125_000  # 1 Mbps
-    assert _budget_bytes(rate, 60.0) == _budget_bytes(rate, 0.1)
-    assert _budget_bytes(rate, 3600.0) == _budget_bytes(rate, 0.1)
-
-
-def test_budget_tracks_configured_rate_over_fake_clock_window():
-    # Simulate the pacing loop over a fake one-second window of 10 ms ticks
-    # at a constant commanded rate; the granted budget must stay within ±15%
-    # of the configured decimal rate (exact modulo integer truncation).
+def test_rate_limiter_tracks_target_without_exceeding_short_or_long_cap():
     clock = FakeClock()
-    budget = _RateBudget(clock=clock)
     target = mbps_to_bytes_per_second(1)
-    submitted = 0
+    limiter = RateLimiter(target, burst_bytes=1200, clock=clock)
+    sent = 0
 
-    for _ in range(100):
-        clock.advance(0.01)
-        allowed = budget.accrue(target)
-        submitted += allowed
-        budget.consume(allowed)
+    for _ in range(1200):
+        reservation = limiter.reserve(1200)
+        clock.advance(reservation.delay)
+        sent += limiter.commit(reservation)
+        assert sent <= target * clock.now + limiter.burst_bytes + 1
 
-    assert abs(submitted - target) <= target * 0.15
+    sustained = (sent - limiter.burst_bytes) / clock.now
+    assert sustained == pytest.approx(target, rel=0.01)
 
 
-def test_rate_budget_caps_elapsed_and_resets_idle_credit():
+def test_rate_limiter_initial_burst_and_failed_send_refund_are_bounded():
     clock = FakeClock()
-    budget = _RateBudget(clock=clock)
     target = mbps_to_bytes_per_second(1)
+    limiter = RateLimiter(target, burst_bytes=1200, clock=clock)
 
-    clock.advance(60)
-    assert budget.accrue(target) == _budget_bytes(target, 0.1)
-    budget.reset()
-    assert budget.available == 0
+    first = limiter.reserve(1200)
+    assert first.delay == 0
+    limiter.commit(first)
 
-    clock.advance(0.01)
-    assert budget.accrue(target) == pytest.approx(
-        _budget_bytes(target, 0.01), abs=1
-    )
+    failed = limiter.reserve(1200)
+    assert failed.delay == pytest.approx(1200 / target)
+    clock.advance(failed.delay)
+    limiter.refund(failed)
+
+    retry = limiter.reserve(1200)
+    assert retry.delay == 0
+    limiter.commit(retry, successful_bytes=600)
+
+    after_partial = limiter.reserve(600)
+    assert after_partial.delay == 0
+    limiter.commit(after_partial)

@@ -7,6 +7,8 @@
 **masking_lib.py**
 - `stream_generator()`: Main traffic generation with fixed/floating rate support
 - `DynamicObfuscator`: Packet obfuscation and fragmentation
+- `ShapeEvent`, `Packetizer`, `RateLimiter`: Explicit offered-load,
+  application-packetization, and framed-byte pacing contracts
 - `ProtocolMimicry`: Pattern generation for different traffic profiles
 - `TrafficProfile`: Enum for supported profiles (web, video, voip, file, gaming, mixed)
 
@@ -20,7 +22,7 @@
 **traffic_masking_server.py**
 - Multi-client UDP server with batch processing
 - Authenticated client enrollment with client, handshake-rate, and total-rate caps
-- Adaptive rate control with floating mode
+- Explicit fixed/floating rate mode and experimental native profile mode
 - Real-time statistics monitoring
 
 **traffic_masking_client.py**

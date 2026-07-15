@@ -30,8 +30,8 @@ pytestmark = pytest.mark.live
 def _server_args(port, psk_file, lo=2, hi=4):
     return [
         "--host", "127.0.0.1", "--port", str(port),
-        "--min-mbps", str(lo), "--max-mbps", str(hi),
-        "--advanced", "--profile", "mixed", "--stats-interval", "1",
+        "--shape-mode", "profile", "--max-mbps", str(hi),
+        "--profile", "mixed", "--stats-interval", "1",
         "--psk-file", str(psk_file),
     ]
 
@@ -140,7 +140,12 @@ def test_floating_rate_stays_within_bounds(spawn, start_server, psk_file):
     """
     lo, hi = 2.0, 6.0
     server, port = start_server(
-        lambda selected_port: _server_args(selected_port, psk_file, lo, hi),
+        lambda selected_port: [
+            "--host", "127.0.0.1", "--port", str(selected_port),
+            "--shape-mode", "rate", "--min-mbps", str(lo),
+            "--max-mbps", str(hi), "--stats-interval", "1",
+            "--psk-file", str(psk_file),
+        ],
         "server",
     )
 

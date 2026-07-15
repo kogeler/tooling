@@ -42,6 +42,7 @@ from control_protocol import (
 )
 from masking_lib import (
     ObfuscationConfig,
+    Packetizer,
     build_obfuscator,
     init_udp_socket,
     mbps_to_bytes_per_second,
@@ -157,7 +158,8 @@ class AdaptiveTrafficClient:
         self.insecure_diagnostic = bool(insecure_diagnostic)
         self.keepalive_jitter = keepalive_jitter
         self.mtu = mtu
-        self.data_payload_ceiling = mtu - FRAME_OVERHEAD
+        self.packetizer = Packetizer(mtu, FRAME_OVERHEAD)
+        self.data_payload_ceiling = self.packetizer.payload_ceiling
         self._send_lock = threading.Lock()
         self.client_nonce = ZERO_NONCE
         self.session_nonce = ZERO_NONCE
@@ -421,7 +423,9 @@ class AdaptiveTrafficClient:
         print(f"[*] Control authentication: {auth_mode}", flush=True)
         # Initialize obfuscator in advanced mode
         if self.advanced:
-            self.obfuscator = build_obfuscator(self.obf_cfg)
+            self.obfuscator = build_obfuscator(
+                self.obf_cfg, rng=self._rng, byte_source=self._byte_source
+            )
             print(
                 f"[*] Advanced client mode: uplink_profile={self.uplink_profile.value}, header={self.obf_cfg.header_mode}, padding={self.obf_cfg.padding_strategy}, mtu={self.obf_cfg.mtu}, entropy={self.obf_cfg.entropy}",
                 flush=True,
@@ -468,16 +472,11 @@ class AdaptiveTrafficClient:
         """Send packet to the server"""
         try:
             if self.advanced and self.obfuscator is not None:
-                fragments, delay = self.obfuscator.obfuscate(
-                    packet, profile=self.uplink_profile, base_delay=0.0
+                packet = self.obfuscator.transform(
+                    packet, profile=self.uplink_profile
                 )
-                if delay > 0:
-                    time.sleep(delay)
-
-                for fragment in fragments:
-                    self._send_session_message(MessageType.DATA, fragment)
-            else:
-                self._send_session_message(MessageType.DATA, packet)
+            for fragment in self.packetizer.packetize(packet):
+                self._send_session_message(MessageType.DATA, fragment)
         except Exception as e:
             print(f"[!] Send error: {e}", flush=True)
 

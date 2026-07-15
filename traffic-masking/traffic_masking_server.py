@@ -19,9 +19,9 @@ import socket
 import struct
 import threading
 import time
+import warnings
 from collections import OrderedDict, deque
 
-import numpy as np
 from control_protocol import (
     CLIENT_TO_SERVER,
     CONTROL_PADDING_MAX,
@@ -47,58 +47,14 @@ from control_protocol import (
 )
 from masking_lib import (
     DynamicObfuscator,
+    Packetizer,
+    RateLimiter,
+    ShapeEvent,
     TrafficProfile,
+    generate_payload,
     mbps_to_bytes_per_second,
-    stream_generator,
+    profile_event_generator,
 )
-
-
-_MAX_PACING_TICK_SECONDS = 0.1
-
-
-def _budget_bytes(
-    rate_bytes_per_second, elapsed, max_tick=_MAX_PACING_TICK_SECONDS
-):
-    """Bytes allowed to send over ``elapsed`` seconds at the given byte rate.
-
-    ``elapsed`` is clamped to ``max_tick`` so an idle gap (no clients) cannot
-    accumulate a burst of credit that floods the next client to connect.
-    """
-    if rate_bytes_per_second <= 0 or elapsed <= 0:
-        return 0
-    return int(rate_bytes_per_second * min(elapsed, max_tick))
-
-
-class _RateBudget:
-    """Monotonic byte-credit accumulator for the legacy pacing loop."""
-
-    def __init__(self, clock=None, max_tick=_MAX_PACING_TICK_SECONDS):
-        if max_tick <= 0:
-            raise ValueError("max_tick must be positive")
-        self._clock = clock or time.monotonic
-        self._max_tick = max_tick
-        self._last_time = self._clock()
-        self._credit = 0.0
-
-    @property
-    def available(self):
-        return max(0, int(self._credit))
-
-    def reset(self):
-        self._last_time = self._clock()
-        self._credit = 0.0
-
-    def accrue(self, rate_bytes_per_second):
-        now = self._clock()
-        elapsed = max(0.0, now - self._last_time)
-        self._last_time = now
-        if rate_bytes_per_second > 0:
-            self._credit += rate_bytes_per_second * min(elapsed, self._max_tick)
-        return self.available
-
-    def consume(self, byte_count):
-        if byte_count > 0:
-            self._credit -= byte_count
 
 
 def _positive_finite_float(value, name):
@@ -133,72 +89,6 @@ def _positive_int(value, name):
     if parsed <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return parsed
-
-
-class TrafficPattern:
-    """Generator of diverse traffic rate patterns (CBR, bursts, waves, random-walk, media-like)"""
-
-    def __init__(self):
-        self.patterns = [
-            self.constant_bitrate,
-            self.burst_pattern,
-            self.wave_pattern,
-            self.random_walk,
-            self.media_like_pattern,
-        ]
-        self.current_pattern = random.choice(self.patterns)
-        self.pattern_duration = random.uniform(5, 30)  # seconds
-        self.pattern_start = time.time()
-
-    def should_switch_pattern(self):
-        """Check if pattern switch is needed"""
-        return time.time() - self.pattern_start > self.pattern_duration
-
-    def switch_pattern(self):
-        """Switch to a new pattern"""
-        self.current_pattern = random.choice(self.patterns)
-        self.pattern_duration = random.uniform(5, 30)
-        self.pattern_start = time.time()
-
-    def constant_bitrate(self, base_rate):
-        """Constant bitrate with small fluctuations"""
-        return base_rate * random.uniform(0.95, 1.05)
-
-    def burst_pattern(self, base_rate):
-        """Traffic bursts"""
-        if random.random() < 0.1:  # 10% chance of burst
-            return base_rate * random.uniform(2, 4)
-        return base_rate * random.uniform(0.5, 0.8)
-
-    def wave_pattern(self, base_rate):
-        """Wave-like pattern"""
-        t = time.time()
-        wave = np.sin(t / 5) * 0.5 + 1  # Sine wave with period ~31 sec
-        return base_rate * wave * random.uniform(0.9, 1.1)
-
-    def random_walk(self, base_rate):
-        """Random walk"""
-        if not hasattr(self, "walk_value"):
-            self.walk_value = base_rate
-        change = random.uniform(-0.1, 0.1) * base_rate
-        self.walk_value = max(
-            base_rate * 0.3, min(base_rate * 2, self.walk_value + change)
-        )
-        return self.walk_value
-
-    def media_like_pattern(self, base_rate):
-        """Media-like stream (video/audio)"""
-        # Base flow + periodic key frames
-        base = base_rate * 0.7
-        if random.random() < 0.05:  # 5% - "key frames"
-            return base + base_rate * random.uniform(0.5, 1.5)
-        return base + random.uniform(-0.1, 0.1) * base_rate
-
-    def get_current_rate(self, base_rate):
-        """Get current bitrate"""
-        if self.should_switch_pattern():
-            self.switch_pattern()
-        return self.current_pattern(base_rate)
 
 
 class PacketGenerator:
@@ -252,11 +142,12 @@ class MaskingTrafficServer:
         self,
         host="0.0.0.0",
         port=8888,
-        target_mbps=5,
+        target_mbps=None,
         min_mbps=None,
         max_mbps=None,
         advanced=False,
-        profile="mixed",
+        profile=None,
+        shape_mode="rate",
         header="none",
         padding="random",
         mtu=1200,
@@ -272,21 +163,61 @@ class MaskingTrafficServer:
         rng=None,
         byte_source=None,
         cookie_secret=None,
+        monotonic_clock=None,
+        sleep=None,
     ):
-        # Validate configuration up front; fail fast on invalid rates/ranges.
-        floating = min_mbps is not None and max_mbps is not None
-        if (min_mbps is None) != (max_mbps is None):
-            raise ValueError("min-mbps and max-mbps must be given together")
-        if floating:
-            min_mbps = _positive_finite_float(min_mbps, "min-mbps")
-            max_mbps = _positive_finite_float(max_mbps, "max-mbps")
-            if min_mbps >= max_mbps:
-                raise ValueError("min-mbps must be less than max-mbps")
-            target_mbps = None
-        else:
-            target_mbps = _positive_finite_float(
-                target_mbps, "target rate (--mbps)"
+        # Validate the offered-load contract before constructing generators.
+        if shape_mode not in ("rate", "profile"):
+            raise ValueError("shape-mode must be 'rate' or 'profile'")
+        if advanced:
+            warnings.warn(
+                "--advanced is deprecated; use --shape-mode profile",
+                FutureWarning,
+                stacklevel=2,
             )
+            shape_mode = "profile"
+            profile = profile or "mixed"
+            if min_mbps is not None:
+                if max_mbps is None:
+                    raise ValueError("min-mbps and max-mbps must be given together")
+                warnings.warn(
+                    "--advanced translates the old min/max range to a profile cap",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+                min_mbps = None
+            if target_mbps is not None:
+                if max_mbps is None:
+                    max_mbps = target_mbps
+                target_mbps = None
+
+        floating = False
+        if shape_mode == "rate":
+            if profile is not None:
+                raise ValueError("profile is not valid in rate shape mode")
+            if (min_mbps is None) != (max_mbps is None):
+                raise ValueError("min-mbps and max-mbps must be given together")
+            floating = min_mbps is not None
+            if floating:
+                min_mbps = _positive_finite_float(min_mbps, "min-mbps")
+                max_mbps = _positive_finite_float(max_mbps, "max-mbps")
+                if min_mbps >= max_mbps:
+                    raise ValueError("min-mbps must be less than max-mbps")
+                target_mbps = None
+            else:
+                target_mbps = _positive_finite_float(
+                    5 if target_mbps is None else target_mbps,
+                    "target rate (--mbps)",
+                )
+        else:
+            if profile is None:
+                raise ValueError("profile shape mode requires --profile")
+            if min_mbps is not None:
+                raise ValueError("min-mbps is not valid in profile shape mode")
+            if target_mbps is not None:
+                raise ValueError("mbps is not valid in profile shape mode")
+            if max_mbps is not None:
+                max_mbps = _positive_finite_float(max_mbps, "max-mbps")
         mtu = _positive_int(mtu, "mtu")
         if mtu > MAX_DATAGRAM_SIZE:
             raise ValueError(f"mtu must not exceed {MAX_DATAGRAM_SIZE}")
@@ -295,10 +226,10 @@ class MaskingTrafficServer:
                 f"mtu must be at least {MIN_CONTROL_MTU} bytes "
                 "for authenticated control framing"
             )
-        if advanced and mtu - FRAME_OVERHEAD < 256:
+        if shape_mode == "profile" and mtu - FRAME_OVERHEAD < 256:
             raise ValueError(
                 f"mtu must be at least {FRAME_OVERHEAD + 256} bytes "
-                "in advanced mode"
+                "in profile shape mode"
             )
         entropy = _unit_interval_float(entropy, "entropy")
         stats_interval = _positive_finite_float(
@@ -312,7 +243,11 @@ class MaskingTrafficServer:
             max_handshakes_per_second, "max-handshakes-per-second"
         )
         cookie_ttl = _positive_int(cookie_ttl, "cookie-ttl")
-        configured_max_mbps = max_mbps if floating else target_mbps
+        configured_max_mbps = (
+            max_mbps
+            if max_mbps is not None
+            else (target_mbps if shape_mode == "rate" else max_total_mbps)
+        )
         if configured_max_mbps > max_total_mbps:
             raise ValueError(
                 "max-total-mbps must be at least the configured per-client maximum"
@@ -334,6 +269,8 @@ class MaskingTrafficServer:
                 )
 
         self._clock = clock or time.time
+        self._monotonic_clock = monotonic_clock or time.monotonic
+        self._sleep = sleep or time.sleep
         self._rng = rng or random.Random()
         self._byte_source = byte_source or os.urandom
         self.base_key = psk if psk is not None else INSECURE_DIAGNOSTIC_KEY
@@ -352,16 +289,23 @@ class MaskingTrafficServer:
         self.target_mbps = target_mbps
         self.min_mbps = min_mbps
         self.max_mbps = max_mbps
-        # Rate is decimal Mbps of application bytes; store the target in bytes/s.
-        if floating:
-            self.target_bytes_per_second = mbps_to_bytes_per_second((min_mbps + max_mbps) / 2)
-        else:
-            self.target_bytes_per_second = mbps_to_bytes_per_second(target_mbps)
+        self.shape_mode = shape_mode
+        self.current_rate_mbps = (
+            (min_mbps + max_mbps) / 2
+            if floating
+            else target_mbps
+        )
+        self._last_rate_update = self._monotonic_clock()
+        self.target_bytes_per_second = (
+            mbps_to_bytes_per_second(self.current_rate_mbps)
+            if self.current_rate_mbps is not None
+            else None
+        )
         self.socket = None
         self.clients = {}  # Only authenticated/validated sessions.
         self.running = False
-        self.pattern_gen = TrafficPattern()
-        self.data_payload_ceiling = mtu - FRAME_OVERHEAD
+        self.packetizer = Packetizer(mtu, FRAME_OVERHEAD)
+        self.data_payload_ceiling = self.packetizer.payload_ceiling
         self.packet_gen = PacketGenerator(
             max_size=min(1400, self.data_payload_ceiling),
             rng=self._rng,
@@ -370,17 +314,16 @@ class MaskingTrafficServer:
         self.stats = {"bytes_sent": 0, "packets_sent": 0, "start_time": time.time()}
         self.last_stats = {"bytes_sent": 0, "packets_sent": 0, "time": time.time()}
         self.stats_interval = stats_interval
-        # Advanced masking options
-        self.advanced = bool(advanced)
-        # Normalize profile to TrafficProfile
-        try:
-            self.profile = (
-                TrafficProfile(profile)
-                if isinstance(profile, str)
-                else (profile or TrafficProfile.MIXED)
-            )
-        except Exception:
-            self.profile = TrafficProfile.MIXED
+        self.advanced = shape_mode == "profile"  # Compatibility attribute.
+        if shape_mode == "profile":
+            try:
+                self.profile = (
+                    TrafficProfile(profile) if isinstance(profile, str) else profile
+                )
+            except (TypeError, ValueError):
+                raise ValueError(f"unknown traffic profile: {profile}") from None
+        else:
+            self.profile = None
         self.header_mode = header
         self.padding_strategy = padding
         self.mtu = mtu
@@ -414,33 +357,36 @@ class MaskingTrafficServer:
         print(
             f"[*] Traffic masking server started on {self.host}:{self.port}", flush=True
         )
-        if self.min_mbps is not None and self.max_mbps is not None:
+        if self.shape_mode == "profile":
+            print(
+                f"[*] Experimental profile shaping: {self.profile.value}"
+                + (
+                    f" (cap {self.max_mbps} Mbps)"
+                    if self.max_mbps is not None
+                    else " (native offered load)"
+                ),
+                flush=True,
+            )
+        elif self.min_mbps is not None and self.max_mbps is not None:
             print(
                 f"[*] Floating throughput: {self.min_mbps}-{self.max_mbps} Mbps",
                 flush=True,
             )
         else:
             print(f"[*] Target throughput: {self.target_mbps} Mbps", flush=True)
-        if self.advanced:
-            # Initialize obfuscator and generator
+        if self.shape_mode == "profile":
             self.obfuscator = DynamicObfuscator(
                 padding_strategy=self.padding_strategy,
                 timing_jitter=0.002,
                 mtu=self.data_payload_ceiling,
                 header_mode=self.header_mode,
+                rng=self._rng,
+                byte_source=self._byte_source,
             )
-            self.generator = stream_generator(
-                self.profile,
-                target_mbps=self.target_mbps
-                if (self.min_mbps is None or self.max_mbps is None)
-                else None,
-                min_mbps=self.min_mbps,
-                max_mbps=self.max_mbps,
-                obfuscator=self.obfuscator,
-                entropy=self.entropy,
-            )
+            self.generator = profile_event_generator(self.profile, rng=self._rng)
             print(
-                f"[*] Advanced mode enabled: profile={self.profile.value}, header={self.header_mode}, padding={self.padding_strategy}, mtu={self.mtu}, entropy={self.entropy}",
+                f"[*] Profile transform: header={self.header_mode}, "
+                f"padding={self.padding_strategy}, mtu={self.mtu}",
                 flush=True,
             )
         auth_mode = "INSECURE DIAGNOSTIC" if self.insecure_diagnostic else "PSK"
@@ -600,6 +546,11 @@ class MaskingTrafficServer:
         self._accepted_auth[replay_key] = {
             "expires": now + self.cookie_ttl
         }
+        limiter_mbps = (
+            self.current_rate_mbps
+            if self.shape_mode == "rate"
+            else self.max_mbps
+        )
         self.clients[addr] = {
             "last_seen": now,
             "bytes_received": 0,
@@ -610,6 +561,15 @@ class MaskingTrafficServer:
             "send_key": send_key,
             "receive_sequence": frame.sequence,
             "send_sequence": 0,
+            "rate_limiter": (
+                RateLimiter(
+                    mbps_to_bytes_per_second(limiter_mbps),
+                    burst_bytes=self.mtu,
+                    clock=self._monotonic_clock,
+                )
+                if limiter_mbps is not None
+                else None
+            ),
         }
         print(f"[+] New client connected: {addr}", flush=True)
         return True
@@ -684,122 +644,74 @@ class MaskingTrafficServer:
         )
 
     def send_loop(self):
-        """Send cover traffic to clients"""
-        # Pacing uses the monotonic clock: wall-clock steps (NTP) must not
-        # produce negative or inflated byte budgets.
-        rate_budget = _RateBudget()
-
-        # Rate control for advanced mode
-        rate_window_bytes = 0
-        rate_window_start = time.time()
-
+        """Generate logical demand, packetize it, and pace framed datagrams."""
         while self.running:
             if not self.clients:
-                time.sleep(0.1)
-                # No clients: reset pacing so idle time is not billed as a burst
-                # to the next client that connects.
-                rate_budget.reset()
+                self._sleep(0.1)
                 continue
 
-            # Advanced generator-driven mode with proper rate limiting
-            if getattr(self, "advanced", False) and self.generator is not None:
-                try:
-                    frags, base_delay = next(self.generator)
-                except StopIteration:
-                    # Recreate generator if it ever stops
-                    self.generator = stream_generator(
-                        self.profile,
-                        target_mbps=self.target_mbps
-                        if not (self.min_mbps and self.max_mbps)
-                        else None,
-                        min_mbps=self.min_mbps,
-                        max_mbps=self.max_mbps,
-                        obfuscator=self.obfuscator,
-                        entropy=self.entropy,
-                    )
-                    frags, base_delay = next(self.generator)
-
-                # Send fragments and track bytes
-                packet_bytes = 0
-                for frag in frags:
+            event = self._next_shape_event()
+            if event.byte_count:
+                payload = self._make_event_payload(event)
+                for fragment in self.packetizer.packetize(payload):
                     for addr, client in list(self.clients.items()):
-                        try:
-                            framed = self._frame_data_for_client(client, frag)
-                            sent = self.socket.sendto(framed, addr)
-                            if sent != len(framed):
-                                continue
-                            self.stats["bytes_sent"] += sent
-                            self.stats["packets_sent"] += 1
-                            packet_bytes += sent
-                        except Exception as e:
-                            print(f"[!] Send error to client {addr}: {e}", flush=True)
+                        self._send_fragment(addr, client, fragment)
+            if event.delay:
+                self._sleep(event.delay)
 
-                # Update rate window
-                rate_window_bytes += packet_bytes
-                now = time.time()
-                window_elapsed = now - rate_window_start
+    def _next_shape_event(self):
+        if self.shape_mode == "profile":
+            return next(self.generator)
 
-                # Reset window every second
-                if window_elapsed > 1.0:
-                    rate_window_bytes = 0
-                    rate_window_start = now
-                    window_elapsed = 0
-
-                # Use the delay from generator which already implements rate limiting
-                time.sleep(base_delay)
-
-                continue
-
-            # Legacy accumulator mode (default)
-            # Current target rate in bytes/s (the pattern scales the byte budget).
-            current_rate_bps = self.pattern_gen.get_current_rate(
-                self.target_bytes_per_second
+        now = self._monotonic_clock()
+        if (
+            self.min_mbps is not None
+            and now - self._last_rate_update >= 1.0
+        ):
+            self.current_rate_mbps = self._rng.uniform(
+                self.min_mbps, self.max_mbps
             )
+            self._last_rate_update = now
+            new_rate = mbps_to_bytes_per_second(self.current_rate_mbps)
+            self.target_bytes_per_second = new_rate
+            for client in self.clients.values():
+                client["rate_limiter"].set_rate(new_rate)
+        return ShapeEvent(byte_count=self.data_payload_ceiling)
 
-            # Bytes allowed for this interval; elapsed time is capped to one tick.
-            bytes_available = rate_budget.accrue(current_rate_bps)
+    def _make_event_payload(self, event):
+        if self.shape_mode == "rate":
+            return self.packet_gen.generate_packet(event.byte_count)
+        payload = bytes(
+            generate_payload(
+                event.byte_count,
+                entropy=self.entropy,
+                rng=self._rng,
+                byte_source=self._byte_source,
+            )
+        )
+        if len(payload) != event.byte_count:
+            raise ValueError("byte source returned the wrong event payload length")
+        return self.obfuscator.transform(payload, profile=self.profile)
 
-            # Send packets in batches for efficiency
-            packets_sent_this_round = 0
-            while (
-                bytes_available >= FRAME_OVERHEAD + 28
-                and self.clients
-                and packets_sent_this_round < 50
-            ):
-                target_frame_size = min(
-                    bytes_available, self.mtu, self._rng.randint(1000, 1400)
-                )
-                payload_size = target_frame_size - FRAME_OVERHEAD
-                packet = self.packet_gen.generate_packet(payload_size)
-                framed_size = FRAME_OVERHEAD + len(packet)
-
-                # Send to all active clients
-                for addr, client in list(self.clients.items()):
-                    try:
-                        framed = self._frame_data_for_client(client, packet)
-                        sent = self.socket.sendto(framed, addr)
-                        if sent != len(framed):
-                            continue
-                        self.stats["bytes_sent"] += sent
-                        self.stats["packets_sent"] += 1
-                    except Exception as e:
-                        print(f"[!] Send error to client {addr}: {e}")
-
-                rate_budget.consume(framed_size)
-                bytes_available = rate_budget.available
-                packets_sent_this_round += 1
-
-                # Minimal sleep between packets in batch
-                if packets_sent_this_round % 10 == 0:
-                    time.sleep(0.0001)
-
-            # Adaptive pacing based on accumulator
-            if rate_budget.available > current_rate_bps * 0.1:
-                # Behind schedule, don't sleep
-                pass
+    def _send_fragment(self, addr, client, fragment):
+        framed = self._frame_data_for_client(client, fragment)
+        limiter = client["rate_limiter"]
+        reservation = limiter.reserve(len(framed)) if limiter else None
+        if reservation and reservation.delay:
+            self._sleep(reservation.delay)
+        sent = 0
+        try:
+            sent = self.socket.sendto(framed, addr)
+            if sent == len(framed):
+                self.stats["bytes_sent"] += sent
+                self.stats["packets_sent"] += 1
             else:
-                # On schedule, small sleep
-                time.sleep(0.0005)
+                sent = max(0, min(sent, len(framed)))
+        except OSError as exc:
+            print(f"[!] Send error to client {addr}: {exc}", flush=True)
+        finally:
+            if reservation:
+                limiter.commit(reservation, successful_bytes=sent)
 
     def cleanup_loop(self):
         """Remove inactive clients"""
@@ -834,9 +746,9 @@ class MaskingTrafficServer:
                 pps = packets_delta / time_delta
 
                 pattern_desc = (
-                    self.pattern_gen.current_pattern.__name__
-                    if not getattr(self, "advanced", False)
-                    else f"advanced:{getattr(self, 'profile', None).value}/{getattr(self, 'obfuscator', None).header_mode}"
+                    f"rate:{self.current_rate_mbps:.2f}Mbps"
+                    if self.shape_mode == "rate"
+                    else f"experimental-profile:{self.profile.value}"
                 )
                 print(
                     f"[STATS] Clients: {len(self.clients)} | "
@@ -865,8 +777,8 @@ def main():
     parser.add_argument(
         "--mbps",
         type=float,
-        default=5,
-        help="Target rate in Mbps (fixed rate if min/max not specified)",
+        default=None,
+        help="Fixed target Mbps in rate shape mode (default: 5)",
     )
     parser.add_argument(
         "--min-mbps",
@@ -878,39 +790,45 @@ def main():
         "--max-mbps",
         type=float,
         default=None,
-        help="Maximum rate in Mbps for floating rate mode",
+        help="Rate-mode upper bound or optional profile-mode ceiling",
+    )
+    parser.add_argument(
+        "--shape-mode",
+        choices=["rate", "profile"],
+        default="rate",
+        help="Offered-load contract (default: rate)",
     )
     parser.add_argument(
         "--advanced",
         action="store_true",
-        help="Enable advanced masking (generator/obfuscator)",
+        help="Deprecated compatibility alias for --shape-mode profile",
     )
     parser.add_argument(
         "--profile",
         choices=["web", "video", "voip", "file", "gaming", "mixed"],
-        default="mixed",
-        help="Traffic profile for advanced mode",
+        default=None,
+        help="Required experimental traffic profile in profile shape mode",
     )
     parser.add_argument(
         "--header",
         choices=["none", "rtp", "quic"],
         default="none",
-        help="Pseudo-header type in advanced mode",
+        help="Pseudo-header type in profile mode",
     )
     parser.add_argument(
         "--padding",
         choices=["random", "fixed_buckets", "progressive", "none"],
         default="random",
-        help="Padding strategy in advanced mode",
+        help="Padding strategy in profile mode",
     )
     parser.add_argument(
-        "--mtu", type=int, default=1200, help="MTU for fragmentation in advanced mode"
+        "--mtu", type=int, default=1200, help="Maximum application UDP datagram size"
     )
     parser.add_argument(
         "--entropy",
         type=float,
         default=1.0,
-        help="Payload entropy (0..1) for advanced mode",
+        help="Payload entropy compatibility setting for profile mode",
     )
     parser.add_argument(
         "--stats-interval",
@@ -959,6 +877,7 @@ def main():
             max_mbps=args.max_mbps,
             advanced=args.advanced,
             profile=args.profile,
+            shape_mode=args.shape_mode,
             header=args.header,
             padding=args.padding,
             mtu=args.mtu,

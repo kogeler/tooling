@@ -104,6 +104,28 @@ def _run(script, *args):
             "positive finite number",
         ),
         (
+            SERVER,
+            (
+                "--insecure-diagnostic", "--shape-mode", "rate",
+                "--profile", "voip",
+            ),
+            "profile is not valid in rate shape mode",
+        ),
+        (
+            SERVER,
+            ("--insecure-diagnostic", "--shape-mode", "profile"),
+            "requires --profile",
+        ),
+        (
+            SERVER,
+            (
+                "--insecure-diagnostic", "--shape-mode", "profile",
+                "--profile", "voip", "--min-mbps", "0.5",
+                "--max-mbps", "1",
+            ),
+            "min-mbps is not valid",
+        ),
+        (
             CLIENT,
             (
                 "--server", "127.0.0.1", "--insecure-diagnostic",
@@ -150,3 +172,22 @@ def test_server_rejects_limits_below_per_client_rate():
 def test_constructors_reject_non_byte_psks(factory):
     with pytest.raises(ValueError, match="psk must be bytes"):
         factory()
+
+
+def test_profile_mode_has_native_load_and_optional_cap():
+    uncapped = MaskingTrafficServer(
+        shape_mode="profile", profile="voip", psk=TEST_PSK
+    )
+    capped = MaskingTrafficServer(
+        shape_mode="profile", profile="voip", max_mbps=1, psk=TEST_PSK
+    )
+    assert uncapped.target_mbps is None
+    assert uncapped.max_mbps is None
+    assert capped.configured_max_mbps == 1
+
+
+def test_advanced_warns_and_translates_to_profile_mode():
+    with pytest.warns(FutureWarning, match="shape-mode profile"):
+        server = MaskingTrafficServer(advanced=True, psk=TEST_PSK)
+    assert server.shape_mode == "profile"
+    assert server.profile.value == "mixed"

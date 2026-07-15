@@ -23,9 +23,10 @@ import random
 import socket
 import time
 import math
-from enum import Enum
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Iterator, List, Optional, Sequence, Tuple, Dict, Any, Union, Callable
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 try:
@@ -48,20 +49,25 @@ except ImportError:
 __all__ = [
     "TrafficProfile",
     "PatternStep",
+    "ShapeEvent",
+    "Packetizer",
+    "RateLimiter",
+    "RateReservation",
     "ProtocolMimicry",
     "DynamicObfuscator",
     "StatisticalAnalyzer",
     "stream_generator",
+    "profile_event_generator",
     "ObfuscationConfig",
     "parse_profile",
     "build_obfuscator",
     "init_udp_socket",
     "send_fragments",
     "mbps_to_bytes_per_second",
+    "generate_payload",
 ]
 
-# Bit-rate unit is decimal megabits/s (10^6 bit/s) of application payload bytes,
-# used consistently across configuration, pacing and metrics.
+# Bit-rate unit is decimal megabits/s (10^6 bit/s), converted to byte budgets.
 _BITS_PER_MEGABIT = 1_000_000
 
 
@@ -85,6 +91,154 @@ class PatternStep:
     delay: float       # seconds (inter-packet delay target)
 
 
+@dataclass(frozen=True)
+class ShapeEvent:
+    """One logical offered-load event before obfuscation and packetization."""
+
+    byte_count: int
+    delay: float = 0.0
+
+    def __post_init__(self):
+        if isinstance(self.byte_count, bool) or not isinstance(self.byte_count, int):
+            raise ValueError("event byte_count must be a non-negative integer")
+        if self.byte_count < 0:
+            raise ValueError("event byte_count must be non-negative")
+        if not math.isfinite(self.delay) or self.delay < 0:
+            raise ValueError("event delay must be a non-negative finite number")
+
+
+class Packetizer:
+    """Split application bytes so final framed datagrams fit a fixed ceiling."""
+
+    def __init__(self, datagram_ceiling, framing_overhead=0):
+        if isinstance(datagram_ceiling, bool) or not isinstance(
+            datagram_ceiling, int
+        ):
+            raise ValueError("datagram ceiling must be a positive integer")
+        if isinstance(framing_overhead, bool) or not isinstance(
+            framing_overhead, int
+        ):
+            raise ValueError("framing overhead must be a non-negative integer")
+        if datagram_ceiling <= 0 or framing_overhead < 0:
+            raise ValueError("invalid packetizer dimensions")
+        if framing_overhead >= datagram_ceiling:
+            raise ValueError("framing overhead leaves no payload capacity")
+        self.datagram_ceiling = datagram_ceiling
+        self.framing_overhead = framing_overhead
+        self.payload_ceiling = datagram_ceiling - framing_overhead
+
+    def packetize(self, payload):
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise ValueError("packetizer payload must be bytes")
+        payload = bytes(payload)
+        return tuple(
+            payload[offset : offset + self.payload_ceiling]
+            for offset in range(0, len(payload), self.payload_ceiling)
+        )
+
+
+@dataclass(frozen=True)
+class RateReservation:
+    byte_count: int
+    delay: float
+    token: int
+
+
+class RateLimiter:
+    """Bounded token bucket with explicit send reservation accounting."""
+
+    def __init__(
+        self,
+        rate_bytes_per_second,
+        burst_bytes,
+        clock=None,
+    ):
+        self._clock = clock or time.monotonic
+        self._rate = self._validate_rate(rate_bytes_per_second)
+        if isinstance(burst_bytes, bool) or not isinstance(burst_bytes, int):
+            raise ValueError("burst bytes must be a positive integer")
+        if burst_bytes <= 0:
+            raise ValueError("burst bytes must be a positive integer")
+        self._capacity = burst_bytes
+        self._tokens = float(burst_bytes)
+        self._updated_at = self._clock()
+        self._next_token = 0
+        self._reservations = {}
+
+    @staticmethod
+    def _validate_rate(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("rate must be a positive finite number") from None
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("rate must be a positive finite number")
+        return value
+
+    @property
+    def rate_bytes_per_second(self):
+        return self._rate
+
+    @property
+    def burst_bytes(self):
+        return self._capacity
+
+    def _accrue(self):
+        now = self._clock()
+        elapsed = max(0.0, now - self._updated_at)
+        self._updated_at = now
+        self._tokens = min(
+            float(self._capacity), self._tokens + elapsed * self._rate
+        )
+
+    def set_rate(self, rate_bytes_per_second):
+        self._accrue()
+        self._rate = self._validate_rate(rate_bytes_per_second)
+
+    def reset(self):
+        self._tokens = float(self._capacity)
+        self._updated_at = self._clock()
+        self._reservations.clear()
+
+    def reserve(self, byte_count):
+        if isinstance(byte_count, bool) or not isinstance(byte_count, int):
+            raise ValueError("reservation size must be a positive integer")
+        if byte_count <= 0:
+            raise ValueError("reservation size must be a positive integer")
+        self._accrue()
+        missing = max(0.0, byte_count - self._tokens)
+        self._tokens -= byte_count
+        self._next_token += 1
+        reservation = RateReservation(
+            byte_count=byte_count,
+            delay=missing / self._rate,
+            token=self._next_token,
+        )
+        self._reservations[reservation.token] = reservation.byte_count
+        return reservation
+
+    def commit(self, reservation, successful_bytes=None):
+        reserved = self._reservations.get(reservation.token)
+        if reserved != reservation.byte_count:
+            raise ValueError("unknown or already completed reservation")
+        if successful_bytes is None:
+            successful_bytes = reserved
+        if (
+            isinstance(successful_bytes, bool)
+            or not isinstance(successful_bytes, int)
+            or not 0 <= successful_bytes <= reserved
+        ):
+            raise ValueError("successful bytes must be within the reservation")
+        del self._reservations[reservation.token]
+        self._accrue()
+        refund = reserved - successful_bytes
+        self._tokens = min(float(self._capacity), self._tokens + refund)
+        return successful_bytes
+
+    def refund(self, reservation):
+        return self.commit(reservation, successful_bytes=0)
+
+
 class ProtocolMimicry:
     """Generate sequences of PatternStep for different protocol-like behaviors."""
 
@@ -100,93 +254,103 @@ class ProtocolMimicry:
                 self.enhanced = False
 
     @staticmethod
-    def web_browsing_session() -> List[PatternStep]:
+    def web_browsing_session(rng=None) -> List[PatternStep]:
+        rng = rng or random
         steps: List[PatternStep] = []
         # Initial page HTML/CSS/JS fetch bursts
-        for _ in range(random.randint(6, 14)):
-            steps.append(PatternStep(size=random.randint(300, 1800), delay=random.uniform(0.005, 0.03)))
+        for _ in range(rng.randint(6, 14)):
+            steps.append(PatternStep(size=rng.randint(300, 1800), delay=rng.uniform(0.005, 0.03)))
         # Assets (images, fonts)
-        for _ in range(random.randint(8, 22)):
-            steps.append(PatternStep(size=random.randint(800, 4000), delay=random.uniform(0.01, 0.06)))
+        for _ in range(rng.randint(8, 22)):
+            steps.append(PatternStep(size=rng.randint(800, 4000), delay=rng.uniform(0.01, 0.06)))
         # Reading pause
-        steps.append(PatternStep(size=0, delay=random.uniform(1.2, 6.0)))
+        steps.append(PatternStep(size=0, delay=rng.uniform(1.2, 6.0)))
         # Background AJAX/pings
-        for _ in range(random.randint(4, 10)):
-            steps.append(PatternStep(size=random.randint(80, 400), delay=random.uniform(0.3, 1.5)))
+        for _ in range(rng.randint(4, 10)):
+            steps.append(PatternStep(size=rng.randint(80, 400), delay=rng.uniform(0.3, 1.5)))
         return steps
 
     @staticmethod
-    def video_streaming_session(quality: Optional[str] = None) -> List[PatternStep]:
+    def video_streaming_session(
+        quality: Optional[str] = None, rng=None
+    ) -> List[PatternStep]:
+        rng = rng or random
         bitrates_kbps = {"360p": 1000, "480p": 2500, "720p": 5000, "1080p": 8000}
         if quality not in bitrates_kbps:
-            quality = random.choice(list(bitrates_kbps.keys()))
+            quality = rng.choice(list(bitrates_kbps.keys()))
         bps = bitrates_kbps[quality] * 1024 // 8  # bytes/sec
         steps: List[PatternStep] = []
         # Startup buffering (~1s)
         for _ in range(100):
-            size = int(bps / 100 * random.uniform(0.9, 1.2))
+            size = int(bps / 100 * rng.uniform(0.9, 1.2))
             steps.append(PatternStep(size=max(200, size), delay=0.01))
         # Steady state (~10s)
         for _ in range(1000):
-            size = int(bps / 100 * random.uniform(0.95, 1.05))
+            size = int(bps / 100 * rng.uniform(0.95, 1.05))
             steps.append(PatternStep(size=max(100, size), delay=0.01))
         # Occasional keyframe-like bursts
-        for _ in range(random.randint(5, 15)):
-            steps.append(PatternStep(size=int(bps * random.uniform(0.05, 0.15)), delay=0.02))
+        for _ in range(rng.randint(5, 15)):
+            steps.append(PatternStep(size=int(bps * rng.uniform(0.05, 0.15)), delay=0.02))
         return steps
 
     @staticmethod
-    def voip_call(codec: Optional[str] = None) -> List[PatternStep]:
+    def voip_call(codec: Optional[str] = None, rng=None) -> List[PatternStep]:
+        rng = rng or random
         codecs = {"g711": {"size": 160, "interval": 0.02},
                   "g729": {"size": 20, "interval": 0.02},
-                  "opus": {"size": random.randint(40, 120), "interval": 0.02}}
+                  "opus": {"size": rng.randint(40, 120), "interval": 0.02}}
         if codec not in codecs:
-            codec = random.choice(list(codecs.keys()))
+            codec = rng.choice(list(codecs.keys()))
         c = codecs[codec]
         steps: List[PatternStep] = []
         for _ in range(3000):
-            steps.append(PatternStep(size=max(10, int(c["size"] * random.uniform(0.9, 1.1))),
-                                     delay=c["interval"] * random.uniform(0.98, 1.02)))
-            if random.random() < 0.005:
-                steps.append(PatternStep(size=random.randint(60, 120), delay=0.0))
+            steps.append(PatternStep(size=max(10, int(c["size"] * rng.uniform(0.9, 1.1))),
+                                     delay=c["interval"] * rng.uniform(0.98, 1.02)))
+            if rng.random() < 0.005:
+                steps.append(PatternStep(size=rng.randint(60, 120), delay=0.0))
         return steps
 
     @staticmethod
-    def file_transfer_session(target_mbps: float = 10.0) -> List[PatternStep]:
+    def file_transfer_session(
+        target_mbps: float = 10.0, rng=None
+    ) -> List[PatternStep]:
+        rng = rng or random
         bps = mbps_to_bytes_per_second(max(0.5, target_mbps))
-        mtu_pay = random.randint(1100, 1400)
+        mtu_pay = rng.randint(1100, 1400)
         interval = mtu_pay / bps
         steps: List[PatternStep] = []
         for _ in range(2000):
-            steps.append(PatternStep(size=int(mtu_pay * random.uniform(0.92, 1.0)),
-                                     delay=max(0.0005, interval * random.uniform(0.9, 1.1))))
-        for _ in range(random.randint(5, 15)):
-            steps.append(PatternStep(size=0, delay=random.uniform(0.01, 0.2)))
+            steps.append(PatternStep(size=int(mtu_pay * rng.uniform(0.92, 1.0)),
+                                     delay=max(0.0005, interval * rng.uniform(0.9, 1.1))))
+        for _ in range(rng.randint(5, 15)):
+            steps.append(PatternStep(size=0, delay=rng.uniform(0.01, 0.2)))
         return steps
 
     @staticmethod
-    def gaming_session() -> List[PatternStep]:
+    def gaming_session(rng=None) -> List[PatternStep]:
+        rng = rng or random
         steps: List[PatternStep] = []
         for _ in range(4000):
-            steps.append(PatternStep(size=random.randint(40, 220), delay=random.uniform(0.01, 0.05)))
-            if random.random() < 0.02:
-                steps.append(PatternStep(size=random.randint(400, 1200), delay=0.001))
+            steps.append(PatternStep(size=rng.randint(40, 220), delay=rng.uniform(0.01, 0.05)))
+            if rng.random() < 0.02:
+                steps.append(PatternStep(size=rng.randint(400, 1200), delay=0.001))
         return steps
 
     @staticmethod
-    def mixed_session() -> List[PatternStep]:
+    def mixed_session(rng=None) -> List[PatternStep]:
+        rng = rng or random
         choices = [ProtocolMimicry.web_browsing_session,
                    ProtocolMimicry.video_streaming_session,
                    ProtocolMimicry.voip_call,
                    ProtocolMimicry.file_transfer_session,
                    ProtocolMimicry.gaming_session]
         steps: List[PatternStep] = []
-        for _ in range(random.randint(3, 6)):
-            steps.extend(random.choice(choices)())
+        for _ in range(rng.randint(3, 6)):
+            steps.extend(rng.choice(choices)(rng=rng))
         return steps
 
     @staticmethod
-    def for_profile(profile: TrafficProfile) -> List[PatternStep]:
+    def for_profile(profile: TrafficProfile, rng=None) -> List[PatternStep]:
         return {
             TrafficProfile.WEB_BROWSING: ProtocolMimicry.web_browsing_session,
             TrafficProfile.VIDEO_STREAMING: ProtocolMimicry.video_streaming_session,
@@ -194,7 +358,7 @@ class ProtocolMimicry:
             TrafficProfile.FILE_TRANSFER: ProtocolMimicry.file_transfer_session,
             TrafficProfile.GAMING: ProtocolMimicry.gaming_session,
             TrafficProfile.MIXED: ProtocolMimicry.mixed_session,
-        }[profile]()
+        }[profile](rng=rng)
 
 
 class DynamicObfuscator:
@@ -213,18 +377,24 @@ class DynamicObfuscator:
         mtu: int = 1200,
         header_mode: str = "none",         # none | rtp | quic
         fixed_buckets: Optional[Sequence[int]] = None,
+        rng=None,
+        byte_source=None,
     ):
         self.padding_strategy = padding_strategy
         self.timing_jitter = max(0.0, float(timing_jitter))
-        self.mtu = max(256, int(mtu))
+        self.mtu = int(mtu)
+        if self.mtu <= 0:
+            raise ValueError("mtu must be positive")
         self.header_mode = header_mode
         self.fixed_buckets = tuple(fixed_buckets) if fixed_buckets else (128, 256, 512, 1024, 1280, 1400)
+        self._rng = rng or random.Random()
+        self._byte_source = byte_source or os.urandom
         # RTP-like state
-        self._rtp_seq = random.randint(0, 65535)
-        self._rtp_ssrc = random.getrandbits(32)
-        self._rtp_ts_base = random.getrandbits(32)
+        self._rtp_seq = self._rng.randint(0, 65535)
+        self._rtp_ssrc = self._rng.getrandbits(32)
+        self._rtp_ts_base = self._rng.getrandbits(32)
         # QUIC-like PN
-        self._quic_pn = random.randint(0, 2**32 - 1)
+        self._quic_pn = self._rng.randint(0, 2**32 - 1)
 
         # Enhanced features if available
         self.enhanced = ENHANCED_AVAILABLE
@@ -236,40 +406,40 @@ class DynamicObfuscator:
                 self.enhanced = False
 
     def obfuscate(self, payload: bytes, profile: Optional[TrafficProfile] = None, base_delay: float = 0.0) -> Tuple[List[bytes], float]:
-        pkt = self._apply_header(payload, profile)
-        pkt = self._apply_padding(pkt, profile)
+        pkt = self.transform(payload, profile)
         fragments = self._fragment(pkt, self.mtu)
 
-        # Use base delay with small jitter for consistent throughput
+        # Compatibility API: preserve the caller's delay and only add bounded jitter.
         if base_delay > 0:
-            # Add small jitter (10% of base delay max)
-            jitter = random.gauss(0.0, min(self.timing_jitter, base_delay * 0.1))
-            delay = max(0.0001, base_delay + jitter)
+            jitter = self._rng.gauss(
+                0.0, min(self.timing_jitter, base_delay * 0.1)
+            )
+            delay = max(0.0, base_delay + jitter)
         else:
-            # Fallback to timing model if available
-            if self.enhanced and hasattr(self, 'timing_model'):
-                delay = self.timing_model.get_delay(len(payload), network_load=0.5)
-                # Cap the delay to maintain throughput
-                delay = min(delay, 0.01)
-            else:
-                jitter = random.gauss(0.0, self.timing_jitter)
-                delay = max(0.0001, base_delay + jitter)
+            delay = 0.0
 
         return fragments, delay
+
+    def transform(self, payload, profile=None):
+        """Apply optional pseudo-header and padding without packetizing."""
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise ValueError("payload must be bytes")
+        packet = self._apply_header(bytes(payload), profile)
+        return self._apply_padding(packet, profile)
 
     def _apply_padding(self, packet: bytes, profile: Optional[TrafficProfile]) -> bytes:
         if self.padding_strategy == "none":
             return packet
         if self.padding_strategy == "random":
             max_pad = max(16, min(120, int(len(packet) * 0.07)))
-            pad_len = random.randint(0, max_pad)
-            return packet + os.urandom(pad_len)
+            pad_len = self._rng.randint(0, max_pad)
+            return packet + self._byte_source(pad_len)
         if self.padding_strategy == "progressive":
-            factor = random.uniform(0.0, 0.20)
+            factor = self._rng.uniform(0.0, 0.20)
             pad_len = int(len(packet) * factor)
             if pad_len <= 0:
                 return packet
-            return packet + os.urandom(pad_len)
+            return packet + self._byte_source(pad_len)
         if self.padding_strategy == "fixed_buckets":
             target = None
             for b in self.fixed_buckets:
@@ -281,7 +451,7 @@ class DynamicObfuscator:
             pad_len = max(0, target - len(packet))
             if pad_len == 0:
                 return packet
-            return packet + os.urandom(pad_len)
+            return packet + self._byte_source(pad_len)
         return packet
 
     def _apply_header(self, payload: bytes, profile: Optional[TrafficProfile]) -> bytes:
@@ -296,26 +466,26 @@ class DynamicObfuscator:
     def _rtp_like(self, payload: bytes, profile: Optional[TrafficProfile]) -> bytes:
         # Very rough RTP-like header (12 bytes)
         version, padding, extension, csrc_count = 2, 0, 0, 0
-        marker = 1 if random.random() < 0.02 else 0
+        marker = 1 if self._rng.random() < 0.02 else 0
         payload_type = {
             TrafficProfile.VOIP_CALL: 111,
             TrafficProfile.VIDEO_STREAMING: 96,
-        }.get(profile, random.randint(96, 127))
+        }.get(profile, self._rng.randint(96, 127))
         b0 = (version << 6) | (padding << 5) | (extension << 4) | (csrc_count & 0x0F)
         b1 = ((marker & 0x01) << 7) | (payload_type & 0x7F)
         self._rtp_seq = (self._rtp_seq + 1) & 0xFFFF
-        ts_step = random.randint(800, 2000)
+        ts_step = self._rng.randint(800, 2000)
         self._rtp_ts_base = (self._rtp_ts_base + ts_step) & 0xFFFFFFFF
         header = struct.pack("!BBHII", b0, b1, self._rtp_seq, self._rtp_ts_base, self._rtp_ssrc)
         return header + payload
 
     def _quic_like(self, payload: bytes) -> bytes:
-        flags = 0xC0 | (random.randint(0, 3) << 4)
-        dcid_len = random.choice([8, 12, 16])
-        scid_len = random.choice([0, 8, 12])
-        dcid = os.urandom(dcid_len)
-        scid = os.urandom(scid_len)
-        pn_len = random.choice([1, 2, 3, 4])
+        flags = 0xC0 | (self._rng.randint(0, 3) << 4)
+        dcid_len = self._rng.choice([8, 12, 16])
+        scid_len = self._rng.choice([0, 8, 12])
+        dcid = self._byte_source(dcid_len)
+        scid = self._byte_source(scid_len)
+        pn_len = self._rng.choice([1, 2, 3, 4])
         self._quic_pn = (self._quic_pn + 1) & 0xFFFFFFFF
         pn_mask = (1 << (pn_len * 8)) - 1
         pn_val = self._quic_pn & pn_mask
@@ -325,7 +495,9 @@ class DynamicObfuscator:
 
     @staticmethod
     def fragment(packet: bytes, mtu: int) -> List[bytes]:
-        mtu = max(256, int(mtu))
+        mtu = int(mtu)
+        if mtu <= 0:
+            raise ValueError("mtu must be positive")
         frags: List[bytes] = []
         for i in range(0, len(packet), mtu):
             frags.append(packet[i : i + mtu])
@@ -379,14 +551,21 @@ class StatisticalAnalyzer:
         return result
 
 
-def _generate_payload(size: int, entropy: float = 1.0) -> bytes:
+def generate_payload(
+    size: int,
+    entropy: float = 1.0,
+    rng=None,
+    byte_source=None,
+) -> bytes:
+    rng = rng or random.Random()
+    byte_source = byte_source or os.urandom
     size = max(0, int(size))
     if size == 0:
         return b""
 
     # For performance, use simple random generation by default
     # Enhanced entropy is expensive and should be used sparingly
-    if ENHANCED_AVAILABLE and size > 1000 and random.random() < 0.1:  # Use enhanced only 10% of time for large packets
+    if ENHANCED_AVAILABLE and size > 1000 and rng.random() < 0.1:  # Use enhanced only 10% of time for large packets
         try:
             enhancer = EntropyEnhancer()
             return enhancer.generate_realistic_encrypted_payload(size, content_type='mixed')
@@ -395,20 +574,31 @@ def _generate_payload(size: int, entropy: float = 1.0) -> bytes:
 
     # Fast path for high entropy (most common case)
     if entropy >= 0.95:
-        return os.urandom(size)
+        return byte_source(size)
 
     # Optimized generation for lower entropy
     if entropy < 0.5:
         # Low entropy - mostly repeated bytes
-        base_byte = random.randint(0, 255)
+        base_byte = rng.randint(0, 255)
         data = bytearray([base_byte] * size)
         # Add some variation
         for _ in range(int(size * entropy)):
-            data[random.randint(0, size-1)] = random.randint(0, 255)
+            data[rng.randint(0, size-1)] = rng.randint(0, 255)
         return bytes(data)
     else:
         # Medium to high entropy - mix of random and patterns
-        return os.urandom(size)
+        return byte_source(size)
+
+
+def profile_event_generator(profile, rng=None):
+    """Yield native experimental profile events without rewriting volume/gaps."""
+    rng = rng or random.Random()
+    while True:
+        steps = ProtocolMimicry.for_profile(profile, rng=rng)
+        if not steps:
+            steps = [PatternStep(size=0, delay=1.0)]
+        for step in steps:
+            yield ShapeEvent(byte_count=step.size, delay=step.delay)
 
 
 def stream_generator(
@@ -418,262 +608,33 @@ def stream_generator(
     max_mbps: Optional[float] = None,
     obfuscator: Optional[DynamicObfuscator] = None,
     entropy: float = 1.0,
+    rng=None,
 ) -> Iterator[Tuple[List[bytes], float]]:
-    """Yield (fragments, delay) continuously according to profile.
+    """Compatibility iterator built on unmodified logical profile events."""
+    if (min_mbps is None) != (max_mbps is None):
+        raise ValueError("min_mbps and max_mbps must be given together")
+    rng = rng or random.Random()
+    obfuscator = obfuscator or DynamicObfuscator(rng=rng)
+    events = profile_event_generator(profile, rng=rng)
+    rate_controlled = target_mbps is not None or min_mbps is not None
 
-    Args:
-        profile: Traffic pattern profile
-        target_mbps: Target rate in Mbps (if min/max not specified)
-        min_mbps: Minimum rate in Mbps for floating rate
-        max_mbps: Maximum rate in Mbps for floating rate
-        obfuscator: Optional obfuscator instance
-        entropy: Payload entropy level 0.0-1.0
-    """
-
-    # Setup rate control
-    if min_mbps is not None and max_mbps is not None:
-        # Floating rate mode - start at a random position for variety
-        current_mbps = random.uniform(min_mbps, max_mbps)
-        last_rate_update = time.time()
-        use_floating_rate = True
-    elif target_mbps is not None:
-        # Fixed target mode
-        current_mbps = target_mbps
-        use_floating_rate = False
-    else:
-        # No rate control
-        current_mbps = None
-        use_floating_rate = False
-
-    # Rate tracking for proper limiting
-    rate_window_bytes = 0
-    rate_window_start = time.time()
-
-    # Use enhanced features if available
-    if ENHANCED_AVAILABLE and target_mbps and target_mbps > 10:  # Only use enhanced for high rates
-        try:
-            MLResistantGenerator()
-            AdaptiveTimingModel(base_rtt=0.001)  # Lower base RTT for higher throughput
-        except Exception:
-            pass
-
-    steps = ProtocolMimicry.for_profile(profile)
-    if not steps:
-        steps = [PatternStep(size=1200, delay=0.001)]
-
-    # Adjust packet sizes for better rate control
-    # Use consistent packet sizes for more predictable rate control
-    adjusted_steps = []
-    for step in steps:
-        # Use medium-sized packets for better control
-        new_size = max(800, min(1400, step.size))
-        # Base delay will be calculated dynamically based on current rate
-        new_delay = 0.001  # Minimal base delay
-        adjusted_steps.append(PatternStep(size=new_size, delay=new_delay))
-    steps = adjusted_steps
-
-    if obfuscator is None:
-        obfuscator = DynamicObfuscator()
-
-    idx = 0
-
-    # For floating rate mode - pattern tracking
-    pattern_change_interval = random.uniform(2.0, 8.0)  # Change pattern every 2-8 seconds
-    last_pattern_change = time.time()
-
-    # Floating rate pattern selection - include more extreme patterns
-    rate_pattern_type = random.choice(['wave', 'random_walk', 'bursty', 'steady_drift', 'oscillating', 'extreme'])
-    rate_pattern_phase = random.uniform(0, 2 * math.pi)  # Random starting phase
-    dwell_at_boundary = False
-    dwell_remaining = 0
-
-    while True:
-        # Update floating rate if enabled
-        if use_floating_rate and min_mbps is not None and max_mbps is not None:
-            now = time.time()
-            dt = now - last_rate_update
-
-            if dt > 0.05:  # Update rate every 50ms for smoother transitions
-                rate_range = max_mbps - min_mbps
-                rate_center = (min_mbps + max_mbps) / 2
-
-                # Check for pattern change
-                if now - last_pattern_change > pattern_change_interval:
-                    # Switch traffic pattern - ensure we use patterns that reach boundaries
-                    rate_pattern_type = random.choice(['full_sine', 'boundary_jumps', 'sweep', 'aggressive_random'])
-                    pattern_change_interval = random.uniform(8.0, 20.0)
-                    last_pattern_change = now
-                    rate_pattern_phase = 0.0
-
-                    # Often start at a boundary to ensure we visit them
-                    if random.random() < 0.6:  # 60% chance to start at boundary
-                        if random.random() < 0.5:
-                            current_mbps = max_mbps
-                        else:
-                            current_mbps = min_mbps
-                        dwell_at_boundary = True
-                        dwell_remaining = random.uniform(2.0, 5.0)
-
-                # Handle dwelling at boundaries
-                if dwell_at_boundary:
-                    dwell_remaining -= dt
-                    if dwell_remaining <= 0:
-                        dwell_at_boundary = False
-                    else:
-                        # Stay exactly at boundary
-                        if current_mbps < rate_center:
-                            current_mbps = min_mbps
-                        else:
-                            current_mbps = max_mbps
-                        last_rate_update = now
-                        continue
-
-                # Apply aggressive patterns that ALWAYS use the full range
-                if rate_pattern_type == 'full_sine':
-                    # Sine wave that definitely spans full range
-                    rate_pattern_phase += dt * 0.5  # Moderate speed
-                    wave_value = math.sin(rate_pattern_phase)
-                    # Direct mapping ensuring we hit exact min and max
-                    # Map [-1, 1] to [min_mbps, max_mbps]
-                    current_mbps = min_mbps + (max_mbps - min_mbps) * (wave_value + 1.0) / 2.0
-                    # Force exact boundaries at extremes
-                    if wave_value <= -0.99:
-                        current_mbps = min_mbps
-                    elif wave_value >= 0.99:
-                        current_mbps = max_mbps
-
-                elif rate_pattern_type == 'boundary_jumps':
-                    # Frequently jump between boundaries and middle
-                    if random.random() < 0.2:  # 20% chance per update - more frequent
-                        choice = random.random()
-                        if choice < 0.4:
-                            current_mbps = min_mbps  # 40% chance for min
-                        elif choice < 0.8:
-                            current_mbps = max_mbps  # 40% chance for max
-                        else:
-                            # 20% chance for random position in range
-                            current_mbps = min_mbps + rate_range * random.random()
-
-                elif rate_pattern_type == 'sweep':
-                    # Linear sweep from min to max and back
-                    rate_pattern_phase += dt * 0.25  # Steady sweep speed
-                    phase_mod = rate_pattern_phase % 2.0
-                    if phase_mod < 1.0:
-                        # Sweep up from min to max - ensure we hit both exactly
-                        progress = phase_mod
-                        if progress <= 0.02:
-                            current_mbps = min_mbps  # Start exactly at min
-                        elif progress >= 0.98:
-                            current_mbps = max_mbps  # End exactly at max
-                        else:
-                            # Linear interpolation
-                            current_mbps = min_mbps + rate_range * progress
-                    else:
-                        # Sweep down from max to min - ensure we hit both exactly
-                        progress = phase_mod - 1.0
-                        if progress <= 0.02:
-                            current_mbps = max_mbps  # Start exactly at max
-                        elif progress >= 0.98:
-                            current_mbps = min_mbps  # End exactly at min
-                        else:
-                            # Linear interpolation
-                            current_mbps = max_mbps - rate_range * progress
-
-                elif rate_pattern_type == 'aggressive_random':
-                    # Aggressive random walk that favors extremes
-                    if random.random() < 0.2:  # 20% chance to jump
-                        rand = random.random()
-                        if rand < 0.3:
-                            # Jump to min
-                            current_mbps = min_mbps
-                        elif rand < 0.6:
-                            # Jump to max
-                            current_mbps = max_mbps
-                        else:
-                            # Random position favoring extremes
-                            if random.random() < 0.5:
-                                # Near min
-                                current_mbps = min_mbps + rate_range * random.uniform(0, 0.3)
-                            else:
-                                # Near max
-                                current_mbps = max_mbps - rate_range * random.uniform(0, 0.3)
-                    else:
-                        # Small random walk
-                        current_mbps += random.gauss(0, rate_range * 0.1)
-
-                # Ensure we stay within bounds
-                current_mbps = max(min_mbps, min(max_mbps, current_mbps))
-
-                # Force more frequent exact boundary visits
-                if random.random() < 0.1:  # 10% chance for guaranteed boundary hit
-                    if random.random() < 0.5:
-                        current_mbps = min_mbps
-                    else:
-                        current_mbps = max_mbps
-
-                last_rate_update = now
-
-        # For floating rate mode, ensure current_mbps is always within bounds
-        if use_floating_rate and min_mbps is not None and max_mbps is not None:
-            current_mbps = max(min_mbps, min(max_mbps, current_mbps))
-
-        step = steps[idx]
-        idx = (idx + 1) % len(steps)
-
-        # Generate packet
-        if step.size <= 0:
-            fragments, _ = obfuscator.obfuscate(b"", profile=profile, base_delay=step.delay)
+    for event in events:
+        if rate_controlled and event.byte_count == 0:
+            continue
+        payload = generate_payload(
+            event.byte_count, entropy=entropy, rng=rng
+        )
+        fragments, _ = obfuscator.obfuscate(payload, profile=profile)
+        if min_mbps is not None:
+            rate_mbps = rng.uniform(min_mbps, max_mbps)
         else:
-            payload = _generate_payload(step.size, entropy=entropy)
-            fragments, _ = obfuscator.obfuscate(payload, profile=profile, base_delay=step.delay)
-
-        # Calculate packet size
-        packet_bytes = sum(len(f) for f in fragments)
-
-        # Update rate window tracking
-        now = time.time()
-        window_elapsed = now - rate_window_start
-
-        # Reset window every second to prevent drift
-        if window_elapsed > 1.0:
-            rate_window_bytes = 0
-            rate_window_start = now
-            window_elapsed = 0
-
-        # Calculate delay to achieve target rate while strictly enforcing boundaries
-        if use_floating_rate and min_mbps is not None and max_mbps is not None:
-            # Ensure current_mbps is strictly within bounds
-            rate_limit_mbps = max(min_mbps, min(max_mbps, current_mbps))
-        elif target_mbps:
-            rate_limit_mbps = target_mbps
+            rate_mbps = target_mbps
+        if rate_mbps is None:
+            delay = event.delay
         else:
-            rate_limit_mbps = None
-
-        if rate_limit_mbps and rate_limit_mbps > 0:
-            # Target bytes per second for desired rate (decimal Mbps)
-            target_bytes_per_second = mbps_to_bytes_per_second(rate_limit_mbps)
-
-            # Simple and direct delay calculation for better rate achievement
-            if target_bytes_per_second > 0 and packet_bytes > 0:
-                # Calculate ideal delay for this packet size at target rate
-                delay = packet_bytes / target_bytes_per_second
-
-                # For higher rates, reduce delay to allow bursting
-                if rate_limit_mbps >= 5:
-                    delay = delay * 0.9  # Allow 10% burst for high rates
-                elif rate_limit_mbps >= 2:
-                    delay = delay * 0.95  # Allow 5% burst for medium rates
-
-                # Minimal bounds to prevent issues
-                delay = max(0.00001, min(0.1, delay))
-            else:
-                delay = 0.001
-        else:
-            delay = step.delay if hasattr(step, 'delay') else 0.001
-
-        # Update window counter
-        rate_window_bytes += packet_bytes
-
+            delay = sum(len(fragment) for fragment in fragments) / (
+                mbps_to_bytes_per_second(rate_mbps)
+            )
         yield fragments, delay
 
 
@@ -699,12 +660,14 @@ def parse_profile(profile: Union[str, TrafficProfile, None]) -> TrafficProfile:
     return TrafficProfile.MIXED
 
 
-def build_obfuscator(cfg: ObfuscationConfig) -> DynamicObfuscator:
+def build_obfuscator(cfg: ObfuscationConfig, rng=None, byte_source=None) -> DynamicObfuscator:
     return DynamicObfuscator(
         padding_strategy=cfg.padding_strategy,
         timing_jitter=cfg.timing_jitter,
         mtu=cfg.mtu,
         header_mode=cfg.header_mode,
+        rng=rng,
+        byte_source=byte_source,
     )
 
 

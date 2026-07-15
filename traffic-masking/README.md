@@ -47,13 +47,16 @@ python traffic_masking_client.py --server <SERVER_IP> \
   --psk-file ./traffic-masking.psk
 ```
 
-### Advanced Mode
+### Experimental Profile Mode
+
+Profile mode preserves each handcrafted profile's native event volumes and
+gaps. `--max-mbps` is only a ceiling; it does not raise a low-rate profile to
+the cap. These profiles remain experimental pending reference-trace validation.
 
 ```bash
-# Server with full obfuscation
+# Server with native mixed-profile load and a 10 Mbps ceiling
 python traffic_masking_server.py \
-  --min-mbps 3 --max-mbps 10 \
-  --advanced --profile mixed \
+  --shape-mode profile --profile mixed --max-mbps 10 \
   --header rtp --padding random \
   --psk-file ./traffic-masking.psk
 
@@ -80,16 +83,23 @@ make test
 
 ## Key Parameters
 
-- `--mbps`: Fixed target rate in decimal Mbps of application UDP payload
-- `--min-mbps/--max-mbps`: Floating range in the same decimal Mbps unit
-- `--advanced`: Enable ML-resistant features
-- `--profile`: Traffic pattern (web/video/voip/file/gaming/mixed)
+- `--shape-mode rate|profile`: Select an explicit offered-load contract. The
+  default is `rate`.
+- `--mbps`: Fixed target in decimal Mbps of authenticated application datagram
+  bytes for rate mode (default 5)
+- `--min-mbps/--max-mbps`: Floating range in rate mode
+- `--profile`: Required experimental pattern in profile mode
+- `--max-mbps`: In profile mode, an optional ceiling that only adds delay
+- `--advanced`: Deprecated warning-emitting alias for profile mode
 - `--response`: Optional diagnostic/profile uplink setting (0.0-1.0, default
   0.0). Nonzero values request additional uplink traffic; the current standalone
   scheduler does not guarantee that exact ratio on the wire.
 - `--header`: Pseudo-headers (none/rtp/quic)
 - `--padding`: Padding strategy (none/random/fixed_buckets/progressive)
 - `--entropy`: Payload entropy (0.0-1.0)
+- `--mtu`: Maximum application UDP datagram size after protocol framing and
+  padding. This is application packetization, not IP fragmentation; account for
+  IP and outer encrypted-transport overhead when selecting a path-safe value.
 - `--psk-file`: Path to the shared 32-4096 byte binary key. The file must not
   grant group or other permissions.
 - `--max-clients`, `--max-total-mbps`: Bound authenticated enrollment and the
@@ -120,7 +130,8 @@ restart both processes. Never log the key or put its value in a service command.
 docker build -t traffic-masking .
 docker run --network host \
   --mount type=bind,src="$PWD/traffic-masking.psk",dst=/run/secrets/traffic-masking.psk,readonly \
-  traffic-masking traffic_masking_server.py --min-mbps 2 --max-mbps 8 \
+  traffic-masking traffic_masking_server.py --shape-mode rate \
+  --min-mbps 2 --max-mbps 8 \
   --psk-file /run/secrets/traffic-masking.psk
 ```
 

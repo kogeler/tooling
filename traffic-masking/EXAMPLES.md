@@ -13,8 +13,8 @@ make test-fast
 python traffic_masking_server.py --mbps 5 --psk-file ./traffic-masking.psk
 python traffic_masking_client.py --server 127.0.0.1 --psk-file ./traffic-masking.psk
 
-# Floating rate (recommended)
-python traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced \
+# Floating rate
+python traffic_masking_server.py --shape-mode rate --min-mbps 2 --max-mbps 8 \
   --psk-file ./traffic-masking.psk
 python traffic_masking_client.py --server 127.0.0.1 --response 0.3 --advanced \
   --psk-file ./traffic-masking.psk
@@ -25,22 +25,25 @@ to no scheduled uplink (`--response 0.0`). A nonzero response is an explicit
 diagnostic/profile choice; the current standalone scheduler does not guarantee
 that exact ratio on the wire.
 
+Server `rate` mode supplies demand to reach its configured target. Experimental
+`profile` mode preserves native event sizes and gaps; `--max-mbps` only caps it.
+
 ## Use Cases
 
 ### Mask Video Calls
 ```bash
 # Google Meet / Zoom / Teams
-python traffic_masking_server.py --min-mbps 1 --max-mbps 5 --advanced \
+python traffic_masking_server.py --shape-mode profile --max-mbps 5 \
   --profile video --psk-file ./traffic-masking.psk
 
 # WhatsApp / Telegram voice calls
-python traffic_masking_server.py --min-mbps 0.5 --max-mbps 1.5 --advanced \
+python traffic_masking_server.py --shape-mode profile --max-mbps 1.5 \
   --profile voip --psk-file ./traffic-masking.psk
 ```
 
 ### Mask Web Browsing
 ```bash
-python traffic_masking_server.py --min-mbps 1 --max-mbps 4 --advanced \
+python traffic_masking_server.py --shape-mode profile --max-mbps 4 \
   --profile web --header quic --psk-file ./traffic-masking.psk
 ```
 
@@ -48,8 +51,8 @@ python traffic_masking_server.py --min-mbps 1 --max-mbps 4 --advanced \
 ```bash
 # Server
 python traffic_masking_server.py \
-  --min-mbps 3 --max-mbps 10 \
-  --advanced --profile mixed \
+  --shape-mode profile --max-mbps 10 \
+  --profile mixed \
   --header rtp --padding random \
   --entropy 1.0 --psk-file ./traffic-masking.psk
 
@@ -65,7 +68,7 @@ python traffic_masking_client.py \
 ```bash
 # Lower CPU usage, good throughput
 python traffic_masking_server.py \
-  --mbps 8 --advanced --profile web \
+  --shape-mode profile --max-mbps 8 --profile web \
   --header none --padding none --entropy 0.7 \
   --psk-file ./traffic-masking.psk
 ```
@@ -88,8 +91,8 @@ docker build -t traffic-masking .
 # Server
 docker run -d --name tm-server --network host \
   --mount type=bind,src="$PWD/traffic-masking.psk",dst=/run/secrets/traffic-masking.psk,readonly \
-  traffic-masking traffic_masking_server.py --min-mbps 2 --max-mbps 8 \
-  --advanced --psk-file /run/secrets/traffic-masking.psk
+  traffic-masking traffic_masking_server.py --shape-mode rate \
+  --min-mbps 2 --max-mbps 8 --psk-file /run/secrets/traffic-masking.psk
 
 # Client
 docker run -d --name tm-client --network host \
@@ -105,7 +108,7 @@ services:
   server:
     build: .
     network_mode: host
-    command: traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced --psk-file /run/secrets/traffic-masking.psk
+    command: traffic_masking_server.py --shape-mode rate --min-mbps 2 --max-mbps 8 --psk-file /run/secrets/traffic-masking.psk
     volumes:
       - ./traffic-masking.psk:/run/secrets/traffic-masking.psk:ro
     restart: unless-stopped
@@ -138,19 +141,19 @@ sudo sysctl -p
 ### Process Priority
 ```bash
 # High priority
-sudo nice -n -10 python traffic_masking_server.py --min-mbps 5 --max-mbps 15 \
-  --advanced --psk-file ./traffic-masking.psk
+sudo nice -n -10 python traffic_masking_server.py --shape-mode rate \
+  --min-mbps 5 --max-mbps 15 --psk-file ./traffic-masking.psk
 
 # CPU affinity (cores 0,1)
-taskset -c 0,1 python traffic_masking_server.py --min-mbps 5 --max-mbps 15 \
-  --advanced --psk-file ./traffic-masking.psk
+taskset -c 0,1 python traffic_masking_server.py --shape-mode rate \
+  --min-mbps 5 --max-mbps 15 --psk-file ./traffic-masking.psk
 ```
 
 ### PyPy for Better Performance
 ```bash
 sudo apt-get install pypy3
 pypy3 -m pip install numpy
-pypy3 traffic_masking_server.py --min-mbps 5 --max-mbps 15 --advanced \
+pypy3 traffic_masking_server.py --shape-mode rate --min-mbps 5 --max-mbps 15 \
   --psk-file ./traffic-masking.psk
 ```
 
@@ -181,7 +184,7 @@ python traffic_masking_client.py --server SERVER_IP \
 
 # Debug mode with verbose output
 PYTHONUNBUFFERED=1 python -u traffic_masking_server.py \
-  --mbps 5 --advanced --stats-interval 1 \
+  --shape-mode rate --mbps 5 --stats-interval 1 \
   --psk-file ./traffic-masking.psk 2>&1 | tee server.log
 
 # Network statistics
