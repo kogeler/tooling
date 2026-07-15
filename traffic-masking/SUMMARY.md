@@ -10,12 +10,21 @@
 - `ProtocolMimicry`: Pattern generation for different traffic profiles
 - `TrafficProfile`: Enum for supported profiles (web, video, voip, file, gaming, mixed)
 
+**control_protocol.py**
+- Versioned binary envelope for control and data datagrams
+- HMAC-SHA256 authentication with direction-specific session keys and monotonic
+  sequences
+- Stateless, source-bound challenge cookies with bounded pre-validation replies
+- Restrictive PSK file validation
+
 **traffic_masking_server.py**
 - Multi-client UDP server with batch processing
+- Authenticated client enrollment with client, handshake-rate, and total-rate caps
 - Adaptive rate control with floating mode
 - Real-time statistics monitoring
 
 **traffic_masking_client.py**
+- Authenticated challenge/response handshake and source validation
 - Adaptive uplink generation based on downlink rate
 - Response ratio control (0-100% of received traffic)
 

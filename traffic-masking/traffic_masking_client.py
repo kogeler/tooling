@@ -19,13 +19,33 @@ import threading
 import time
 
 import numpy as np
+from control_protocol import (
+    CLIENT_TO_SERVER,
+    CONTROL_PADDING_MAX,
+    FRAME_OVERHEAD,
+    INSECURE_DIAGNOSTIC_KEY,
+    MAX_DATAGRAM_SIZE,
+    MAX_PSK_SIZE,
+    MIN_CONTROL_MTU,
+    MIN_PSK_SIZE,
+    NONCE_SIZE,
+    ZERO_NONCE,
+    MessageType,
+    ProtocolError,
+    SERVER_TO_CLIENT,
+    decode_frame,
+    derive_session_key,
+    encode_frame,
+    inspect_frame,
+    load_psk,
+    make_padding,
+)
 from masking_lib import (
     ObfuscationConfig,
     build_obfuscator,
     init_udp_socket,
     mbps_to_bytes_per_second,
     parse_profile,
-    send_fragments,
 )
 
 
@@ -51,6 +71,9 @@ class AdaptiveTrafficClient:
         stats_interval=5.0,
         rng=None,
         byte_source=None,
+        psk=None,
+        insecure_diagnostic=False,
+        keepalive_jitter=0.2,
     ):
         # Validate configuration up front; fail fast on invalid inputs.
         try:
@@ -65,18 +88,54 @@ class AdaptiveTrafficClient:
             raise ValueError("response ratio must be in [0.0, 1.0]")
         if not math.isfinite(entropy) or not 0.0 <= entropy <= 1.0:
             raise ValueError("entropy must be in [0.0, 1.0]")
+        original_mtu = mtu
+        if isinstance(original_mtu, bool):
+            raise ValueError("mtu must be a positive integer")
         try:
-            mtu = int(mtu)
+            mtu = int(original_mtu)
         except (TypeError, ValueError, OverflowError):
             raise ValueError("mtu must be a positive integer") from None
-        if mtu <= 0:
-            raise ValueError("mtu must be positive")
+        if not isinstance(original_mtu, str) and original_mtu != mtu:
+            raise ValueError("mtu must be a positive integer")
+        if mtu > MAX_DATAGRAM_SIZE:
+            raise ValueError(f"mtu must not exceed {MAX_DATAGRAM_SIZE}")
+        if mtu < MIN_CONTROL_MTU:
+            raise ValueError(
+                f"mtu must be at least {MIN_CONTROL_MTU} bytes "
+                "for authenticated control framing"
+            )
+        if advanced and mtu - FRAME_OVERHEAD < 256:
+            raise ValueError(
+                f"mtu must be at least {FRAME_OVERHEAD + 256} bytes "
+                "in advanced mode"
+            )
         if not math.isfinite(stats_interval) or stats_interval <= 0:
             raise ValueError("stats-interval must be a positive finite number")
+        try:
+            keepalive_jitter = float(keepalive_jitter)
+        except (TypeError, ValueError):
+            raise ValueError("keepalive jitter must be a number") from None
+        if not math.isfinite(keepalive_jitter) or not 0.0 <= keepalive_jitter < 1.0:
+            raise ValueError("keepalive jitter must be in [0.0, 1.0)")
+        if psk is not None and insecure_diagnostic:
+            raise ValueError("psk and insecure diagnostic mode are mutually exclusive")
+        if psk is None and not insecure_diagnostic:
+            raise ValueError(
+                "a PSK is required unless insecure diagnostic mode is explicit"
+            )
+        if psk is not None:
+            if not isinstance(psk, (bytes, bytearray, memoryview)):
+                raise ValueError("psk must be bytes")
+            psk = bytes(psk)
+            if not MIN_PSK_SIZE <= len(psk) <= MAX_PSK_SIZE:
+                raise ValueError(
+                    f"psk must contain between {MIN_PSK_SIZE} and "
+                    f"{MAX_PSK_SIZE} bytes"
+                )
 
         self.server_host = server_host
         self.server_port = server_port
-        self.server_addr = (server_host, server_port)
+        self.server_addr = None
         self.response_ratio = response_ratio  # Response traffic ratio
         self.socket = None
         self.running = False
@@ -94,13 +153,29 @@ class AdaptiveTrafficClient:
         self.sequence = 0
         self._rng = rng or random.Random()
         self._byte_source = byte_source or os.urandom
+        self.base_key = psk if psk is not None else INSECURE_DIAGNOSTIC_KEY
+        self.insecure_diagnostic = bool(insecure_diagnostic)
+        self.keepalive_jitter = keepalive_jitter
+        self.mtu = mtu
+        self.data_payload_ceiling = mtu - FRAME_OVERHEAD
+        self._send_lock = threading.Lock()
+        self.client_nonce = ZERO_NONCE
+        self.session_nonce = ZERO_NONCE
+        self.pending_send_key = None
+        self.pending_receive_key = None
+        self.session_send_key = None
+        self.session_receive_key = None
+        self.handshake_sequence = 0
+        self.control_send_sequence = 0
+        self.control_receive_sequence = -1
+        self.handshake_accepted = False
         self.stats_interval = stats_interval
         # Advanced obfuscation settings
         self.advanced = bool(advanced)
         self.obf_cfg = ObfuscationConfig(
             padding_strategy=padding,
             header_mode=header,
-            mtu=mtu,
+            mtu=self.data_payload_ceiling,
             entropy=entropy,
             timing_jitter=0.002,
         )
@@ -114,21 +189,188 @@ class AdaptiveTrafficClient:
                 self.socket.close()
             except Exception:
                 pass
+        addresses = socket.getaddrinfo(
+            self.server_host,
+            self.server_port,
+            family=socket.AF_INET,
+            type=socket.SOCK_DGRAM,
+        )
+        if not addresses:
+            raise OSError(f"could not resolve server {self.server_host}")
+        self.server_addr = addresses[0][4][:2]
         self.socket = init_udp_socket(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
         self.socket.settimeout(2.0)
+        self._reset_protocol_state()
+
+    def _random_nonce(self):
+        nonce = bytes(self._byte_source(NONCE_SIZE))
+        if len(nonce) != NONCE_SIZE:
+            raise ValueError("byte source returned the wrong nonce length")
+        return nonce if nonce != ZERO_NONCE else b"\x01" + nonce[1:]
+
+    def _reset_protocol_state(self):
+        self.client_nonce = self._random_nonce()
+        self.session_nonce = ZERO_NONCE
+        self.pending_send_key = None
+        self.pending_receive_key = None
+        self.session_send_key = None
+        self.session_receive_key = None
+        self.handshake_sequence = self._rng.randint(1, 2**63 - 1)
+        self.control_send_sequence = self.handshake_sequence
+        self.control_receive_sequence = -1
+        self.handshake_accepted = False
+        self.connected = False
+
+    def _control_padding(self):
+        return make_padding(
+            self._rng, self._byte_source, 0, CONTROL_PADDING_MAX
+        )
 
     def _send_registration(self):
-        """Send registration packet to the server (UDP: no delivery guarantee)"""
+        """Send an authenticated HELLO (UDP: no delivery guarantee)."""
         try:
-            self.socket.sendto(b"INIT_CLIENT", self.server_addr)
+            hello = encode_frame(
+                MessageType.HELLO,
+                self.client_nonce,
+                ZERO_NONCE,
+                self.handshake_sequence,
+                self.base_key,
+                padding=self._control_padding(),
+            )
+            self.socket.sendto(hello, self.server_addr)
             print(
-                f"[*] Registration sent to {self.server_host}:{self.server_port}",
+                f"[*] Handshake HELLO sent to {self.server_addr[0]}:"
+                f"{self.server_addr[1]}",
                 flush=True,
             )
             return True
         except Exception as e:
             print(f"[!] Registration failed: {e}", flush=True)
             return False
+
+    def _process_datagram(self, datagram, addr):
+        """Authenticate one server datagram and return its DATA payload or None."""
+        if self.server_addr is None or addr[:2] != self.server_addr:
+            return None
+        try:
+            inspected = inspect_frame(datagram)
+        except ProtocolError:
+            return None
+
+        if inspected.message_type is MessageType.CHALLENGE:
+            try:
+                challenge = decode_frame(datagram, self.base_key)
+            except ProtocolError:
+                return None
+            if (
+                challenge.client_nonce != self.client_nonce
+                or challenge.session_nonce == ZERO_NONCE
+                or challenge.sequence != self.handshake_sequence
+            ):
+                return None
+            self.session_nonce = challenge.session_nonce
+            self.pending_send_key = derive_session_key(
+                self.base_key,
+                self.client_nonce,
+                self.session_nonce,
+                CLIENT_TO_SERVER,
+            )
+            self.pending_receive_key = derive_session_key(
+                self.base_key,
+                self.client_nonce,
+                self.session_nonce,
+                SERVER_TO_CLIENT,
+            )
+            self.control_send_sequence = self.handshake_sequence + 1
+            auth = encode_frame(
+                MessageType.AUTH,
+                self.client_nonce,
+                self.session_nonce,
+                self.control_send_sequence,
+                self.base_key,
+                payload=challenge.payload,
+                padding=self._control_padding(),
+            )
+            try:
+                self.socket.sendto(auth, self.server_addr)
+            except OSError:
+                return None
+            return None
+
+        if inspected.message_type is MessageType.ACCEPT:
+            if self.pending_receive_key is None or self.pending_send_key is None:
+                return None
+            try:
+                accept = decode_frame(datagram, self.pending_receive_key)
+            except ProtocolError:
+                return None
+            if (
+                accept.client_nonce != self.client_nonce
+                or accept.session_nonce != self.session_nonce
+                or accept.sequence != 0
+            ):
+                return None
+            self.session_send_key = self.pending_send_key
+            self.session_receive_key = self.pending_receive_key
+            self.pending_send_key = None
+            self.pending_receive_key = None
+            self.control_receive_sequence = accept.sequence
+            self.handshake_accepted = True
+            print("[*] Authenticated session accepted", flush=True)
+            return None
+
+        if inspected.message_type is not MessageType.DATA:
+            return None
+        if not self.handshake_accepted or self.session_receive_key is None:
+            return None
+        if (
+            inspected.client_nonce != self.client_nonce
+            or inspected.session_nonce != self.session_nonce
+        ):
+            return None
+        try:
+            frame = decode_frame(datagram, self.session_receive_key)
+        except ProtocolError:
+            return None
+        if frame.sequence <= self.control_receive_sequence:
+            return None
+        self.control_receive_sequence = frame.sequence
+        return frame.payload
+
+    def _send_session_message(self, message_type, payload=b""):
+        if not self.handshake_accepted or self.session_send_key is None:
+            return False
+        with self._send_lock:
+            self.control_send_sequence += 1
+            datagram = encode_frame(
+                message_type,
+                self.client_nonce,
+                self.session_nonce,
+                self.control_send_sequence,
+                self.session_send_key,
+                payload=payload,
+                padding=(
+                    self._control_padding()
+                    if message_type is MessageType.KEEPALIVE
+                    else b""
+                ),
+            )
+            try:
+                sent = self.socket.sendto(datagram, self.server_addr)
+            except OSError as exc:
+                print(f"[!] Send error: {exc}", flush=True)
+                return False
+            if sent != len(datagram):
+                return False
+            self.stats["bytes_sent"] += sent
+            self.stats["packets_sent"] += 1
+            return True
+
+    def _next_keepalive_delay(self):
+        factor = 1.0 + self._rng.uniform(
+            -self.keepalive_jitter, self.keepalive_jitter
+        )
+        return self.KEEPALIVE_INTERVAL * factor
 
     def _wait_for_server(self, timeout=5.0):
         """Wait for actual data from the server to confirm connection"""
@@ -171,9 +413,12 @@ class AdaptiveTrafficClient:
         self.running = True
 
         print(
-            f"[*] Traffic masking client connecting to {self.server_host}:{self.server_port}",
+            f"[*] Traffic masking client connecting to {self.server_addr[0]}:"
+            f"{self.server_addr[1]}",
             flush=True,
         )
+        auth_mode = "INSECURE DIAGNOSTIC" if self.insecure_diagnostic else "PSK"
+        print(f"[*] Control authentication: {auth_mode}", flush=True)
         # Initialize obfuscator in advanced mode
         if self.advanced:
             self.obfuscator = build_obfuscator(self.obf_cfg)
@@ -229,17 +474,10 @@ class AdaptiveTrafficClient:
                 if delay > 0:
                     time.sleep(delay)
 
-                def _on_sent(n: int):
-                    self.stats["bytes_sent"] += n
-                    self.stats["packets_sent"] += 1
-
-                send_fragments(
-                    self.socket, self.server_addr, fragments, on_sent=_on_sent
-                )
+                for fragment in fragments:
+                    self._send_session_message(MessageType.DATA, fragment)
             else:
-                self.socket.sendto(packet, self.server_addr)
-                self.stats["bytes_sent"] += len(packet)
-                self.stats["packets_sent"] += 1
+                self._send_session_message(MessageType.DATA, packet)
         except Exception as e:
             print(f"[!] Send error: {e}", flush=True)
 
@@ -250,7 +488,11 @@ class AdaptiveTrafficClient:
 
         while self.running:
             try:
-                data, addr = self.socket.recvfrom(65535)
+                data, addr = self.socket.recvfrom(MAX_DATAGRAM_SIZE)
+
+                payload = self._process_datagram(data, addr)
+                if payload is None:
+                    continue
 
                 self.last_received = time.time()
                 self.connected = True
@@ -270,7 +512,7 @@ class AdaptiveTrafficClient:
 
                 # Occasionally send echo to simulate interactivity
                 if random.random() < 0.01:  # 1% probability
-                    echo_packet = self.generate_response_packet(len(data) // 4)
+                    echo_packet = self.generate_response_packet(len(payload) // 4)
                     self.send_packet(echo_packet)
 
             except socket.timeout:
@@ -283,7 +525,7 @@ class AdaptiveTrafficClient:
     def keepalive_loop(self):
         """Send periodic keepalives and handle reconnection"""
         while self.running:
-            time.sleep(self.KEEPALIVE_INTERVAL)
+            time.sleep(self._next_keepalive_delay())
             if not self.running:
                 break
 
@@ -302,11 +544,10 @@ class AdaptiveTrafficClient:
                 # After _reconnect returns (success), resume keepalive loop
                 continue
 
-            # Send keepalive to stay registered on the server
-            try:
-                self.socket.sendto(b"KEEPALIVE", self.server_addr)
-            except Exception:
-                pass
+            if self.handshake_accepted:
+                self._send_session_message(MessageType.KEEPALIVE)
+            else:
+                self._send_registration()
 
     def send_loop(self):
         """Generate uplink traffic"""
@@ -412,10 +653,21 @@ def main():
         default=5.0,
         help="Stats print interval in seconds",
     )
+    auth_group = parser.add_mutually_exclusive_group()
+    auth_group.add_argument(
+        "--psk-file",
+        help="Path to a 32+ byte pre-shared key file (never pass the key itself)",
+    )
+    auth_group.add_argument(
+        "--insecure-diagnostic",
+        action="store_true",
+        help="Run without a secret; diagnostic use only",
+    )
 
     args = parser.parse_args()
 
     try:
+        psk = None if args.insecure_diagnostic else load_psk(args.psk_file)
         client = AdaptiveTrafficClient(
             args.server,
             args.port,
@@ -427,6 +679,8 @@ def main():
             mtu=args.mtu,
             entropy=args.entropy,
             stats_interval=args.stats_interval,
+            psk=psk,
+            insecure_diagnostic=args.insecure_diagnostic,
         )
     except ValueError as exc:
         parser.error(str(exc))

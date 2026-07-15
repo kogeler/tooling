@@ -3,16 +3,21 @@
 ## Quick Start
 
 ```bash
+umask 077
+openssl rand 32 > traffic-masking.psk
+
 # Test the system without live process/network tests
 make test-fast
 
 # Basic server and client
-python traffic_masking_server.py --mbps 5
-python traffic_masking_client.py --server 127.0.0.1
+python traffic_masking_server.py --mbps 5 --psk-file ./traffic-masking.psk
+python traffic_masking_client.py --server 127.0.0.1 --psk-file ./traffic-masking.psk
 
 # Floating rate (recommended)
-python traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced
-python traffic_masking_client.py --server 127.0.0.1 --response 0.3 --advanced
+python traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced \
+  --psk-file ./traffic-masking.psk
+python traffic_masking_client.py --server 127.0.0.1 --response 0.3 --advanced \
+  --psk-file ./traffic-masking.psk
 ```
 
 Mbps values are decimal Mbit/s of application UDP payload. The client defaults
@@ -25,15 +30,18 @@ that exact ratio on the wire.
 ### Mask Video Calls
 ```bash
 # Google Meet / Zoom / Teams
-python traffic_masking_server.py --min-mbps 1 --max-mbps 5 --advanced --profile video
+python traffic_masking_server.py --min-mbps 1 --max-mbps 5 --advanced \
+  --profile video --psk-file ./traffic-masking.psk
 
 # WhatsApp / Telegram voice calls
-python traffic_masking_server.py --min-mbps 0.5 --max-mbps 1.5 --advanced --profile voip
+python traffic_masking_server.py --min-mbps 0.5 --max-mbps 1.5 --advanced \
+  --profile voip --psk-file ./traffic-masking.psk
 ```
 
 ### Mask Web Browsing
 ```bash
-python traffic_masking_server.py --min-mbps 1 --max-mbps 4 --advanced --profile web --header quic
+python traffic_masking_server.py --min-mbps 1 --max-mbps 4 --advanced \
+  --profile web --header quic --psk-file ./traffic-masking.psk
 ```
 
 ### Maximum Security Configuration
@@ -43,13 +51,14 @@ python traffic_masking_server.py \
   --min-mbps 3 --max-mbps 10 \
   --advanced --profile mixed \
   --header rtp --padding random \
-  --entropy 1.0
+  --entropy 1.0 --psk-file ./traffic-masking.psk
 
 # Client
 python traffic_masking_client.py \
   --server SERVER_IP --response 0.4 \
   --advanced --uplink-profile mixed \
-  --header rtp --padding random
+  --header rtp --padding random \
+  --psk-file ./traffic-masking.psk
 ```
 
 ### Performance Optimized
@@ -57,7 +66,8 @@ python traffic_masking_client.py \
 # Lower CPU usage, good throughput
 python traffic_masking_server.py \
   --mbps 8 --advanced --profile web \
-  --header none --padding none --entropy 0.7
+  --header none --padding none --entropy 0.7 \
+  --psk-file ./traffic-masking.psk
 ```
 
 ## Integration
@@ -76,12 +86,16 @@ PreDown = systemctl stop traffic-masking-server
 docker build -t traffic-masking .
 
 # Server
-docker run -d --name tm-server --network host traffic-masking \
-  traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced
+docker run -d --name tm-server --network host \
+  --mount type=bind,src="$PWD/traffic-masking.psk",dst=/run/secrets/traffic-masking.psk,readonly \
+  traffic-masking traffic_masking_server.py --min-mbps 2 --max-mbps 8 \
+  --advanced --psk-file /run/secrets/traffic-masking.psk
 
 # Client
-docker run -d --name tm-client --network host traffic-masking \
-  traffic_masking_client.py --server SERVER_IP --response 0.3 --advanced
+docker run -d --name tm-client --network host \
+  --mount type=bind,src="$PWD/traffic-masking.psk",dst=/run/secrets/traffic-masking.psk,readonly \
+  traffic-masking traffic_masking_client.py --server SERVER_IP --response 0.3 \
+  --advanced --psk-file /run/secrets/traffic-masking.psk
 ```
 
 ### Docker Compose
@@ -91,13 +105,17 @@ services:
   server:
     build: .
     network_mode: host
-    command: traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced
+    command: traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced --psk-file /run/secrets/traffic-masking.psk
+    volumes:
+      - ./traffic-masking.psk:/run/secrets/traffic-masking.psk:ro
     restart: unless-stopped
 
   client:
     build: .
     network_mode: host
-    command: traffic_masking_client.py --server ${SERVER_IP} --response 0.3 --advanced
+    command: traffic_masking_client.py --server ${SERVER_IP} --response 0.3 --advanced --psk-file /run/secrets/traffic-masking.psk
+    volumes:
+      - ./traffic-masking.psk:/run/secrets/traffic-masking.psk:ro
     restart: unless-stopped
     depends_on:
       - server
@@ -120,17 +138,20 @@ sudo sysctl -p
 ### Process Priority
 ```bash
 # High priority
-sudo nice -n -10 python traffic_masking_server.py --min-mbps 5 --max-mbps 15 --advanced
+sudo nice -n -10 python traffic_masking_server.py --min-mbps 5 --max-mbps 15 \
+  --advanced --psk-file ./traffic-masking.psk
 
 # CPU affinity (cores 0,1)
-taskset -c 0,1 python traffic_masking_server.py --min-mbps 5 --max-mbps 15 --advanced
+taskset -c 0,1 python traffic_masking_server.py --min-mbps 5 --max-mbps 15 \
+  --advanced --psk-file ./traffic-masking.psk
 ```
 
 ### PyPy for Better Performance
 ```bash
 sudo apt-get install pypy3
 pypy3 -m pip install numpy
-pypy3 traffic_masking_server.py --min-mbps 5 --max-mbps 15 --advanced
+pypy3 traffic_masking_server.py --min-mbps 5 --max-mbps 15 --advanced \
+  --psk-file ./traffic-masking.psk
 ```
 
 ## Monitoring
@@ -154,13 +175,14 @@ grep "Rate:" server.log | awk '{sum+=$4; count++} END {print sum/count}'
 ## Troubleshooting
 
 ```bash
-# Test connectivity
-nc -u -v SERVER_IP 8888
-echo "TEST" | nc -u -w1 SERVER_IP 8888
+# Test authenticated connectivity
+python traffic_masking_client.py --server SERVER_IP \
+  --psk-file ./traffic-masking.psk --stats-interval 1
 
 # Debug mode with verbose output
 PYTHONUNBUFFERED=1 python -u traffic_masking_server.py \
-  --mbps 5 --advanced --stats-interval 1 2>&1 | tee server.log
+  --mbps 5 --advanced --stats-interval 1 \
+  --psk-file ./traffic-masking.psk 2>&1 | tee server.log
 
 # Network statistics
 netstat -su | grep -A 5 Udp:

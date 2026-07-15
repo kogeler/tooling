@@ -8,6 +8,7 @@ import importlib
 import pytest
 
 CORE_MODULES = [
+    "control_protocol",
     "masking_lib",
     "traffic_masking_server",
     "traffic_masking_client",

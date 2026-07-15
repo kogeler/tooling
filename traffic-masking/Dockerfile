@@ -24,7 +24,7 @@ COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
-COPY masking_lib.py traffic_masking_server.py traffic_masking_client.py /app/
+COPY control_protocol.py masking_lib.py traffic_masking_server.py traffic_masking_client.py /app/
 COPY enhanced/ /app/enhanced/
 
 # Copy documentation
@@ -43,4 +43,4 @@ EXPOSE 8888/udp
 ENTRYPOINT ["python"]
 
 # Default command shows usage
-CMD ["-c", "print('Usage:\\n  Server: python traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced\\n  Client: python traffic_masking_client.py --server <IP> --advanced')"]
+CMD ["-c", "print('Usage (mount a mode 0600 PSK at /run/secrets/traffic-masking.psk):\\n  Server: python traffic_masking_server.py --min-mbps 2 --max-mbps 8 --psk-file /run/secrets/traffic-masking.psk\\n  Client: python traffic_masking_client.py --server <IP> --psk-file /run/secrets/traffic-masking.psk')"]

@@ -27,7 +27,11 @@ ExecStart=/usr/bin/python3 /opt/traffic-masking/traffic_masking_server.py \
     --padding random \
     --mtu 1200 \
     --entropy 1.0 \
-    --stats-interval 10
+    --stats-interval 10 \
+    --psk-file /etc/traffic-masking/control.psk \
+    --max-clients 8 \
+    --max-total-mbps 80 \
+    --max-handshakes-per-second 20
 
 # Restart policy
 Restart=always

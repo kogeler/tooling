@@ -22,6 +22,7 @@ import pytest
 BASE_DIR = Path(__file__).resolve().parent
 SERVER = str(BASE_DIR / "traffic_masking_server.py")
 CLIENT = str(BASE_DIR / "traffic_masking_client.py")
+TEST_PSK = b"traffic-masking-test-key-material-32"
 
 
 @dataclass
@@ -46,6 +47,15 @@ def pytest_configure(config):
         "markers",
         "live: bounded end-to-end tests that spawn real client/server subprocesses",
     )
+
+
+@pytest.fixture
+def psk_file(tmp_path):
+    """Create a restrictive binary PSK file shared by live client/server."""
+    path = tmp_path / "control.psk"
+    path.write_bytes(TEST_PSK)
+    path.chmod(0o600)
+    return path
 
 
 def free_udp_port():

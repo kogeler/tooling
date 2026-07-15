@@ -11,6 +11,8 @@ UDP-based cover traffic generator designed to mask traffic patterns inside encry
 - **Protocol mimicry**: 6 traffic profiles (web, video, voip, file, gaming, mixed)
 - **Bidirectional flow**: Adaptive client uplink response
 - **Auto-reconnection**: Client recovers automatically after server restart or network loss
+- **Authenticated enrollment**: Source-bound challenge cookies and HMAC-SHA256
+  session framing prevent unauthenticated cover-traffic amplification
 
 ## Installation
 
@@ -22,17 +24,27 @@ pip install -r requirements.txt
 
 ## Quick Start
 
+Create one binary PSK and install the same file on both endpoints. Keep the file
+out of source control and do not pass the key value on the command line.
+
+```bash
+umask 077
+openssl rand 32 > traffic-masking.psk
+```
+
 ### Basic Usage
 
 ```bash
 # Server with fixed rate
-python traffic_masking_server.py --mbps 5
+python traffic_masking_server.py --mbps 5 --psk-file ./traffic-masking.psk
 
 # Server with floating rate (recommended)
-python traffic_masking_server.py --min-mbps 2 --max-mbps 8
+python traffic_masking_server.py --min-mbps 2 --max-mbps 8 \
+  --psk-file ./traffic-masking.psk
 
 # Client
-python traffic_masking_client.py --server <SERVER_IP>
+python traffic_masking_client.py --server <SERVER_IP> \
+  --psk-file ./traffic-masking.psk
 ```
 
 ### Advanced Mode
@@ -42,13 +54,15 @@ python traffic_masking_client.py --server <SERVER_IP>
 python traffic_masking_server.py \
   --min-mbps 3 --max-mbps 10 \
   --advanced --profile mixed \
-  --header rtp --padding random
+  --header rtp --padding random \
+  --psk-file ./traffic-masking.psk
 
 # Client with matching configuration
 # A nonzero response is an explicit diagnostic/profile uplink choice.
 python traffic_masking_client.py \
   --server <SERVER_IP> --response 0.3 \
-  --advanced --uplink-profile mixed
+  --advanced --uplink-profile mixed \
+  --psk-file ./traffic-masking.psk
 ```
 
 ## Testing
@@ -76,6 +90,23 @@ make test
 - `--header`: Pseudo-headers (none/rtp/quic)
 - `--padding`: Padding strategy (none/random/fixed_buckets/progressive)
 - `--entropy`: Payload entropy (0.0-1.0)
+- `--psk-file`: Path to the shared 32-4096 byte binary key. The file must not
+  grant group or other permissions.
+- `--max-clients`, `--max-total-mbps`: Bound authenticated enrollment and the
+  configured aggregate egress commitment.
+- `--max-handshakes-per-second`: Bound global handshake processing. Pending and
+  replay state expires with the cookie window; full state refuses new enrollment
+  rather than evicting an authenticated client.
+
+`--insecure-diagnostic` uses a public built-in key and is only for local
+diagnostics. Production startup fails closed when the PSK is missing,
+unreadable, too short, too large, or has permissive file modes.
+
+## Key Rotation
+
+There is no multi-key grace period. Generate a replacement file with mode
+`0600`, stop both endpoints, atomically replace the old file on both hosts, and
+restart both processes. Never log the key or put its value in a service command.
 
 ## Documentation
 
@@ -87,8 +118,14 @@ make test
 
 ```bash
 docker build -t traffic-masking .
-docker run --network host traffic-masking traffic_masking_server.py --min-mbps 2 --max-mbps 8
+docker run --network host \
+  --mount type=bind,src="$PWD/traffic-masking.psk",dst=/run/secrets/traffic-masking.psk,readonly \
+  traffic-masking traffic_masking_server.py --min-mbps 2 --max-mbps 8 \
+  --psk-file /run/secrets/traffic-masking.psk
 ```
+
+The mounted secret must be readable by container UID 1000 while retaining mode
+`0400` or `0600` and no group/other permission bits.
 
 ## Systemd
 

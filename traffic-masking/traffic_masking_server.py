@@ -19,8 +19,32 @@ import socket
 import struct
 import threading
 import time
+from collections import OrderedDict, deque
 
 import numpy as np
+from control_protocol import (
+    CLIENT_TO_SERVER,
+    CONTROL_PADDING_MAX,
+    FRAME_OVERHEAD,
+    INSECURE_DIAGNOSTIC_KEY,
+    MAX_DATAGRAM_SIZE,
+    MAX_PSK_SIZE,
+    MIN_CONTROL_MTU,
+    MIN_PSK_SIZE,
+    NONCE_SIZE,
+    ZERO_NONCE,
+    MessageType,
+    ProtocolError,
+    SERVER_TO_CLIENT,
+    create_cookie,
+    decode_frame,
+    derive_session_key,
+    encode_frame,
+    inspect_frame,
+    load_psk,
+    make_padding,
+    verify_cookie,
+)
 from masking_lib import (
     DynamicObfuscator,
     TrafficProfile,
@@ -97,6 +121,20 @@ def _unit_interval_float(value, name):
     return value
 
 
+def _positive_int(value, name):
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be a positive integer") from None
+    if not isinstance(value, str) and value != parsed:
+        raise ValueError(f"{name} must be a positive integer")
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
+
+
 class TrafficPattern:
     """Generator of diverse traffic rate patterns (CBR, bursts, waves, random-walk, media-like)"""
 
@@ -166,7 +204,7 @@ class TrafficPattern:
 class PacketGenerator:
     """Packet generator with variable sizes and pseudo-random payload characteristics"""
 
-    def __init__(self, min_size=64, max_size=1400, rng=None, byte_source=None):
+    def __init__(self, min_size=28, max_size=1400, rng=None, byte_source=None):
         self.min_size = min_size
         self.max_size = max_size
         self.sequence = 0
@@ -224,6 +262,16 @@ class MaskingTrafficServer:
         mtu=1200,
         entropy=1.0,
         stats_interval=5.0,
+        psk=None,
+        insecure_diagnostic=False,
+        max_clients=16,
+        max_total_mbps=100.0,
+        max_handshakes_per_second=20,
+        cookie_ttl=10,
+        clock=None,
+        rng=None,
+        byte_source=None,
+        cookie_secret=None,
     ):
         # Validate configuration up front; fail fast on invalid rates/ranges.
         floating = min_mbps is not None and max_mbps is not None
@@ -239,16 +287,65 @@ class MaskingTrafficServer:
             target_mbps = _positive_finite_float(
                 target_mbps, "target rate (--mbps)"
             )
-        try:
-            mtu = int(mtu)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError("mtu must be a positive integer") from None
-        if mtu <= 0:
-            raise ValueError("mtu must be positive")
+        mtu = _positive_int(mtu, "mtu")
+        if mtu > MAX_DATAGRAM_SIZE:
+            raise ValueError(f"mtu must not exceed {MAX_DATAGRAM_SIZE}")
+        if mtu < MIN_CONTROL_MTU:
+            raise ValueError(
+                f"mtu must be at least {MIN_CONTROL_MTU} bytes "
+                "for authenticated control framing"
+            )
+        if advanced and mtu - FRAME_OVERHEAD < 256:
+            raise ValueError(
+                f"mtu must be at least {FRAME_OVERHEAD + 256} bytes "
+                "in advanced mode"
+            )
         entropy = _unit_interval_float(entropy, "entropy")
         stats_interval = _positive_finite_float(
             stats_interval, "stats-interval"
         )
+        max_clients = _positive_int(max_clients, "max-clients")
+        max_total_mbps = _positive_finite_float(
+            max_total_mbps, "max-total-mbps"
+        )
+        max_handshakes_per_second = _positive_int(
+            max_handshakes_per_second, "max-handshakes-per-second"
+        )
+        cookie_ttl = _positive_int(cookie_ttl, "cookie-ttl")
+        configured_max_mbps = max_mbps if floating else target_mbps
+        if configured_max_mbps > max_total_mbps:
+            raise ValueError(
+                "max-total-mbps must be at least the configured per-client maximum"
+            )
+        if psk is not None and insecure_diagnostic:
+            raise ValueError("psk and insecure diagnostic mode are mutually exclusive")
+        if psk is None and not insecure_diagnostic:
+            raise ValueError(
+                "a PSK is required unless insecure diagnostic mode is explicit"
+            )
+        if psk is not None:
+            if not isinstance(psk, (bytes, bytearray, memoryview)):
+                raise ValueError("psk must be bytes")
+            psk = bytes(psk)
+            if not MIN_PSK_SIZE <= len(psk) <= MAX_PSK_SIZE:
+                raise ValueError(
+                    f"psk must contain between {MIN_PSK_SIZE} and "
+                    f"{MAX_PSK_SIZE} bytes"
+                )
+
+        self._clock = clock or time.time
+        self._rng = rng or random.Random()
+        self._byte_source = byte_source or os.urandom
+        self.base_key = psk if psk is not None else INSECURE_DIAGNOSTIC_KEY
+        self.insecure_diagnostic = bool(insecure_diagnostic)
+        if cookie_secret is None:
+            self.cookie_secret = bytes(self._byte_source(32))
+        elif isinstance(cookie_secret, (bytes, bytearray, memoryview)):
+            self.cookie_secret = bytes(cookie_secret)
+        else:
+            raise ValueError("cookie secret must be bytes")
+        if len(self.cookie_secret) < 32:
+            raise ValueError("cookie secret must contain at least 32 bytes")
 
         self.host = host
         self.port = port
@@ -261,10 +358,15 @@ class MaskingTrafficServer:
         else:
             self.target_bytes_per_second = mbps_to_bytes_per_second(target_mbps)
         self.socket = None
-        self.clients = {}  # {address: {'last_seen': timestamp, 'stats': {...}}}
+        self.clients = {}  # Only authenticated/validated sessions.
         self.running = False
         self.pattern_gen = TrafficPattern()
-        self.packet_gen = PacketGenerator()
+        self.data_payload_ceiling = mtu - FRAME_OVERHEAD
+        self.packet_gen = PacketGenerator(
+            max_size=min(1400, self.data_payload_ceiling),
+            rng=self._rng,
+            byte_source=self._byte_source,
+        )
         self.stats = {"bytes_sent": 0, "packets_sent": 0, "start_time": time.time()}
         self.last_stats = {"bytes_sent": 0, "packets_sent": 0, "time": time.time()}
         self.stats_interval = stats_interval
@@ -283,6 +385,17 @@ class MaskingTrafficServer:
         self.padding_strategy = padding
         self.mtu = mtu
         self.entropy = entropy
+        self.max_clients = max_clients
+        self.max_total_mbps = max_total_mbps
+        self.max_handshakes_per_second = max_handshakes_per_second
+        self.cookie_ttl = cookie_ttl
+        self.configured_max_mbps = configured_max_mbps
+        self._handshake_times = deque()
+        self._prevalidation = OrderedDict()
+        self._accepted_auth = OrderedDict()
+        self._handshake_state_limit = (
+            max_clients + max_handshakes_per_second * cookie_ttl
+        )
         self.obfuscator = None
         self.generator = None
 
@@ -313,7 +426,7 @@ class MaskingTrafficServer:
             self.obfuscator = DynamicObfuscator(
                 padding_strategy=self.padding_strategy,
                 timing_jitter=0.002,
-                mtu=self.mtu,
+                mtu=self.data_payload_ceiling,
                 header_mode=self.header_mode,
             )
             self.generator = stream_generator(
@@ -330,6 +443,12 @@ class MaskingTrafficServer:
                 f"[*] Advanced mode enabled: profile={self.profile.value}, header={self.header_mode}, padding={self.padding_strategy}, mtu={self.mtu}, entropy={self.entropy}",
                 flush=True,
             )
+        auth_mode = "INSECURE DIAGNOSTIC" if self.insecure_diagnostic else "PSK"
+        print(
+            f"[*] Control authentication: {auth_mode} | max clients: "
+            f"{self.max_clients} | total cap: {self.max_total_mbps} Mbps",
+            flush=True,
+        )
 
         # Start threads
         threading.Thread(target=self.receive_loop, daemon=True).start()
@@ -337,28 +456,232 @@ class MaskingTrafficServer:
         threading.Thread(target=self.stats_loop, daemon=True).start()
         threading.Thread(target=self.cleanup_loop, daemon=True).start()
 
+    def _prune_handshake_state(self, now):
+        while self._handshake_times and self._handshake_times[0] <= now - 1.0:
+            self._handshake_times.popleft()
+        for mapping in (self._prevalidation, self._accepted_auth):
+            expired = [key for key, value in mapping.items() if value["expires"] < now]
+            for key in expired:
+                del mapping[key]
+
+    def _consume_handshake_slot(self, now):
+        self._prune_handshake_state(now)
+        if len(self._handshake_times) >= self.max_handshakes_per_second:
+            return False
+        self._handshake_times.append(now)
+        return True
+
+    def _record_prevalidation_input(self, addr, byte_count, now):
+        self._prune_handshake_state(now)
+        entry = self._prevalidation.get(addr)
+        if entry is None:
+            if len(self._prevalidation) >= self._handshake_state_limit:
+                return None
+            entry = {"received": 0, "replied": 0, "expires": now + self.cookie_ttl}
+            self._prevalidation[addr] = entry
+        entry["received"] += byte_count
+        entry["expires"] = now + self.cookie_ttl
+        self._prevalidation.move_to_end(addr)
+        return entry
+
+    def _send_prevalidation(self, addr, datagram, entry):
+        if entry["replied"] + len(datagram) > entry["received"] * 3:
+            return False
+        try:
+            sent = self.socket.sendto(datagram, addr)
+        except OSError:
+            return False
+        if sent != len(datagram):
+            return False
+        entry["replied"] += sent
+        return True
+
+    def prevalidation_totals(self, addr):
+        """Return received/replied pre-validation bytes for tests/diagnostics."""
+        entry = self._prevalidation.get(addr)
+        if entry is None:
+            return 0, 0
+        return entry["received"], entry["replied"]
+
+    def _control_padding(self):
+        return make_padding(
+            self._rng, self._byte_source, 0, CONTROL_PADDING_MAX
+        )
+
+    def _random_nonce(self):
+        nonce = bytes(self._byte_source(NONCE_SIZE))
+        if len(nonce) != NONCE_SIZE:
+            raise ValueError("byte source returned the wrong nonce length")
+        return nonce if nonce != ZERO_NONCE else b"\x01" + nonce[1:]
+
+    def _handle_hello(self, frame, addr, entry, now):
+        if (
+            frame.client_nonce == ZERO_NONCE
+            or frame.session_nonce != ZERO_NONCE
+            or frame.payload
+            or frame.sequence == 2**64 - 1
+        ):
+            return False
+        session_nonce = self._random_nonce()
+        expires_at = int(now) + self.cookie_ttl
+        cookie = create_cookie(
+            self.cookie_secret,
+            addr,
+            frame.client_nonce,
+            session_nonce,
+            frame.sequence,
+            expires_at,
+        )
+        challenge = encode_frame(
+            MessageType.CHALLENGE,
+            frame.client_nonce,
+            session_nonce,
+            frame.sequence,
+            self.base_key,
+            payload=cookie,
+            padding=self._control_padding(),
+        )
+        return self._send_prevalidation(addr, challenge, entry)
+
+    def _handle_auth(self, frame, addr, entry, now):
+        if frame.client_nonce == ZERO_NONCE or frame.session_nonce == ZERO_NONCE:
+            return False
+        try:
+            cookie = verify_cookie(
+                frame.payload,
+                self.cookie_secret,
+                addr,
+                frame.client_nonce,
+                frame.session_nonce,
+                now=int(now),
+                max_future_seconds=self.cookie_ttl,
+            )
+        except ProtocolError:
+            return False
+        if frame.sequence != cookie.hello_sequence + 1:
+            return False
+
+        replay_key = frame.client_nonce + frame.session_nonce
+        self._prune_handshake_state(now)
+        if replay_key in self._accepted_auth:
+            return False
+        existing = 1 if addr in self.clients else 0
+        prospective_clients = len(self.clients) - existing + 1
+        if prospective_clients > self.max_clients:
+            return False
+        if prospective_clients * self.configured_max_mbps > self.max_total_mbps:
+            return False
+        if len(self._accepted_auth) >= self._handshake_state_limit:
+            return False
+
+        receive_key = derive_session_key(
+            self.base_key,
+            frame.client_nonce,
+            frame.session_nonce,
+            CLIENT_TO_SERVER,
+        )
+        send_key = derive_session_key(
+            self.base_key,
+            frame.client_nonce,
+            frame.session_nonce,
+            SERVER_TO_CLIENT,
+        )
+        accept = encode_frame(
+            MessageType.ACCEPT,
+            frame.client_nonce,
+            frame.session_nonce,
+            0,
+            send_key,
+            padding=self._control_padding(),
+        )
+        if not self._send_prevalidation(addr, accept, entry):
+            return False
+
+        self._accepted_auth[replay_key] = {
+            "expires": now + self.cookie_ttl
+        }
+        self.clients[addr] = {
+            "last_seen": now,
+            "bytes_received": 0,
+            "packets_received": 0,
+            "client_nonce": frame.client_nonce,
+            "session_nonce": frame.session_nonce,
+            "receive_key": receive_key,
+            "send_key": send_key,
+            "receive_sequence": frame.sequence,
+            "send_sequence": 0,
+        }
+        print(f"[+] New client connected: {addr}", flush=True)
+        return True
+
+    def _handle_session_frame(self, inspected, datagram, addr, now):
+        client = self.clients.get(addr)
+        if client is None:
+            return False
+        if inspected.message_type not in (MessageType.KEEPALIVE, MessageType.DATA):
+            return False
+        if (
+            inspected.client_nonce != client["client_nonce"]
+            or inspected.session_nonce != client["session_nonce"]
+        ):
+            return False
+        try:
+            frame = decode_frame(datagram, client["receive_key"])
+        except ProtocolError:
+            return False
+        if frame.sequence <= client["receive_sequence"]:
+            return False
+
+        client["receive_sequence"] = frame.sequence
+        client["last_seen"] = now
+        if frame.message_type is MessageType.DATA:
+            client["bytes_received"] += len(datagram)
+            client["packets_received"] += 1
+        return True
+
+    def handle_datagram(self, datagram, addr):
+        """Validate and dispatch one UDP datagram; return whether it was accepted."""
+        try:
+            inspected = inspect_frame(datagram)
+        except ProtocolError:
+            return False
+        now = self._clock()
+        if inspected.message_type in (MessageType.KEEPALIVE, MessageType.DATA):
+            return self._handle_session_frame(inspected, datagram, addr, now)
+        if inspected.message_type not in (MessageType.HELLO, MessageType.AUTH):
+            return False
+
+        entry = self._record_prevalidation_input(addr, len(datagram), now)
+        if entry is None or not self._consume_handshake_slot(now):
+            return False
+        try:
+            frame = decode_frame(datagram, self.base_key)
+        except ProtocolError:
+            return False
+        if frame.message_type is MessageType.HELLO:
+            return self._handle_hello(frame, addr, entry, now)
+        return self._handle_auth(frame, addr, entry, now)
+
     def receive_loop(self):
-        """Receive packets from clients"""
+        """Receive and authenticate packets from clients."""
         while self.running:
             try:
-                data, addr = self.socket.recvfrom(65535)
-
-                # Update client info
-                if addr not in self.clients:
-                    print(f"[+] New client connected: {addr}", flush=True)
-                    self.clients[addr] = {
-                        "last_seen": time.time(),
-                        "bytes_received": 0,
-                        "packets_received": 0,
-                    }
-
-                self.clients[addr]["last_seen"] = time.time()
-                self.clients[addr]["bytes_received"] += len(data)
-                self.clients[addr]["packets_received"] += 1
-
-            except Exception as e:
+                data, addr = self.socket.recvfrom(MAX_DATAGRAM_SIZE)
+                self.handle_datagram(data, addr)
+            except Exception as exc:
                 if self.running:
-                    print(f"[!] Receive error: {e}", flush=True)
+                    print(f"[!] Receive error: {exc}", flush=True)
+
+    def _frame_data_for_client(self, client, payload):
+        client["send_sequence"] += 1
+        return encode_frame(
+            MessageType.DATA,
+            client["client_nonce"],
+            client["session_nonce"],
+            client["send_sequence"],
+            client["send_key"],
+            payload=payload,
+        )
 
     def send_loop(self):
         """Send cover traffic to clients"""
@@ -399,12 +722,15 @@ class MaskingTrafficServer:
                 # Send fragments and track bytes
                 packet_bytes = 0
                 for frag in frags:
-                    for addr in list(self.clients.keys()):
+                    for addr, client in list(self.clients.items()):
                         try:
-                            self.socket.sendto(frag, addr)
-                            self.stats["bytes_sent"] += len(frag)
+                            framed = self._frame_data_for_client(client, frag)
+                            sent = self.socket.sendto(framed, addr)
+                            if sent != len(framed):
+                                continue
+                            self.stats["bytes_sent"] += sent
                             self.stats["packets_sent"] += 1
-                            packet_bytes += len(frag)
+                            packet_bytes += sent
                         except Exception as e:
                             print(f"[!] Send error to client {addr}: {e}", flush=True)
 
@@ -436,22 +762,30 @@ class MaskingTrafficServer:
             # Send packets in batches for efficiency
             packets_sent_this_round = 0
             while (
-                bytes_available > 0 and self.clients and packets_sent_this_round < 50
+                bytes_available >= FRAME_OVERHEAD + 28
+                and self.clients
+                and packets_sent_this_round < 50
             ):
-                # Generate larger packets for better throughput
-                packet_size = min(bytes_available, random.randint(1000, 1400))
-                packet = self.packet_gen.generate_packet(packet_size)
+                target_frame_size = min(
+                    bytes_available, self.mtu, self._rng.randint(1000, 1400)
+                )
+                payload_size = target_frame_size - FRAME_OVERHEAD
+                packet = self.packet_gen.generate_packet(payload_size)
+                framed_size = FRAME_OVERHEAD + len(packet)
 
                 # Send to all active clients
-                for addr in list(self.clients.keys()):
+                for addr, client in list(self.clients.items()):
                     try:
-                        self.socket.sendto(packet, addr)
-                        self.stats["bytes_sent"] += len(packet)
+                        framed = self._frame_data_for_client(client, packet)
+                        sent = self.socket.sendto(framed, addr)
+                        if sent != len(framed):
+                            continue
+                        self.stats["bytes_sent"] += sent
                         self.stats["packets_sent"] += 1
                     except Exception as e:
                         print(f"[!] Send error to client {addr}: {e}")
 
-                rate_budget.consume(len(packet))
+                rate_budget.consume(framed_size)
                 bytes_available = rate_budget.available
                 packets_sent_this_round += 1
 
@@ -584,10 +918,39 @@ def main():
         default=5.0,
         help="Stats print interval in seconds",
     )
+    auth_group = parser.add_mutually_exclusive_group()
+    auth_group.add_argument(
+        "--psk-file",
+        help="Path to a 32+ byte pre-shared key file (never pass the key itself)",
+    )
+    auth_group.add_argument(
+        "--insecure-diagnostic",
+        action="store_true",
+        help="Run without a secret; diagnostic use only",
+    )
+    parser.add_argument(
+        "--max-clients",
+        type=int,
+        default=16,
+        help="Maximum number of authenticated clients",
+    )
+    parser.add_argument(
+        "--max-total-mbps",
+        type=float,
+        default=100.0,
+        help="Maximum configured aggregate server egress in decimal Mbps",
+    )
+    parser.add_argument(
+        "--max-handshakes-per-second",
+        type=int,
+        default=20,
+        help="Global cap on authenticated handshake frames per second",
+    )
 
     args = parser.parse_args()
 
     try:
+        psk = None if args.insecure_diagnostic else load_psk(args.psk_file)
         server = MaskingTrafficServer(
             args.host,
             args.port,
@@ -601,6 +964,11 @@ def main():
             mtu=args.mtu,
             entropy=args.entropy,
             stats_interval=args.stats_interval,
+            psk=psk,
+            insecure_diagnostic=args.insecure_diagnostic,
+            max_clients=args.max_clients,
+            max_total_mbps=args.max_total_mbps,
+            max_handshakes_per_second=args.max_handshakes_per_second,
         )
     except ValueError as exc:
         parser.error(str(exc))

@@ -14,7 +14,8 @@ WorkingDirectory=/opt/traffic-masking
 
 # Environment
 Environment="PYTHONUNBUFFERED=1"
-Environment="SERVER_IP=127.0.0.1"  # Override with drop-in file
+# Override SERVER_IP with a drop-in file.
+Environment="SERVER_IP=127.0.0.1"
 
 # Maximum configuration with advanced features
 ExecStart=/usr/bin/python3 /opt/traffic-masking/traffic_masking_client.py \
@@ -27,7 +28,8 @@ ExecStart=/usr/bin/python3 /opt/traffic-masking/traffic_masking_client.py \
     --padding random \
     --mtu 1200 \
     --entropy 1.0 \
-    --stats-interval 10
+    --stats-interval 10 \
+    --psk-file /etc/traffic-masking/control.psk
 
 # Restart policy
 Restart=always

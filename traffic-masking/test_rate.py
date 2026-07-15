@@ -5,6 +5,7 @@
 
 import masking_lib
 import pytest
+from conftest import TEST_PSK
 from masking_lib import ProtocolMimicry, mbps_to_bytes_per_second
 from traffic_masking_server import MaskingTrafficServer, _budget_bytes, _RateBudget
 
@@ -29,15 +30,17 @@ def test_server_target_uses_decimal_conversion():
     # The old loop budgeted `mbps * 1024 * 1024` *bits* as if they were bytes
     # and added a 1.1 fudge factor, inflating --mbps 1 to ~8.8 Mbit/s of
     # payload. The stored target must be plain decimal bytes per second.
-    server = MaskingTrafficServer(target_mbps=1)
+    server = MaskingTrafficServer(target_mbps=1, psk=TEST_PSK)
     assert server.target_bytes_per_second == 125_000
     legacy_bytes_budget = 1 * 1024 * 1024 * 1.1  # what the old loop granted
     assert legacy_bytes_budget / server.target_bytes_per_second > 8
 
 
 def test_fixed_and_floating_conversions_are_identical():
-    fixed = MaskingTrafficServer(target_mbps=5)
-    floating = MaskingTrafficServer(min_mbps=2, max_mbps=8)  # midpoint 5
+    fixed = MaskingTrafficServer(target_mbps=5, psk=TEST_PSK)
+    floating = MaskingTrafficServer(
+        min_mbps=2, max_mbps=8, psk=TEST_PSK
+    )  # midpoint 5
     assert fixed.target_bytes_per_second == floating.target_bytes_per_second
 
 

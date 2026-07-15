@@ -7,7 +7,8 @@ PIP        := $(VENV)/bin/pip
 RUFF       := $(VENV)/bin/ruff
 DEPS_STAMP := $(VENV)/.deps-installed
 
-COV := --cov=masking_lib --cov=traffic_masking_server --cov=traffic_masking_client \
+COV := --cov=control_protocol --cov=masking_lib \
+       --cov=traffic_masking_server --cov=traffic_masking_client \
        --cov=enhanced --cov-branch --cov-report=term-missing
 
 .PHONY: venv test test-fast test-live lint run-server run-client clean
@@ -35,10 +36,10 @@ lint: venv                ## static checks
 	$(RUFF) check .
 
 run-server: venv          ## demo server (floating 2-8 Mbps, advanced)
-	$(PYTHON) traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced --profile mixed
+	$(PYTHON) traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced --profile mixed --insecure-diagnostic
 
 run-client: venv          ## demo client against 127.0.0.1
-	$(PYTHON) traffic_masking_client.py --server 127.0.0.1 --advanced --uplink-profile mixed
+	$(PYTHON) traffic_masking_client.py --server 127.0.0.1 --advanced --uplink-profile mixed --insecure-diagnostic
 
 clean:                    ## remove venv and generated artifacts
 	rm -rf $(VENV) __pycache__ enhanced/__pycache__ \

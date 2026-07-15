@@ -23,7 +23,19 @@ sudo python3 -m venv /opt/traffic-masking/venv
 sudo /opt/traffic-masking/venv/bin/pip install numpy
 ```
 
-4. Update service files to use venv Python:
+4. Generate the shared key on one endpoint and securely transfer the same binary
+   file to the other endpoint:
+
+```bash
+sudo install -d -o root -g root -m 0755 /etc/traffic-masking
+umask 077
+openssl rand 32 > /tmp/control.psk
+sudo install -o nobody -g nogroup -m 0400 /tmp/control.psk \
+    /etc/traffic-masking/control.psk
+rm -f /tmp/control.psk
+```
+
+5. Update service files to use venv Python:
 ```bash
 sudo sed -i 's|/usr/bin/python3|/opt/traffic-masking/venv/bin/python|g' \
     /etc/systemd/system/traffic-masking-*.service
@@ -49,7 +61,8 @@ Example override to change rate:
 [Service]
 ExecStart=
 ExecStart=/opt/traffic-masking/venv/bin/python /opt/traffic-masking/traffic_masking_server.py \
-    --min-mbps 1 --max-mbps 5 --advanced --profile video
+    --min-mbps 1 --max-mbps 5 --advanced --profile video \
+    --psk-file /etc/traffic-masking/control.psk
 ```
 
 ### Client Configuration
@@ -118,6 +131,14 @@ Both services include security hardening:
 - Read-only system directories
 - No new privileges
 - Resource limits
+- HMAC-SHA256 authenticated enrollment and session traffic
+- A mode `0400` PSK file that is never exposed in process arguments or logs
+
+### Key Rotation
+
+The protocol does not support overlapping keys. Stop both services, install a
+new mode `0400` key at `/etc/traffic-masking/control.psk` on both endpoints, then
+start both services. A client with an old or incorrect key remains unregistered.
 
 ## Troubleshooting
 
@@ -125,6 +146,7 @@ Both services include security hardening:
 - Check logs: `sudo journalctl -u traffic-masking-server.service -e`
 - Verify Python path: `which python3`
 - Check permissions: `ls -la /opt/traffic-masking/`
+- Check PSK ownership/mode: `sudo stat /etc/traffic-masking/control.psk`
 
 ### High CPU Usage
 - Reduce `--entropy` to 0.5-0.7
@@ -134,4 +156,5 @@ Both services include security hardening:
 ### Connection Issues
 - Check firewall: `sudo ufw status`
 - Verify server is listening: `sudo ss -ulnp | grep 8888`
-- Test connectivity: `nc -u -v SERVER_IP 8888`
+- Run an authenticated client and inspect its status output; arbitrary UDP probes
+  are intentionally ignored.

@@ -10,33 +10,44 @@ timeouts; a later stage adds timing knobs to shrink them.
 """
 
 import re
+import socket
 import time
 
 import pytest
 
-from conftest import CLIENT, last_match, read_log, stop_process, wait_for
+from conftest import CLIENT, TEST_PSK, last_match, read_log, stop_process, wait_for
+from control_protocol import (
+    NONCE_SIZE,
+    ZERO_NONCE,
+    MessageType,
+    decode_frame,
+    encode_frame,
+)
 
 pytestmark = pytest.mark.live
 
 
-def _server_args(port, lo=2, hi=4):
+def _server_args(port, psk_file, lo=2, hi=4):
     return [
         "--host", "127.0.0.1", "--port", str(port),
         "--min-mbps", str(lo), "--max-mbps", str(hi),
         "--advanced", "--profile", "mixed", "--stats-interval", "1",
+        "--psk-file", str(psk_file),
     ]
 
 
-def test_transmission_bidirectional(spawn, start_server):
+def test_transmission_bidirectional(spawn, start_server, psk_file):
     """Client connects, receives downlink and emits uplink; server sees the client."""
-    server, port = start_server(_server_args, "server")
+    server, port = start_server(
+        lambda selected_port: _server_args(selected_port, psk_file), "server"
+    )
 
     client = spawn(
         CLIENT,
         [
             "--server", "127.0.0.1", "--port", str(port),
             "--response", "0.3", "--advanced", "--uplink-profile", "mixed",
-            "--stats-interval", "1",
+            "--stats-interval", "1", "--psk-file", str(psk_file),
         ],
         "client",
     )
@@ -52,14 +63,17 @@ def test_transmission_bidirectional(spawn, start_server):
     assert tx is not None and tx > 0.0, read_log(client)
 
 
-def test_reconnection_after_server_restart(spawn, start_server):
+def test_reconnection_after_server_restart(spawn, start_server, psk_file):
     """Three-phase: connected -> server down (no false success) -> restarted -> resumed."""
-    server, port = start_server(_server_args, "server1")
+    def server_args(selected_port):
+        return _server_args(selected_port, psk_file)
+
+    server, port = start_server(server_args, "server1")
 
     client = spawn(
         CLIENT,
         ["--server", "127.0.0.1", "--port", str(port), "--response", "0.3",
-         "--stats-interval", "1"],
+         "--stats-interval", "1", "--psk-file", str(psk_file)],
         "client",
     )
     assert wait_for(client, "Rx:", 10.0), read_log(client)
@@ -73,14 +87,14 @@ def test_reconnection_after_server_restart(spawn, start_server):
 
     # Phase 3: restart the server; the client must reconnect.
     reconnect_offset = client.mark_log()
-    server2, _ = start_server(_server_args, "server2", port=port)
+    server2, _ = start_server(server_args, "server2", port=port)
     assert wait_for(
         client, "Reconnected successfully", 25.0, offset=reconnect_offset
     ), read_log(client, offset=reconnect_offset)
     assert server2.process.poll() is None
 
 
-def test_fixed_rate_is_not_inflated(spawn, start_server):
+def test_fixed_rate_is_not_inflated(spawn, start_server, psk_file):
     """Characterization: --mbps 1 emits on the order of 1 Mbit/s, not ~8.8.
 
     The legacy pattern generator legitimately scales the commanded rate
@@ -91,13 +105,17 @@ def test_fixed_rate_is_not_inflated(spawn, start_server):
         lambda selected_port: [
             "--host", "127.0.0.1", "--port", str(selected_port),
             "--mbps", "1", "--stats-interval", "1",
+            "--psk-file", str(psk_file),
         ],
         "server",
     )
 
     client = spawn(
         CLIENT,
-        ["--server", "127.0.0.1", "--port", str(port), "--stats-interval", "1"],
+        [
+            "--server", "127.0.0.1", "--port", str(port),
+            "--stats-interval", "1", "--psk-file", str(psk_file),
+        ],
         "client",
     )
     assert wait_for(client, "Rx:", 10.0), read_log(client)
@@ -113,7 +131,7 @@ def test_fixed_rate_is_not_inflated(spawn, start_server):
     assert max(rates) <= 5.0, rates
 
 
-def test_floating_rate_stays_within_bounds(spawn, start_server):
+def test_floating_rate_stays_within_bounds(spawn, start_server, psk_file):
     """Characterization: the emitted server rate stays within a slack of [min,max].
 
     (The old realistic-pattern runner's boundary-coverage "quality" scoring is
@@ -122,12 +140,16 @@ def test_floating_rate_stays_within_bounds(spawn, start_server):
     """
     lo, hi = 2.0, 6.0
     server, port = start_server(
-        lambda selected_port: _server_args(selected_port, lo, hi), "server"
+        lambda selected_port: _server_args(selected_port, psk_file, lo, hi),
+        "server",
     )
 
     client = spawn(
         CLIENT,
-        ["--server", "127.0.0.1", "--port", str(port), "--stats-interval", "1"],
+        [
+            "--server", "127.0.0.1", "--port", str(port),
+            "--stats-interval", "1", "--psk-file", str(psk_file),
+        ],
         "client",
     )
     assert wait_for(client, "Rx:", 10.0), read_log(client)
@@ -141,3 +163,69 @@ def test_floating_rate_stays_within_bounds(spawn, start_server):
     assert min(rates) >= 0.0
     # Generous slack: this only guards against runaway rate, not shape quality.
     assert max(rates) <= hi * 1.75, rates
+
+
+def test_raw_probe_gets_only_bounded_challenge(start_server, psk_file):
+    server, port = start_server(
+        lambda selected_port: [
+            "--host", "127.0.0.1", "--port", str(selected_port),
+            "--mbps", "1", "--stats-interval", "1",
+            "--psk-file", str(psk_file),
+        ],
+        "probe-server",
+    )
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.bind(("127.0.0.1", 0))
+    probe.settimeout(0.5)
+    try:
+        probe.sendto(b"x", ("127.0.0.1", port))
+        with pytest.raises(socket.timeout):
+            probe.recvfrom(65535)
+
+        hello = encode_frame(
+            MessageType.HELLO,
+            b"p" * NONCE_SIZE,
+            ZERO_NONCE,
+            1,
+            TEST_PSK,
+        )
+        probe.sendto(hello, ("127.0.0.1", port))
+        challenge, source = probe.recvfrom(65535)
+        assert source == ("127.0.0.1", port)
+        assert len(challenge) <= len(hello) * 3
+        assert decode_frame(challenge, TEST_PSK).message_type is MessageType.CHALLENGE
+
+        with pytest.raises(socket.timeout):
+            probe.recvfrom(65535)
+        assert "New client connected" not in read_log(server)
+    finally:
+        probe.close()
+
+
+def test_wrong_psk_client_remains_unregistered(
+    spawn, start_server, psk_file, tmp_path
+):
+    server, port = start_server(
+        lambda selected_port: [
+            "--host", "127.0.0.1", "--port", str(selected_port),
+            "--mbps", "1", "--stats-interval", "1",
+            "--psk-file", str(psk_file),
+        ],
+        "wrong-key-server",
+    )
+    wrong_psk = tmp_path / "wrong.psk"
+    wrong_psk.write_bytes(b"w" * 32)
+    wrong_psk.chmod(0o600)
+    client = spawn(
+        CLIENT,
+        [
+            "--server", "127.0.0.1", "--port", str(port),
+            "--stats-interval", "1", "--psk-file", str(wrong_psk),
+        ],
+        "wrong-key-client",
+    )
+    assert wait_for(client, "Handshake HELLO sent", 5.0), read_log(client)
+    time.sleep(2)
+    assert "New client connected" not in read_log(server)
+    assert "Authenticated session accepted" not in read_log(client)
+    assert last_match(client, r"Rx:\s*([0-9.]+)\s*Mbps") == 0.0

@@ -5,6 +5,7 @@
 
 import random
 
+from conftest import TEST_PSK
 from traffic_masking_client import AdaptiveTrafficClient
 from traffic_masking_server import PacketGenerator
 
@@ -40,7 +41,9 @@ def test_generate_packet_guards_small_sizes():
 
 
 def test_client_response_payload_is_not_deterministic():
-    client = AdaptiveTrafficClient("127.0.0.1", 9)  # no socket opened in __init__
+    client = AdaptiveTrafficClient(
+        "127.0.0.1", 9, psk=TEST_PSK
+    )  # no socket opened in __init__
     p1 = client.generate_response_packet(600)
     p2 = client.generate_response_packet(600)
     # Header is [type 1][seq 4][ts 8] = 13 bytes; the payload after must differ.
@@ -48,7 +51,7 @@ def test_client_response_payload_is_not_deterministic():
 
 
 def test_client_response_does_not_mutate_global_rng():
-    client = AdaptiveTrafficClient("127.0.0.1", 9)
+    client = AdaptiveTrafficClient("127.0.0.1", 9, psk=TEST_PSK)
     original_state = random.getstate()
     try:
         random.seed(5678)
