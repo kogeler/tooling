@@ -153,7 +153,7 @@ class ProtocolMimicry:
 
     @staticmethod
     def file_transfer_session(target_mbps: float = 10.0) -> List[PatternStep]:
-        bps = max(0.5, target_mbps) * 1024 * 1024 / 8  # bytes/sec
+        bps = mbps_to_bytes_per_second(max(0.5, target_mbps))
         mtu_pay = random.randint(1100, 1400)
         interval = mtu_pay / bps
         steps: List[PatternStep] = []

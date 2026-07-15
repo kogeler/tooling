@@ -32,7 +32,7 @@ python traffic_masking_server.py --mbps 5
 python traffic_masking_server.py --min-mbps 2 --max-mbps 8
 
 # Client
-python traffic_masking_client.py --server <SERVER_IP> --response 0.3
+python traffic_masking_client.py --server <SERVER_IP>
 ```
 
 ### Advanced Mode
@@ -45,6 +45,7 @@ python traffic_masking_server.py \
   --header rtp --padding random
 
 # Client with matching configuration
+# A nonzero response is an explicit diagnostic/profile uplink choice.
 python traffic_masking_client.py \
   --server <SERVER_IP> --response 0.3 \
   --advanced --uplink-profile mixed
@@ -53,23 +54,25 @@ python traffic_masking_client.py \
 ## Testing
 
 ```bash
-# Run complete test suite (includes reconnection test)
-python test_traffic_masking.py
+# Run fast unit tests
+make test-fast
 
-# Quick 10-second test
-python test_traffic_masking.py --quick
+# Run bounded live process/network tests
+make test-live
 
-# Module tests only (no network transmission)
-python test_traffic_masking.py --modules-only
+# Run the complete pytest suite
+make test
 ```
 
 ## Key Parameters
 
-- `--mbps`: Fixed target rate in Mbps
-- `--min-mbps/--max-mbps`: Floating rate range (more realistic)
+- `--mbps`: Fixed target rate in decimal Mbps of application UDP payload
+- `--min-mbps/--max-mbps`: Floating range in the same decimal Mbps unit
 - `--advanced`: Enable ML-resistant features
 - `--profile`: Traffic pattern (web/video/voip/file/gaming/mixed)
-- `--response`: Client uplink ratio (0.0-1.0)
+- `--response`: Optional diagnostic/profile uplink setting (0.0-1.0, default
+  0.0). Nonzero values request additional uplink traffic; the current standalone
+  scheduler does not guarantee that exact ratio on the wire.
 - `--header`: Pseudo-headers (none/rtp/quic)
 - `--padding`: Padding strategy (none/random/fixed_buckets/progressive)
 - `--entropy`: Payload entropy (0.0-1.0)

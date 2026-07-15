@@ -10,6 +10,7 @@ Receives and generates reverse traffic to create a bidirectional, realistic stre
 """
 
 import argparse
+import math
 import os
 import random
 import socket
@@ -40,7 +41,7 @@ class AdaptiveTrafficClient:
         self,
         server_host,
         server_port,
-        response_ratio=0.3,
+        response_ratio=0.0,
         advanced=False,
         uplink_profile="mixed",
         header="none",
@@ -48,16 +49,30 @@ class AdaptiveTrafficClient:
         mtu=1200,
         entropy=1.0,
         stats_interval=5.0,
+        rng=None,
+        byte_source=None,
     ):
         # Validate configuration up front; fail fast on invalid inputs.
-        if not (0.0 <= float(response_ratio) <= 1.0):
+        try:
+            response_ratio = float(response_ratio)
+            entropy = float(entropy)
+            stats_interval = float(stats_interval)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "response, entropy, and stats-interval must be numbers"
+            ) from None
+        if not math.isfinite(response_ratio) or not 0.0 <= response_ratio <= 1.0:
             raise ValueError("response ratio must be in [0.0, 1.0]")
-        if not (0.0 <= float(entropy) <= 1.0):
+        if not math.isfinite(entropy) or not 0.0 <= entropy <= 1.0:
             raise ValueError("entropy must be in [0.0, 1.0]")
-        if int(mtu) <= 0:
+        try:
+            mtu = int(mtu)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("mtu must be a positive integer") from None
+        if mtu <= 0:
             raise ValueError("mtu must be positive")
-        if float(stats_interval) <= 0:
-            raise ValueError("stats-interval must be positive")
+        if not math.isfinite(stats_interval) or stats_interval <= 0:
+            raise ValueError("stats-interval must be a positive finite number")
 
         self.server_host = server_host
         self.server_port = server_port
@@ -77,14 +92,16 @@ class AdaptiveTrafficClient:
         self.received_rate = 0
         self.rate_window = []
         self.sequence = 0
-        self.stats_interval = float(stats_interval)
+        self._rng = rng or random.Random()
+        self._byte_source = byte_source or os.urandom
+        self.stats_interval = stats_interval
         # Advanced obfuscation settings
         self.advanced = bool(advanced)
         self.obf_cfg = ObfuscationConfig(
             padding_strategy=padding,
             header_mode=header,
-            mtu=int(mtu),
-            entropy=float(entropy),
+            mtu=mtu,
+            entropy=entropy,
             timing_jitter=0.002,
         )
         self.uplink_profile = parse_profile(uplink_profile)
@@ -179,11 +196,11 @@ class AdaptiveTrafficClient:
         """Generate uplink response packet"""
         if size is None:
             # Vary response size
-            size = random.choice(
+            size = self._rng.choice(
                 [
-                    random.randint(64, 200),  # Small ACK-like
-                    random.randint(200, 600),  # Medium
-                    random.randint(600, 1200),  # Large
+                    self._rng.randint(64, 200),  # Small ACK-like
+                    self._rng.randint(200, 600),  # Medium
+                    self._rng.randint(600, 1200),  # Large
                 ]
             )
 
@@ -198,7 +215,7 @@ class AdaptiveTrafficClient:
         data_size = max(0, size - header_size)
 
         # Bulk CSPRNG payload (no per-byte Python RNG in the hot path).
-        random_data = os.urandom(data_size)
+        random_data = self._byte_source(data_size)
 
         return packet_type + seq_bytes + timestamp + random_data
 

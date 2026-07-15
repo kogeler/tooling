@@ -3,17 +3,22 @@
 ## Quick Start
 
 ```bash
-# Test the system
-python test_traffic_masking.py --quick
+# Test the system without live process/network tests
+make test-fast
 
 # Basic server and client
 python traffic_masking_server.py --mbps 5
-python traffic_masking_client.py --server 127.0.0.1 --response 0.3
+python traffic_masking_client.py --server 127.0.0.1
 
 # Floating rate (recommended)
 python traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced
 python traffic_masking_client.py --server 127.0.0.1 --response 0.3 --advanced
 ```
+
+Mbps values are decimal Mbit/s of application UDP payload. The client defaults
+to no scheduled uplink (`--response 0.0`). A nonzero response is an explicit
+diagnostic/profile choice; the current standalone scheduler does not guarantee
+that exact ratio on the wire.
 
 ## Use Cases
 

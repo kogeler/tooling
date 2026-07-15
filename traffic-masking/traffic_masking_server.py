@@ -11,8 +11,10 @@ Creates a variable, realistic-looking stream to mask media traffic patterns from
 
 import argparse
 import hashlib
+import math
 import os
 import random
+import signal
 import socket
 import struct
 import threading
@@ -27,7 +29,12 @@ from masking_lib import (
 )
 
 
-def _budget_bytes(rate_bytes_per_second, elapsed, max_tick=0.5):
+_MAX_PACING_TICK_SECONDS = 0.1
+
+
+def _budget_bytes(
+    rate_bytes_per_second, elapsed, max_tick=_MAX_PACING_TICK_SECONDS
+):
     """Bytes allowed to send over ``elapsed`` seconds at the given byte rate.
 
     ``elapsed`` is clamped to ``max_tick`` so an idle gap (no clients) cannot
@@ -36,6 +43,58 @@ def _budget_bytes(rate_bytes_per_second, elapsed, max_tick=0.5):
     if rate_bytes_per_second <= 0 or elapsed <= 0:
         return 0
     return int(rate_bytes_per_second * min(elapsed, max_tick))
+
+
+class _RateBudget:
+    """Monotonic byte-credit accumulator for the legacy pacing loop."""
+
+    def __init__(self, clock=None, max_tick=_MAX_PACING_TICK_SECONDS):
+        if max_tick <= 0:
+            raise ValueError("max_tick must be positive")
+        self._clock = clock or time.monotonic
+        self._max_tick = max_tick
+        self._last_time = self._clock()
+        self._credit = 0.0
+
+    @property
+    def available(self):
+        return max(0, int(self._credit))
+
+    def reset(self):
+        self._last_time = self._clock()
+        self._credit = 0.0
+
+    def accrue(self, rate_bytes_per_second):
+        now = self._clock()
+        elapsed = max(0.0, now - self._last_time)
+        self._last_time = now
+        if rate_bytes_per_second > 0:
+            self._credit += rate_bytes_per_second * min(elapsed, self._max_tick)
+        return self.available
+
+    def consume(self, byte_count):
+        if byte_count > 0:
+            self._credit -= byte_count
+
+
+def _positive_finite_float(value, name):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number") from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return value
+
+
+def _unit_interval_float(value, name):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number") from None
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be in [0.0, 1.0]")
+    return value
 
 
 class TrafficPattern:
@@ -107,10 +166,12 @@ class TrafficPattern:
 class PacketGenerator:
     """Packet generator with variable sizes and pseudo-random payload characteristics"""
 
-    def __init__(self, min_size=64, max_size=1400):
+    def __init__(self, min_size=64, max_size=1400, rng=None, byte_source=None):
         self.min_size = min_size
         self.max_size = max_size
         self.sequence = 0
+        self._rng = rng or random.Random()
+        self._byte_source = byte_source or os.urandom
 
     def generate_packet(self, target_size=None):
         """Generate a data packet"""
@@ -118,13 +179,13 @@ class PacketGenerator:
             # Packet size distribution (simulate realistic traffic)
             weights = [0.1, 0.15, 0.5, 0.15, 0.1]  # Favor medium packets
             sizes = [
-                random.randint(self.min_size, 200),  # Small
-                random.randint(200, 500),  # Small-medium
-                random.randint(500, 1000),  # Medium
-                random.randint(1000, 1300),  # Medium-large
-                random.randint(1300, self.max_size),  # Large
+                self._rng.randint(self.min_size, 200),  # Small
+                self._rng.randint(200, 500),  # Small-medium
+                self._rng.randint(500, 1000),  # Medium
+                self._rng.randint(1000, 1300),  # Medium-large
+                self._rng.randint(1300, self.max_size),  # Large
             ]
-            size = random.choices(sizes, weights=weights)[0]
+            size = self._rng.choices(sizes, weights=weights)[0]
         else:
             size = min(max(target_size, self.min_size), self.max_size)
 
@@ -137,7 +198,7 @@ class PacketGenerator:
         # in the hot path: it made same-size payloads identical within a window
         # and corrupted the shared random stream used by other threads.
         data_size = max(0, size - 28)  # 4 + 8 + 16 = 28 bytes header
-        random_data = os.urandom(data_size)
+        random_data = self._byte_source(data_size)
 
         # Calculate checksum
         packet_content = seq_bytes + timestamp + random_data
@@ -169,18 +230,25 @@ class MaskingTrafficServer:
         if (min_mbps is None) != (max_mbps is None):
             raise ValueError("min-mbps and max-mbps must be given together")
         if floating:
-            if min_mbps <= 0 or max_mbps <= 0:
-                raise ValueError("min-mbps and max-mbps must be positive")
+            min_mbps = _positive_finite_float(min_mbps, "min-mbps")
+            max_mbps = _positive_finite_float(max_mbps, "max-mbps")
             if min_mbps >= max_mbps:
                 raise ValueError("min-mbps must be less than max-mbps")
-        elif target_mbps is None or target_mbps <= 0:
-            raise ValueError("target rate (--mbps) must be positive")
-        if int(mtu) <= 0:
+            target_mbps = None
+        else:
+            target_mbps = _positive_finite_float(
+                target_mbps, "target rate (--mbps)"
+            )
+        try:
+            mtu = int(mtu)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("mtu must be a positive integer") from None
+        if mtu <= 0:
             raise ValueError("mtu must be positive")
-        if not (0.0 <= float(entropy) <= 1.0):
-            raise ValueError("entropy must be in [0.0, 1.0]")
-        if float(stats_interval) <= 0:
-            raise ValueError("stats-interval must be positive")
+        entropy = _unit_interval_float(entropy, "entropy")
+        stats_interval = _positive_finite_float(
+            stats_interval, "stats-interval"
+        )
 
         self.host = host
         self.port = port
@@ -199,7 +267,7 @@ class MaskingTrafficServer:
         self.packet_gen = PacketGenerator()
         self.stats = {"bytes_sent": 0, "packets_sent": 0, "start_time": time.time()}
         self.last_stats = {"bytes_sent": 0, "packets_sent": 0, "time": time.time()}
-        self.stats_interval = float(stats_interval)
+        self.stats_interval = stats_interval
         # Advanced masking options
         self.advanced = bool(advanced)
         # Normalize profile to TrafficProfile
@@ -213,8 +281,8 @@ class MaskingTrafficServer:
             self.profile = TrafficProfile.MIXED
         self.header_mode = header
         self.padding_strategy = padding
-        self.mtu = int(mtu)
-        self.entropy = float(entropy)
+        self.mtu = mtu
+        self.entropy = entropy
         self.obfuscator = None
         self.generator = None
 
@@ -296,8 +364,7 @@ class MaskingTrafficServer:
         """Send cover traffic to clients"""
         # Pacing uses the monotonic clock: wall-clock steps (NTP) must not
         # produce negative or inflated byte budgets.
-        last_send_time = time.monotonic()
-        bytes_accumulator = 0
+        rate_budget = _RateBudget()
 
         # Rate control for advanced mode
         rate_window_bytes = 0
@@ -308,8 +375,7 @@ class MaskingTrafficServer:
                 time.sleep(0.1)
                 # No clients: reset pacing so idle time is not billed as a burst
                 # to the next client that connects.
-                last_send_time = time.monotonic()
-                bytes_accumulator = 0
+                rate_budget.reset()
                 continue
 
             # Advanced generator-driven mode with proper rate limiting
@@ -359,24 +425,21 @@ class MaskingTrafficServer:
                 continue
 
             # Legacy accumulator mode (default)
-            current_time = time.monotonic()
-            elapsed = current_time - last_send_time
-
             # Current target rate in bytes/s (the pattern scales the byte budget).
             current_rate_bps = self.pattern_gen.get_current_rate(
                 self.target_bytes_per_second
             )
 
-            # Bytes allowed for this interval; an idle gap is capped to one tick.
-            bytes_accumulator += _budget_bytes(current_rate_bps, elapsed)
+            # Bytes allowed for this interval; elapsed time is capped to one tick.
+            bytes_available = rate_budget.accrue(current_rate_bps)
 
             # Send packets in batches for efficiency
             packets_sent_this_round = 0
             while (
-                bytes_accumulator > 0 and self.clients and packets_sent_this_round < 50
+                bytes_available > 0 and self.clients and packets_sent_this_round < 50
             ):
                 # Generate larger packets for better throughput
-                packet_size = min(bytes_accumulator, random.randint(1000, 1400))
+                packet_size = min(bytes_available, random.randint(1000, 1400))
                 packet = self.packet_gen.generate_packet(packet_size)
 
                 # Send to all active clients
@@ -388,17 +451,16 @@ class MaskingTrafficServer:
                     except Exception as e:
                         print(f"[!] Send error to client {addr}: {e}")
 
-                bytes_accumulator -= len(packet)
+                rate_budget.consume(len(packet))
+                bytes_available = rate_budget.available
                 packets_sent_this_round += 1
 
                 # Minimal sleep between packets in batch
                 if packets_sent_this_round % 10 == 0:
                     time.sleep(0.0001)
 
-            last_send_time = current_time
-
             # Adaptive pacing based on accumulator
-            if bytes_accumulator > current_rate_bps * 0.1:
+            if rate_budget.available > current_rate_bps * 0.1:
                 # Behind schedule, don't sleep
                 pass
             else:
@@ -543,11 +605,18 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
+    shutdown_requested = threading.Event()
+
+    def request_shutdown(_signum, _frame):
+        shutdown_requested.set()
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
+
     try:
         server.start()
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
+        shutdown_requested.wait()
+    finally:
         print("\n[*] Stopping server...", flush=True)
         server.stop()
 

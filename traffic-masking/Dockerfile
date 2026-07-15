@@ -43,4 +43,4 @@ EXPOSE 8888/udp
 ENTRYPOINT ["python"]
 
 # Default command shows usage
-CMD ["-c", "print('Usage:\\n  Server: python traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced\\n  Client: python traffic_masking_client.py --server <IP> --response 0.3 --advanced')"]
+CMD ["-c", "print('Usage:\\n  Server: python traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced\\n  Client: python traffic_masking_client.py --server <IP> --advanced')"]

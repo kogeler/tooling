@@ -20,12 +20,16 @@ def test_server_payload_is_not_deterministic():
 
 def test_generate_packet_does_not_mutate_global_rng():
     gen = PacketGenerator()
-    random.seed(1234)
-    before = random.random()
-    random.seed(1234)
-    gen.generate_packet(600)
-    after = random.random()
-    assert before == after
+    original_state = random.getstate()
+    try:
+        random.seed(1234)
+        before = random.random()
+        random.seed(1234)
+        gen.generate_packet()
+        after = random.random()
+        assert before == after
+    finally:
+        random.setstate(original_state)
 
 
 def test_generate_packet_guards_small_sizes():
@@ -41,3 +45,17 @@ def test_client_response_payload_is_not_deterministic():
     p2 = client.generate_response_packet(600)
     # Header is [type 1][seq 4][ts 8] = 13 bytes; the payload after must differ.
     assert p1[13:] != p2[13:]
+
+
+def test_client_response_does_not_mutate_global_rng():
+    client = AdaptiveTrafficClient("127.0.0.1", 9)
+    original_state = random.getstate()
+    try:
+        random.seed(5678)
+        before = random.random()
+        random.seed(5678)
+        client.generate_response_packet()
+        after = random.random()
+        assert before == after
+    finally:
+        random.setstate(original_state)
