@@ -11,6 +11,7 @@ Creates a variable, realistic-looking stream to mask media traffic patterns from
 
 import argparse
 import hashlib
+import os
 import random
 import socket
 import struct
@@ -18,7 +19,23 @@ import threading
 import time
 
 import numpy as np
-from masking_lib import DynamicObfuscator, TrafficProfile, stream_generator
+from masking_lib import (
+    DynamicObfuscator,
+    TrafficProfile,
+    mbps_to_bytes_per_second,
+    stream_generator,
+)
+
+
+def _budget_bytes(rate_bytes_per_second, elapsed, max_tick=0.5):
+    """Bytes allowed to send over ``elapsed`` seconds at the given byte rate.
+
+    ``elapsed`` is clamped to ``max_tick`` so an idle gap (no clients) cannot
+    accumulate a burst of credit that floods the next client to connect.
+    """
+    if rate_bytes_per_second <= 0 or elapsed <= 0:
+        return 0
+    return int(rate_bytes_per_second * min(elapsed, max_tick))
 
 
 class TrafficPattern:
@@ -116,12 +133,11 @@ class PacketGenerator:
         timestamp = struct.pack("!Q", int(time.time() * 1000000))  # microseconds
         seq_bytes = struct.pack("!I", self.sequence)
 
-        # Pseudo-random payload with a time-based pattern
-        pattern_seed = int(time.time() / 10)  # changes every 10 seconds
-        random.seed(pattern_seed)
-        data_size = size - 28  # 4 + 8 + 16 = 28 bytes header
-        random_data = bytes([random.randint(0, 255) for _ in range(data_size)])
-        random.seed()  # reset seed
+        # Random payload from a bulk CSPRNG source. Never reseed the global RNG
+        # in the hot path: it made same-size payloads identical within a window
+        # and corrupted the shared random stream used by other threads.
+        data_size = max(0, size - 28)  # 4 + 8 + 16 = 28 bytes header
+        random_data = os.urandom(data_size)
 
         # Calculate checksum
         packet_content = seq_bytes + timestamp + random_data
@@ -148,16 +164,34 @@ class MaskingTrafficServer:
         entropy=1.0,
         stats_interval=5.0,
     ):
+        # Validate configuration up front; fail fast on invalid rates/ranges.
+        floating = min_mbps is not None and max_mbps is not None
+        if (min_mbps is None) != (max_mbps is None):
+            raise ValueError("min-mbps and max-mbps must be given together")
+        if floating:
+            if min_mbps <= 0 or max_mbps <= 0:
+                raise ValueError("min-mbps and max-mbps must be positive")
+            if min_mbps >= max_mbps:
+                raise ValueError("min-mbps must be less than max-mbps")
+        elif target_mbps is None or target_mbps <= 0:
+            raise ValueError("target rate (--mbps) must be positive")
+        if int(mtu) <= 0:
+            raise ValueError("mtu must be positive")
+        if not (0.0 <= float(entropy) <= 1.0):
+            raise ValueError("entropy must be in [0.0, 1.0]")
+        if float(stats_interval) <= 0:
+            raise ValueError("stats-interval must be positive")
+
         self.host = host
         self.port = port
         self.target_mbps = target_mbps
         self.min_mbps = min_mbps
         self.max_mbps = max_mbps
-        # Use floating rate if min/max specified, otherwise use target
-        if min_mbps is not None and max_mbps is not None:
-            self.target_bps = ((min_mbps + max_mbps) / 2) * 1024 * 1024
+        # Rate is decimal Mbps of application bytes; store the target in bytes/s.
+        if floating:
+            self.target_bytes_per_second = mbps_to_bytes_per_second((min_mbps + max_mbps) / 2)
         else:
-            self.target_bps = target_mbps * 1024 * 1024
+            self.target_bytes_per_second = mbps_to_bytes_per_second(target_mbps)
         self.socket = None
         self.clients = {}  # {address: {'last_seen': timestamp, 'stats': {...}}}
         self.running = False
@@ -260,7 +294,9 @@ class MaskingTrafficServer:
 
     def send_loop(self):
         """Send cover traffic to clients"""
-        last_send_time = time.time()
+        # Pacing uses the monotonic clock: wall-clock steps (NTP) must not
+        # produce negative or inflated byte budgets.
+        last_send_time = time.monotonic()
         bytes_accumulator = 0
 
         # Rate control for advanced mode
@@ -270,6 +306,10 @@ class MaskingTrafficServer:
         while self.running:
             if not self.clients:
                 time.sleep(0.1)
+                # No clients: reset pacing so idle time is not billed as a burst
+                # to the next client that connects.
+                last_send_time = time.monotonic()
+                bytes_accumulator = 0
                 continue
 
             # Advanced generator-driven mode with proper rate limiting
@@ -319,15 +359,16 @@ class MaskingTrafficServer:
                 continue
 
             # Legacy accumulator mode (default)
-            current_time = time.time()
+            current_time = time.monotonic()
             elapsed = current_time - last_send_time
 
-            # Get current target bitrate
-            current_rate_bps = self.pattern_gen.get_current_rate(self.target_bps)
+            # Current target rate in bytes/s (the pattern scales the byte budget).
+            current_rate_bps = self.pattern_gen.get_current_rate(
+                self.target_bytes_per_second
+            )
 
-            # Compute target bytes to send (with buffer for smoother rate)
-            target_bytes = int(current_rate_bps * elapsed * 1.1)  # 10% buffer
-            bytes_accumulator += target_bytes
+            # Bytes allowed for this interval; an idle gap is capped to one tick.
+            bytes_accumulator += _budget_bytes(current_rate_bps, elapsed)
 
             # Send packets in batches for efficiency
             packets_sent_this_round = 0
@@ -392,8 +433,8 @@ class MaskingTrafficServer:
             packets_delta = self.stats["packets_sent"] - self.last_stats["packets_sent"]
 
             if time_delta > 0:
-                # Instantaneous rate (not cumulative average)
-                mbps = (bytes_delta * 8) / (time_delta * 1024 * 1024)
+                # Instantaneous rate (not cumulative average), decimal Mbps
+                mbps = (bytes_delta * 8) / (time_delta * 1_000_000)
                 pps = packets_delta / time_delta
 
                 pattern_desc = (
@@ -484,20 +525,23 @@ def main():
 
     args = parser.parse_args()
 
-    server = MaskingTrafficServer(
-        args.host,
-        args.port,
-        args.mbps,
-        min_mbps=args.min_mbps,
-        max_mbps=args.max_mbps,
-        advanced=args.advanced,
-        profile=args.profile,
-        header=args.header,
-        padding=args.padding,
-        mtu=args.mtu,
-        entropy=args.entropy,
-        stats_interval=args.stats_interval,
-    )
+    try:
+        server = MaskingTrafficServer(
+            args.host,
+            args.port,
+            args.mbps,
+            min_mbps=args.min_mbps,
+            max_mbps=args.max_mbps,
+            advanced=args.advanced,
+            profile=args.profile,
+            header=args.header,
+            padding=args.padding,
+            mtu=args.mtu,
+            entropy=args.entropy,
+            stats_interval=args.stats_interval,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     try:
         server.start()

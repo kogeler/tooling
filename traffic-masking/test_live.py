@@ -84,6 +84,37 @@ def test_reconnection_after_server_restart(spawn):
     assert wait_for(clog, "Reconnected successfully", 25.0), read_log(clog)
 
 
+def test_fixed_rate_is_not_inflated(spawn):
+    """Characterization: --mbps 1 emits on the order of 1 Mbit/s, not ~8.8.
+
+    The legacy pattern generator legitimately scales the commanded rate
+    (bursts up to 4x for single windows), so this only pins the gross unit
+    error: the old bits-as-bytes budget inflated the average ~8.8x.
+    """
+    port = free_udp_port()
+    _server, slog = spawn(
+        SERVER,
+        ["--host", "127.0.0.1", "--port", str(port), "--mbps", "1",
+         "--stats-interval", "1"],
+        "server",
+    )
+    assert wait_for(slog, "started", 5.0), read_log(slog)
+
+    _client, clog = spawn(
+        CLIENT,
+        ["--server", "127.0.0.1", "--port", str(port), "--stats-interval", "1"],
+        "client",
+    )
+    assert wait_for(clog, "Rx:", 10.0), read_log(clog)
+
+    time.sleep(6)
+    rates = [float(m) for m in re.findall(r"Rate:\s*([0-9.]+)\s*Mbps", read_log(slog))]
+    assert rates, read_log(slog)
+    mean_rate = sum(rates) / len(rates)
+    assert 0.1 <= mean_rate <= 3.0, rates
+    assert max(rates) <= 5.0, rates
+
+
 def test_floating_rate_stays_within_bounds(spawn):
     """Characterization: the emitted server rate stays within a slack of [min,max].
 

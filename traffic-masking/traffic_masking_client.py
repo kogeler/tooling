@@ -10,6 +10,7 @@ Receives and generates reverse traffic to create a bidirectional, realistic stre
 """
 
 import argparse
+import os
 import random
 import socket
 import struct
@@ -21,6 +22,7 @@ from masking_lib import (
     ObfuscationConfig,
     build_obfuscator,
     init_udp_socket,
+    mbps_to_bytes_per_second,
     parse_profile,
     send_fragments,
 )
@@ -47,6 +49,16 @@ class AdaptiveTrafficClient:
         entropy=1.0,
         stats_interval=5.0,
     ):
+        # Validate configuration up front; fail fast on invalid inputs.
+        if not (0.0 <= float(response_ratio) <= 1.0):
+            raise ValueError("response ratio must be in [0.0, 1.0]")
+        if not (0.0 <= float(entropy) <= 1.0):
+            raise ValueError("entropy must be in [0.0, 1.0]")
+        if int(mtu) <= 0:
+            raise ValueError("mtu must be positive")
+        if float(stats_interval) <= 0:
+            raise ValueError("stats-interval must be positive")
+
         self.server_host = server_host
         self.server_port = server_port
         self.server_addr = (server_host, server_port)
@@ -185,8 +197,8 @@ class AdaptiveTrafficClient:
         header_size = 1 + 4 + 8
         data_size = max(0, size - header_size)
 
-        # Generate data with entropy
-        random_data = bytes([random.randint(0, 255) for _ in range(data_size)])
+        # Bulk CSPRNG payload (no per-byte Python RNG in the hot path).
+        random_data = os.urandom(data_size)
 
         return packet_type + seq_bytes + timestamp + random_data
 
@@ -232,7 +244,7 @@ class AdaptiveTrafficClient:
                 window_bytes += len(data)
                 current_time = time.time()
                 if current_time - window_start >= 1.0:  # 1 second window
-                    self.received_rate = window_bytes * 8 / 1024 / 1024  # Mbps
+                    self.received_rate = window_bytes * 8 / 1_000_000  # decimal Mbps
                     self.rate_window.append(self.received_rate)
                     if len(self.rate_window) > 10:
                         self.rate_window.pop(0)
@@ -285,8 +297,8 @@ class AdaptiveTrafficClient:
             # Adaptive generation based on received traffic
             if self.received_rate > 0:
                 # Send percentage of received rate
-                target_send_rate = (
-                    self.received_rate * self.response_ratio * 1024 * 1024 / 8
+                target_send_rate = mbps_to_bytes_per_second(
+                    self.received_rate * self.response_ratio
                 )  # bytes/sec
 
                 # Add random bursts
@@ -311,8 +323,8 @@ class AdaptiveTrafficClient:
             time.sleep(self.stats_interval)
             elapsed = time.time() - self.stats["start_time"]
             if elapsed > 0:
-                recv_mbps = (self.stats["bytes_received"] * 8) / (elapsed * 1024 * 1024)
-                send_mbps = (self.stats["bytes_sent"] * 8) / (elapsed * 1024 * 1024)
+                recv_mbps = (self.stats["bytes_received"] * 8) / (elapsed * 1_000_000)
+                send_mbps = (self.stats["bytes_sent"] * 8) / (elapsed * 1_000_000)
                 recv_pps = self.stats["packets_received"] / elapsed
                 send_pps = self.stats["packets_sent"] / elapsed
 
@@ -339,7 +351,11 @@ def main():
     parser.add_argument("--server", required=True, help="Server IP address")
     parser.add_argument("--port", type=int, default=8888, help="Server UDP port")
     parser.add_argument(
-        "--response", type=float, default=0.3, help="Uplink response ratio (0.0-1.0)"
+        "--response",
+        type=float,
+        default=0.0,
+        help="Uplink response ratio (0.0-1.0); default 0.0 keeps the flow "
+        "download-dominant. Non-zero uplink is an explicit choice.",
     )
     parser.add_argument(
         "--advanced",
@@ -382,18 +398,21 @@ def main():
 
     args = parser.parse_args()
 
-    client = AdaptiveTrafficClient(
-        args.server,
-        args.port,
-        args.response,
-        advanced=args.advanced,
-        uplink_profile=args.uplink_profile,
-        header=args.header,
-        padding=args.padding,
-        mtu=args.mtu,
-        entropy=args.entropy,
-        stats_interval=args.stats_interval,
-    )
+    try:
+        client = AdaptiveTrafficClient(
+            args.server,
+            args.port,
+            args.response,
+            advanced=args.advanced,
+            uplink_profile=args.uplink_profile,
+            header=args.header,
+            padding=args.padding,
+            mtu=args.mtu,
+            entropy=args.entropy,
+            stats_interval=args.stats_interval,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     try:
         client.connect()

@@ -57,7 +57,17 @@ __all__ = [
     "build_obfuscator",
     "init_udp_socket",
     "send_fragments",
+    "mbps_to_bytes_per_second",
 ]
+
+# Bit-rate unit is decimal megabits/s (10^6 bit/s) of application payload bytes,
+# used consistently across configuration, pacing and metrics.
+_BITS_PER_MEGABIT = 1_000_000
+
+
+def mbps_to_bytes_per_second(mbps: float) -> float:
+    """Convert a decimal-Mbps rate to application bytes per second."""
+    return float(mbps) * _BITS_PER_MEGABIT / 8
 
 
 class TrafficProfile(Enum):
@@ -640,8 +650,8 @@ def stream_generator(
             rate_limit_mbps = None
 
         if rate_limit_mbps and rate_limit_mbps > 0:
-            # Target bytes per second for desired rate
-            target_bytes_per_second = rate_limit_mbps * 1024 * 1024 / 8
+            # Target bytes per second for desired rate (decimal Mbps)
+            target_bytes_per_second = mbps_to_bytes_per_second(rate_limit_mbps)
 
             # Simple and direct delay calculation for better rate achievement
             if target_bytes_per_second > 0 and packet_bytes > 0:
