@@ -43,20 +43,19 @@ from control_protocol import (
 from masking_lib import (
     ObfuscationConfig,
     Packetizer,
+    RatioBudget,
     build_obfuscator,
     init_udp_socket,
-    mbps_to_bytes_per_second,
     parse_profile,
 )
 
 
+def _env_default(name, fallback):
+    return os.environ.get(name, fallback)
+
+
 class AdaptiveTrafficClient:
     """Adaptive traffic masking client"""
-
-    KEEPALIVE_INTERVAL = 5.0  # Send keepalive every 5 seconds
-    RECEIVE_TIMEOUT = 10.0  # Consider connection lost after 10s without data
-    RECONNECT_DELAY_MIN = 1.0
-    RECONNECT_DELAY_MAX = 30.0
 
     def __init__(
         self,
@@ -75,6 +74,12 @@ class AdaptiveTrafficClient:
         psk=None,
         insecure_diagnostic=False,
         keepalive_jitter=0.2,
+        keepalive_interval=5.0,
+        receive_timeout=10.0,
+        reconnect_delay_min=1.0,
+        reconnect_delay_max=30.0,
+        monotonic_clock=None,
+        sleep=None,
     ):
         # Validate configuration up front; fail fast on invalid inputs.
         try:
@@ -118,6 +123,32 @@ class AdaptiveTrafficClient:
             raise ValueError("keepalive jitter must be a number") from None
         if not math.isfinite(keepalive_jitter) or not 0.0 <= keepalive_jitter < 1.0:
             raise ValueError("keepalive jitter must be in [0.0, 1.0)")
+        timing_values = {
+            "keepalive-interval": keepalive_interval,
+            "receive-timeout": receive_timeout,
+            "reconnect-delay-min": reconnect_delay_min,
+            "reconnect-delay-max": reconnect_delay_max,
+        }
+        for name, value in timing_values.items():
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{name} must be a positive finite number") from None
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a positive finite number")
+            timing_values[name] = value
+        keepalive_interval = timing_values["keepalive-interval"]
+        receive_timeout = timing_values["receive-timeout"]
+        reconnect_delay_min = timing_values["reconnect-delay-min"]
+        reconnect_delay_max = timing_values["reconnect-delay-max"]
+        if reconnect_delay_min > reconnect_delay_max:
+            raise ValueError(
+                "reconnect-delay-min must not exceed reconnect-delay-max"
+            )
+        if receive_timeout <= keepalive_interval * (1.0 + keepalive_jitter):
+            raise ValueError(
+                "receive-timeout must exceed the maximum jittered keepalive interval"
+            )
         if psk is not None and insecure_diagnostic:
             raise ValueError("psk and insecure diagnostic mode are mutually exclusive")
         if psk is None and not insecure_diagnostic:
@@ -142,21 +173,29 @@ class AdaptiveTrafficClient:
         self.running = False
         self.connected = False
         self.last_received = 0.0
+        self._monotonic_clock = monotonic_clock or time.monotonic
+        self._sleep = sleep or time.sleep
         self.stats = {
             "bytes_received": 0,
             "bytes_sent": 0,
             "packets_received": 0,
             "packets_sent": 0,
-            "start_time": time.time(),
+            "start_time": self._monotonic_clock(),
         }
         self.received_rate = 0
         self.rate_window = []
+        self._rate_window_started = self._monotonic_clock()
+        self._rate_window_bytes = 0
         self.sequence = 0
         self._rng = rng or random.Random()
         self._byte_source = byte_source or os.urandom
         self.base_key = psk if psk is not None else INSECURE_DIAGNOSTIC_KEY
         self.insecure_diagnostic = bool(insecure_diagnostic)
         self.keepalive_jitter = keepalive_jitter
+        self.keepalive_interval = keepalive_interval
+        self.receive_timeout = receive_timeout
+        self.reconnect_delay_min = reconnect_delay_min
+        self.reconnect_delay_max = reconnect_delay_max
         self.mtu = mtu
         self.packetizer = Packetizer(mtu, FRAME_OVERHEAD)
         self.data_payload_ceiling = self.packetizer.payload_ceiling
@@ -172,6 +211,7 @@ class AdaptiveTrafficClient:
         self.control_receive_sequence = -1
         self.handshake_accepted = False
         self.stats_interval = stats_interval
+        self.uplink_budget = RatioBudget(response_ratio)
         # Advanced obfuscation settings
         self.advanced = bool(advanced)
         self.obf_cfg = ObfuscationConfig(
@@ -222,6 +262,9 @@ class AdaptiveTrafficClient:
         self.control_receive_sequence = -1
         self.handshake_accepted = False
         self.connected = False
+        self.uplink_budget = RatioBudget(self.response_ratio)
+        self._rate_window_started = self._monotonic_clock()
+        self._rate_window_bytes = 0
 
     def _control_padding(self):
         return make_padding(
@@ -339,16 +382,18 @@ class AdaptiveTrafficClient:
         self.control_receive_sequence = frame.sequence
         return frame.payload
 
-    def _send_session_message(self, message_type, payload=b""):
+    def _send_session_message(
+        self, message_type, payload=b"", allow_budget_debt=False
+    ):
         if not self.handshake_accepted or self.session_send_key is None:
-            return False
+            return 0
         with self._send_lock:
-            self.control_send_sequence += 1
+            next_sequence = self.control_send_sequence + 1
             datagram = encode_frame(
                 message_type,
                 self.client_nonce,
                 self.session_nonce,
-                self.control_send_sequence,
+                next_sequence,
                 self.session_send_key,
                 payload=payload,
                 padding=(
@@ -357,48 +402,54 @@ class AdaptiveTrafficClient:
                     else b""
                 ),
             )
+            if not self.uplink_budget.allows(
+                len(datagram), allow_debt=allow_budget_debt
+            ):
+                return 0
+            self.control_send_sequence = next_sequence
             try:
                 sent = self.socket.sendto(datagram, self.server_addr)
             except OSError as exc:
                 print(f"[!] Send error: {exc}", flush=True)
-                return False
+                return 0
             if sent != len(datagram):
-                return False
+                return 0
             self.stats["bytes_sent"] += sent
             self.stats["packets_sent"] += 1
-            return True
+            self.uplink_budget.record_uplink(sent)
+            return sent
 
     def _next_keepalive_delay(self):
         factor = 1.0 + self._rng.uniform(
             -self.keepalive_jitter, self.keepalive_jitter
         )
-        return self.KEEPALIVE_INTERVAL * factor
+        return self.keepalive_interval * factor
 
     def _wait_for_server(self, timeout=5.0):
         """Wait for actual data from the server to confirm connection"""
-        deadline = time.time() + timeout
-        while time.time() < deadline and self.running:
+        deadline = self._monotonic_clock() + timeout
+        while self._monotonic_clock() < deadline and self.running:
             if self.connected:
                 return True
-            time.sleep(0.2)
+            self._sleep(min(0.2, timeout))
         return self.connected
 
     def _reconnect(self):
         """Reconnect to the server with exponential backoff"""
-        delay = self.RECONNECT_DELAY_MIN
+        delay = self.reconnect_delay_min
         while self.running:
             print(
                 f"[*] Attempting reconnect in {delay:.1f}s...",
                 flush=True,
             )
-            time.sleep(delay)
+            self._sleep(delay)
             if not self.running:
                 break
             try:
                 self._create_socket()
                 self._send_registration()
                 # Wait for actual server response to confirm connection
-                if self._wait_for_server(timeout=delay + 2.0):
+                if self._wait_for_server(timeout=self.receive_timeout):
                     print("[*] Reconnected successfully", flush=True)
                     self.received_rate = 0
                     self.rate_window.clear()
@@ -407,7 +458,7 @@ class AdaptiveTrafficClient:
                     print("[!] No response from server", flush=True)
             except Exception as e:
                 print(f"[!] Reconnect failed: {e}", flush=True)
-            delay = min(delay * 2, self.RECONNECT_DELAY_MAX)
+            delay = min(delay * 2, self.reconnect_delay_max)
 
     def connect(self):
         """Connect to the server"""
@@ -433,7 +484,7 @@ class AdaptiveTrafficClient:
 
         # Send initial registration packet
         self._send_registration()
-        self.last_received = time.time()  # Grace period for initial connection
+        self.last_received = self._monotonic_clock()
 
         # Start threads
         threading.Thread(target=self.receive_loop, daemon=True).start()
@@ -470,21 +521,23 @@ class AdaptiveTrafficClient:
 
     def send_packet(self, packet):
         """Send packet to the server"""
+        sent_bytes = 0
         try:
             if self.advanced and self.obfuscator is not None:
                 packet = self.obfuscator.transform(
                     packet, profile=self.uplink_profile
                 )
             for fragment in self.packetizer.packetize(packet):
-                self._send_session_message(MessageType.DATA, fragment)
+                sent = self._send_session_message(MessageType.DATA, fragment)
+                if not sent:
+                    break
+                sent_bytes += sent
         except Exception as e:
             print(f"[!] Send error: {e}", flush=True)
+        return sent_bytes
 
     def receive_loop(self):
         """Receive packets from the server"""
-        window_start = time.time()
-        window_bytes = 0
-
         while self.running:
             try:
                 data, addr = self.socket.recvfrom(MAX_DATAGRAM_SIZE)
@@ -493,45 +546,46 @@ class AdaptiveTrafficClient:
                 if payload is None:
                     continue
 
-                self.last_received = time.time()
-                self.connected = True
-                self.stats["bytes_received"] += len(data)
-                self.stats["packets_received"] += 1
-
-                # Calculate receive rate
-                window_bytes += len(data)
-                current_time = time.time()
-                if current_time - window_start >= 1.0:  # 1 second window
-                    self.received_rate = window_bytes * 8 / 1_000_000  # decimal Mbps
-                    self.rate_window.append(self.received_rate)
-                    if len(self.rate_window) > 10:
-                        self.rate_window.pop(0)
-                    window_start = current_time
-                    window_bytes = 0
-
-                # Occasionally send echo to simulate interactivity
-                if random.random() < 0.01:  # 1% probability
-                    echo_packet = self.generate_response_packet(len(payload) // 4)
-                    self.send_packet(echo_packet)
+                self._record_received_data(len(data))
 
             except socket.timeout:
                 continue
             except Exception as e:
                 if self.running:
                     print(f"[!] Receive error: {e}", flush=True)
-                    time.sleep(0.1)
+                    self._sleep(0.1)
+
+    def _record_received_data(self, byte_count):
+        now = self._monotonic_clock()
+        self.last_received = now
+        self.connected = True
+        self.stats["bytes_received"] += byte_count
+        self.stats["packets_received"] += 1
+        self.uplink_budget.record_downlink(byte_count)
+        self._rate_window_bytes += byte_count
+        elapsed = now - self._rate_window_started
+        if elapsed >= 1.0:
+            self.received_rate = (
+                self._rate_window_bytes * 8 / (elapsed * 1_000_000)
+            )
+            self.rate_window.append(self.received_rate)
+            if len(self.rate_window) > 10:
+                self.rate_window.pop(0)
+            self._rate_window_started = now
+            self._rate_window_bytes = 0
 
     def keepalive_loop(self):
         """Send periodic keepalives and handle reconnection"""
         while self.running:
-            time.sleep(self._next_keepalive_delay())
+            self._sleep(self._next_keepalive_delay())
             if not self.running:
                 break
 
             # Check if we've lost the connection
             if (
                 self.last_received > 0
-                and (time.time() - self.last_received) > self.RECEIVE_TIMEOUT
+                and (self._monotonic_clock() - self.last_received)
+                > self.receive_timeout
             ):
                 print(
                     "[!] Connection lost (no data received), reconnecting...",
@@ -544,41 +598,32 @@ class AdaptiveTrafficClient:
                 continue
 
             if self.handshake_accepted:
-                self._send_session_message(MessageType.KEEPALIVE)
+                self._send_session_message(
+                    MessageType.KEEPALIVE, allow_budget_debt=True
+                )
             else:
                 self._send_registration()
 
     def send_loop(self):
-        """Generate uplink traffic"""
+        """Spend response credit on framed DATA without bypass traffic."""
         while self.running:
-            # Adaptive generation based on received traffic
-            if self.received_rate > 0:
-                # Send percentage of received rate
-                target_send_rate = mbps_to_bytes_per_second(
-                    self.received_rate * self.response_ratio
-                )  # bytes/sec
-
-                # Add random bursts
-                if random.random() < 0.05:  # 5% burst probability
-                    target_send_rate *= random.uniform(1.5, 3)
-
-                # Generate packets
-                bytes_to_send = int(target_send_rate / 100)  # Divide by send frequency
-
-                while bytes_to_send > 0:
-                    packet_size = min(bytes_to_send, random.randint(200, 1000))
-                    packet = self.generate_response_packet(packet_size)
-                    self.send_packet(packet)
-                    bytes_to_send -= len(packet)
-                    time.sleep(random.uniform(0.001, 0.005))
-
-            time.sleep(0.01)  # 100 Hz main loop
+            available_datagram_bytes = int(self.uplink_budget.available_bytes)
+            available_payload_bytes = available_datagram_bytes - FRAME_OVERHEAD
+            if available_payload_bytes >= 13:
+                packet_size = min(
+                    available_payload_bytes,
+                    self.data_payload_ceiling,
+                    self._rng.randint(200, 1000),
+                )
+                packet = self.generate_response_packet(packet_size)
+                self.send_packet(packet)
+            self._sleep(0.01)
 
     def stats_loop(self):
         """Print runtime statistics"""
         while self.running:
-            time.sleep(self.stats_interval)
-            elapsed = time.time() - self.stats["start_time"]
+            self._sleep(self.stats_interval)
+            elapsed = self._monotonic_clock() - self.stats["start_time"]
             if elapsed > 0:
                 recv_mbps = (self.stats["bytes_received"] * 8) / (elapsed * 1_000_000)
                 send_mbps = (self.stats["bytes_sent"] * 8) / (elapsed * 1_000_000)
@@ -589,9 +634,11 @@ class AdaptiveTrafficClient:
                 conn_status = "connected" if self.connected else "disconnected"
 
                 print(
-                    f"[STATS] Rx: {recv_mbps:.2f} Mbps ({recv_pps:.0f} pps) | "
+                    f"[STATS client total] Rx: {recv_mbps:.2f} Mbps "
+                    f"({recv_pps:.0f} pps) | "
                     f"Tx: {send_mbps:.2f} Mbps ({send_pps:.0f} pps) | "
                     f"Avg rate: {avg_rate:.2f} Mbps | "
+                    f"Uplink ratio: {self.uplink_budget.observed_ratio:.3f} | "
                     f"Status: {conn_status}",
                     flush=True,
                 )
@@ -649,8 +696,38 @@ def main():
     parser.add_argument(
         "--stats-interval",
         type=float,
-        default=5.0,
+        default=_env_default("TRAFFIC_MASKING_STATS_INTERVAL", 5.0),
         help="Stats print interval in seconds",
+    )
+    parser.add_argument(
+        "--keepalive-interval",
+        type=float,
+        default=_env_default("TRAFFIC_MASKING_KEEPALIVE_INTERVAL", 5.0),
+        help="Base keepalive interval in seconds",
+    )
+    parser.add_argument(
+        "--keepalive-jitter",
+        type=float,
+        default=_env_default("TRAFFIC_MASKING_KEEPALIVE_JITTER", 0.2),
+        help="Fractional keepalive jitter in [0.0, 1.0)",
+    )
+    parser.add_argument(
+        "--receive-timeout",
+        type=float,
+        default=_env_default("TRAFFIC_MASKING_RECEIVE_TIMEOUT", 10.0),
+        help="Seconds without authenticated data before reconnecting",
+    )
+    parser.add_argument(
+        "--reconnect-delay-min",
+        type=float,
+        default=_env_default("TRAFFIC_MASKING_RECONNECT_DELAY_MIN", 1.0),
+        help="Initial reconnect delay in seconds",
+    )
+    parser.add_argument(
+        "--reconnect-delay-max",
+        type=float,
+        default=_env_default("TRAFFIC_MASKING_RECONNECT_DELAY_MAX", 30.0),
+        help="Maximum reconnect delay in seconds",
     )
     auth_group = parser.add_mutually_exclusive_group()
     auth_group.add_argument(
@@ -680,6 +757,11 @@ def main():
             stats_interval=args.stats_interval,
             psk=psk,
             insecure_diagnostic=args.insecure_diagnostic,
+            keepalive_jitter=args.keepalive_jitter,
+            keepalive_interval=args.keepalive_interval,
+            receive_timeout=args.receive_timeout,
+            reconnect_delay_min=args.reconnect_delay_min,
+            reconnect_delay_max=args.reconnect_delay_max,
         )
     except ValueError as exc:
         parser.error(str(exc))

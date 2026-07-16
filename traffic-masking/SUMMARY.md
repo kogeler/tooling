@@ -9,6 +9,8 @@
 - `DynamicObfuscator`: Packet obfuscation and fragmentation
 - `ShapeEvent`, `Packetizer`, `RateLimiter`: Explicit offered-load,
   application-packetization, and framed-byte pacing contracts
+- `FloatingRate`: Bounded slope-limited per-client rate state
+- `RatioBudget`: Successful framed uplink accounting against downlink bytes
 - `ProtocolMimicry`: Pattern generation for different traffic profiles
 - `TrafficProfile`: Enum for supported profiles (web, video, voip, file, gaming, mixed)
 
@@ -20,15 +22,16 @@
 - Restrictive PSK file validation
 
 **traffic_masking_server.py**
-- Multi-client UDP server with batch processing
-- Authenticated client enrollment with client, handshake-rate, and total-rate caps
+- Multi-client UDP server with independent generator, limiter, RNG and counters
+- Authenticated client enrollment with client and handshake-rate caps
+- Round-robin per-client pacing under an actual aggregate egress limiter
 - Explicit fixed/floating rate mode and experimental native profile mode
 - Real-time statistics monitoring
 
 **traffic_masking_client.py**
 - Authenticated challenge/response handshake and source validation
-- Adaptive uplink generation based on downlink rate
-- Response ratio control (0-100% of received traffic)
+- Monotonic receive-rate windows and configurable health/reconnect timings
+- Response ratio control over DATA, framing, padding and control bytes
 
 ### Enhanced Modules (optional)
 - `enhanced/timing.py`: Adaptive timing with congestion modeling
@@ -41,21 +44,19 @@
 
 ### Floating Rate Algorithm
 ```python
-# Physics-based smooth rate transitions
-rate_acceleration = random.uniform(-0.5, 0.5)  # Major pattern changes
-rate_velocity += rate_acceleration * dt
-rate_velocity *= 0.95  # Natural damping
-current_mbps += rate_velocity * dt
+# Low-pass random slope with midpoint reversion
+desired_slope = midpoint_force + bounded_noise
+slope += (desired_slope - slope) * elapsed / response_time
+slope = clamp(slope, -max_slope, max_slope)
+current_mbps += slope * elapsed
 
-# Elastic boundaries
-if current_mbps < min_mbps:
-    current_mbps = min_mbps + elastic_bounce
-    rate_velocity = abs(rate_velocity) * 0.5
+# Soft reflection avoids exact-boundary dwell
+current_mbps = reflect_inside(current_mbps, min_mbps, max_mbps)
 ```
 
-- Pattern changes every 2-8 seconds
-- Momentum-based transitions for realistic traffic
-- Elastic collision at min/max boundaries
+- Monotonic-clock updates with injected RNG for deterministic tests
+- Bounded derivative and nonzero long-run variance
+- Independent state and sequence for every validated client
 
 ### Performance Optimizations
 - Batch processing: 10 packets per batch

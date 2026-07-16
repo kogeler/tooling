@@ -22,11 +22,31 @@ python traffic_masking_client.py --server 127.0.0.1 --response 0.3 --advanced \
 
 Mbps values are decimal Mbit/s of application UDP payload. The client defaults
 to no scheduled uplink (`--response 0.0`). A nonzero response is an explicit
-diagnostic/profile choice; the current standalone scheduler does not guarantee
-that exact ratio on the wire.
+diagnostic/profile choice. Its ratio covers successfully submitted DATA,
+framing, padding and keepalive bytes relative to authenticated downlink datagram
+bytes; mandatory keepalives can temporarily exceed the target and are repaid by
+pausing DATA.
 
 Server `rate` mode supplies demand to reach its configured target. Experimental
 `profile` mode preserves native event sizes and gaps; `--max-mbps` only caps it.
+Rates are per validated client. `--max-total-mbps` is an actual aggregate cap;
+when it binds, validated clients share it in round-robin order.
+
+Client health and reporting timings support CLI flags and environment defaults:
+
+```bash
+TRAFFIC_MASKING_KEEPALIVE_INTERVAL=2 \
+TRAFFIC_MASKING_RECEIVE_TIMEOUT=8 \
+TRAFFIC_MASKING_RECONNECT_DELAY_MIN=0.5 \
+TRAFFIC_MASKING_RECONNECT_DELAY_MAX=10 \
+TRAFFIC_MASKING_STATS_INTERVAL=2 \
+python traffic_masking_client.py --server SERVER_IP \
+  --psk-file ./traffic-masking.psk
+```
+
+`TRAFFIC_MASKING_KEEPALIVE_JITTER` sets the fractional jitter (default `0.2`).
+Equivalent CLI flags override these defaults. The receive timeout must be
+greater than `keepalive interval * (1 + jitter)`.
 
 ## Use Cases
 
@@ -168,11 +188,9 @@ sudo iftop -i eth0 -f "udp port 8888"
 htop
 pidstat -p $(pgrep -f traffic_masking_server) 1
 
-# Extract rates from logs
-grep "Rate:" server.log | awk '{print $4}' | sort -n
-
-# Average rate
-grep "Rate:" server.log | awk '{sum+=$4; count++} END {print sum/count}'
+# Total and per-client rates are labelled separately
+grep "Total Rate:" server.log
+grep "Per-client:" server.log
 ```
 
 ## Troubleshooting

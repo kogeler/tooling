@@ -354,9 +354,9 @@ def test_expired_auth_fails_and_prevalidation_is_non_amplifying():
 
 @pytest.mark.parametrize(
     ("max_clients", "max_total_mbps"),
-    [(1, 100), (2, 1)],
+    [(1, 100)],
 )
-def test_client_and_total_caps_refuse_new_enrollment(
+def test_client_count_cap_refuses_new_enrollment(
     max_clients, max_total_mbps
 ):
     server = make_server(
@@ -381,6 +381,20 @@ def test_client_and_total_caps_refuse_new_enrollment(
     )
     assert not server.handle_datagram(auth, second_address)
     assert len(server.clients) == 1
+
+
+def test_total_rate_cap_allows_enrollment_for_fair_runtime_sharing():
+    server = make_server(max_clients=2, max_total_mbps=1)
+    complete_handshake(server, ("127.0.0.1", 20006))
+    complete_handshake(
+        server,
+        ("127.0.0.1", 20007),
+        client_nonce=b"d" * NONCE_SIZE,
+        hello_sequence=30,
+    )
+
+    assert len(server.clients) == 2
+    assert server.total_rate_limiter.rate_bytes_per_second == 125_000
 
 
 def test_handshake_rate_and_pending_state_are_bounded():

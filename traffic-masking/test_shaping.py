@@ -126,9 +126,11 @@ class RecordingSocket:
         return len(datagram)
 
 
-def test_client_packetizes_large_uplink_before_session_framing():
+def test_client_packetizes_credited_uplink_before_session_framing():
     key = b"k" * 32
-    client = AdaptiveTrafficClient("server.example", 8888, psk=key, mtu=1200)
+    client = AdaptiveTrafficClient(
+        "server.example", 8888, psk=key, mtu=1200, response_ratio=1.0
+    )
     client.socket = RecordingSocket()
     client.server_addr = ("192.0.2.1", 8888)
     client.client_nonce = b"c" * 16
@@ -138,6 +140,7 @@ def test_client_packetizes_large_uplink_before_session_framing():
     )
     client.handshake_accepted = True
     payload = b"u" * 9_000
+    client.uplink_budget.record_downlink(20_000)
 
     client.send_packet(payload)
 

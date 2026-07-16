@@ -92,8 +92,9 @@ make test
 - `--max-mbps`: In profile mode, an optional ceiling that only adds delay
 - `--advanced`: Deprecated warning-emitting alias for profile mode
 - `--response`: Optional diagnostic/profile uplink setting (0.0-1.0, default
-  0.0). Nonzero values request additional uplink traffic; the current standalone
-  scheduler does not guarantee that exact ratio on the wire.
+  0.0). The client budgets successfully submitted framed uplink bytes as this
+  fraction of authenticated downlink datagram bytes. DATA, framing, padding and
+  keepalives share the budget; mandatory keepalives can create temporary debt.
 - `--header`: Pseudo-headers (none/rtp/quic)
 - `--padding`: Padding strategy (none/random/fixed_buckets/progressive)
 - `--entropy`: Payload entropy (0.0-1.0)
@@ -102,11 +103,25 @@ make test
   IP and outer encrypted-transport overhead when selecting a path-safe value.
 - `--psk-file`: Path to the shared 32-4096 byte binary key. The file must not
   grant group or other permissions.
-- `--max-clients`, `--max-total-mbps`: Bound authenticated enrollment and the
-  configured aggregate egress commitment.
+- `--max-clients`, `--max-total-mbps`: Bound authenticated enrollment and actual
+  aggregate server egress. The configured rate is per client; a round-robin
+  global limiter shares a binding total cap between validated clients.
 - `--max-handshakes-per-second`: Bound global handshake processing. Pending and
   replay state expires with the cookie window; full state refuses new enrollment
   rather than evicting an authenticated client.
+- `--keepalive-interval`, `--keepalive-jitter`, `--receive-timeout`: Control
+  client health checks. The receive timeout must exceed the maximum jittered
+  keepalive interval.
+- `--reconnect-delay-min`, `--reconnect-delay-max`: Bound exponential reconnect
+  backoff.
+- `--stats-interval`: Controls reporting on both endpoints. Server reports
+  explicitly labelled total and per-client framed application-datagram rates.
+
+Client timing defaults can also be set with
+`TRAFFIC_MASKING_KEEPALIVE_INTERVAL`, `TRAFFIC_MASKING_KEEPALIVE_JITTER`,
+`TRAFFIC_MASKING_RECEIVE_TIMEOUT`, `TRAFFIC_MASKING_RECONNECT_DELAY_MIN`, and
+`TRAFFIC_MASKING_RECONNECT_DELAY_MAX`. `TRAFFIC_MASKING_STATS_INTERVAL` applies
+to either endpoint. CLI values override environment defaults.
 
 `--insecure-diagnostic` uses a public built-in key and is only for local
 diagnostics. Production startup fails closed when the PSK is missing,

@@ -47,6 +47,7 @@ from control_protocol import (
 )
 from masking_lib import (
     DynamicObfuscator,
+    FloatingRate,
     Packetizer,
     RateLimiter,
     ShapeEvent,
@@ -89,6 +90,10 @@ def _positive_int(value, name):
     if parsed <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return parsed
+
+
+def _env_default(name, fallback):
+    return os.environ.get(name, fallback)
 
 
 class PacketGenerator:
@@ -295,7 +300,6 @@ class MaskingTrafficServer:
             if floating
             else target_mbps
         )
-        self._last_rate_update = self._monotonic_clock()
         self.target_bytes_per_second = (
             mbps_to_bytes_per_second(self.current_rate_mbps)
             if self.current_rate_mbps is not None
@@ -306,13 +310,17 @@ class MaskingTrafficServer:
         self.running = False
         self.packetizer = Packetizer(mtu, FRAME_OVERHEAD)
         self.data_payload_ceiling = self.packetizer.payload_ceiling
-        self.packet_gen = PacketGenerator(
-            max_size=min(1400, self.data_payload_ceiling),
-            rng=self._rng,
-            byte_source=self._byte_source,
-        )
-        self.stats = {"bytes_sent": 0, "packets_sent": 0, "start_time": time.time()}
-        self.last_stats = {"bytes_sent": 0, "packets_sent": 0, "time": time.time()}
+        stats_started = self._monotonic_clock()
+        self.stats = {
+            "bytes_sent": 0,
+            "packets_sent": 0,
+            "start_time": stats_started,
+        }
+        self.last_stats = {
+            "bytes_sent": 0,
+            "packets_sent": 0,
+            "time": stats_started,
+        }
         self.stats_interval = stats_interval
         self.advanced = shape_mode == "profile"  # Compatibility attribute.
         if shape_mode == "profile":
@@ -339,8 +347,11 @@ class MaskingTrafficServer:
         self._handshake_state_limit = (
             max_clients + max_handshakes_per_second * cookie_ttl
         )
-        self.obfuscator = None
-        self.generator = None
+        self.total_rate_limiter = RateLimiter(
+            mbps_to_bytes_per_second(max_total_mbps),
+            burst_bytes=self.mtu,
+            clock=self._monotonic_clock,
+        )
 
     def start(self):
         """Start the server"""
@@ -375,15 +386,6 @@ class MaskingTrafficServer:
         else:
             print(f"[*] Target throughput: {self.target_mbps} Mbps", flush=True)
         if self.shape_mode == "profile":
-            self.obfuscator = DynamicObfuscator(
-                padding_strategy=self.padding_strategy,
-                timing_jitter=0.002,
-                mtu=self.data_payload_ceiling,
-                header_mode=self.header_mode,
-                rng=self._rng,
-                byte_source=self._byte_source,
-            )
-            self.generator = profile_event_generator(self.profile, rng=self._rng)
             print(
                 f"[*] Profile transform: header={self.header_mode}, "
                 f"padding={self.padding_strategy}, mtu={self.mtu}",
@@ -511,11 +513,8 @@ class MaskingTrafficServer:
         self._prune_handshake_state(now)
         if replay_key in self._accepted_auth:
             return False
-        existing = 1 if addr in self.clients else 0
-        prospective_clients = len(self.clients) - existing + 1
+        prospective_clients = len(self.clients) - (1 if addr in self.clients else 0) + 1
         if prospective_clients > self.max_clients:
-            return False
-        if prospective_clients * self.configured_max_mbps > self.max_total_mbps:
             return False
         if len(self._accepted_auth) >= self._handshake_state_limit:
             return False
@@ -546,15 +545,54 @@ class MaskingTrafficServer:
         self._accepted_auth[replay_key] = {
             "expires": now + self.cookie_ttl
         }
-        limiter_mbps = (
-            self.current_rate_mbps
-            if self.shape_mode == "rate"
-            else self.max_mbps
+        self.clients[addr] = self._new_client_state(
+            frame,
+            now,
+            receive_key,
+            send_key,
         )
-        self.clients[addr] = {
+        print(f"[+] New client connected: {addr}", flush=True)
+        return True
+
+    def _new_client_state(self, frame, now, receive_key, send_key):
+        seed_material = hashlib.sha256(
+            self.cookie_secret + frame.client_nonce + frame.session_nonce
+        ).digest()
+        client_rng = random.Random(int.from_bytes(seed_material, "big"))
+        floating_rate = None
+        current_rate_mbps = self.target_mbps
+        if self.shape_mode == "rate" and self.min_mbps is not None:
+            floating_rate = FloatingRate(
+                self.min_mbps,
+                self.max_mbps,
+                clock=self._monotonic_clock,
+                rng=client_rng,
+            )
+            current_rate_mbps = floating_rate.value_mbps
+        limiter_mbps = (
+            current_rate_mbps if self.shape_mode == "rate" else self.max_mbps
+        )
+        obfuscator = None
+        generator = None
+        if self.shape_mode == "profile":
+            obfuscator = DynamicObfuscator(
+                padding_strategy=self.padding_strategy,
+                timing_jitter=0.002,
+                mtu=self.data_payload_ceiling,
+                header_mode=self.header_mode,
+                rng=client_rng,
+                byte_source=self._byte_source,
+            )
+            generator = profile_event_generator(self.profile, rng=client_rng)
+
+        return {
             "last_seen": now,
             "bytes_received": 0,
             "packets_received": 0,
+            "bytes_sent": 0,
+            "packets_sent": 0,
+            "last_bytes_sent": 0,
+            "last_packets_sent": 0,
             "client_nonce": frame.client_nonce,
             "session_nonce": frame.session_nonce,
             "receive_key": receive_key,
@@ -570,9 +608,21 @@ class MaskingTrafficServer:
                 if limiter_mbps is not None
                 else None
             ),
+            "rng": client_rng,
+            "packet_gen": PacketGenerator(
+                max_size=min(1400, self.data_payload_ceiling),
+                rng=client_rng,
+                byte_source=self._byte_source,
+            ),
+            "floating_rate": floating_rate,
+            "current_rate_mbps": current_rate_mbps,
+            "generator": generator,
+            "obfuscator": obfuscator,
+            "pending_fragments": deque(),
+            "next_event_at": self._monotonic_clock(),
+            "pending_event_delay": 0.0,
+            "delay_after_send": None,
         }
-        print(f"[+] New client connected: {addr}", flush=True)
-        return True
 
     def _handle_session_frame(self, inspected, datagram, addr, now):
         client = self.clients.get(addr)
@@ -644,74 +694,122 @@ class MaskingTrafficServer:
         )
 
     def send_loop(self):
-        """Generate logical demand, packetize it, and pace framed datagrams."""
+        """Serve one datagram per client per round under the aggregate cap."""
         while self.running:
-            if not self.clients:
+            clients = list(self.clients.items())
+            if not clients:
                 self._sleep(0.1)
                 continue
 
-            event = self._next_shape_event()
-            if event.byte_count:
-                payload = self._make_event_payload(event)
-                for fragment in self.packetizer.packetize(payload):
-                    for addr, client in list(self.clients.items()):
-                        self._send_fragment(addr, client, fragment)
-            if event.delay:
-                self._sleep(event.delay)
+            sent_any = False
+            next_ready_at = None
+            for addr, client in clients:
+                fragment = self._next_client_fragment(client)
+                if fragment is not None:
+                    self._send_fragment(addr, client, fragment)
+                    self._complete_client_fragment(client)
+                    sent_any = True
+                elif client["next_event_at"] > self._monotonic_clock():
+                    next_ready_at = min(
+                        client["next_event_at"],
+                        next_ready_at or client["next_event_at"],
+                    )
+            if not sent_any:
+                delay = 0.01
+                if next_ready_at is not None:
+                    delay = min(
+                        delay,
+                        max(0.0, next_ready_at - self._monotonic_clock()),
+                    )
+                self._sleep(delay)
 
-    def _next_shape_event(self):
-        if self.shape_mode == "profile":
-            return next(self.generator)
-
+    def _next_client_fragment(self, client):
+        if client["pending_fragments"]:
+            fragment = client["pending_fragments"].popleft()
+            if not client["pending_fragments"]:
+                client["delay_after_send"] = client["pending_event_delay"]
+            return fragment
         now = self._monotonic_clock()
-        if (
-            self.min_mbps is not None
-            and now - self._last_rate_update >= 1.0
-        ):
-            self.current_rate_mbps = self._rng.uniform(
-                self.min_mbps, self.max_mbps
+        if now < client["next_event_at"]:
+            return None
+
+        event = self._next_shape_event(client)
+        if not event.byte_count:
+            client["next_event_at"] = now + event.delay
+            return None
+        payload = self._make_event_payload(client, event)
+        client["pending_fragments"].extend(self.packetizer.packetize(payload))
+        if not client["pending_fragments"]:
+            return None
+        client["pending_event_delay"] = event.delay
+        fragment = client["pending_fragments"].popleft()
+        if not client["pending_fragments"]:
+            client["delay_after_send"] = event.delay
+        return fragment
+
+    def _complete_client_fragment(self, client):
+        if client["delay_after_send"] is not None:
+            client["next_event_at"] = (
+                self._monotonic_clock() + client["delay_after_send"]
             )
-            self._last_rate_update = now
-            new_rate = mbps_to_bytes_per_second(self.current_rate_mbps)
-            self.target_bytes_per_second = new_rate
-            for client in self.clients.values():
-                client["rate_limiter"].set_rate(new_rate)
+            client["delay_after_send"] = None
+
+    def _next_shape_event(self, client):
+        if self.shape_mode == "profile":
+            return next(client["generator"])
+
+        if client["floating_rate"] is not None:
+            current_rate = client["floating_rate"].update()
+            client["current_rate_mbps"] = current_rate
+            client["rate_limiter"].set_rate(
+                mbps_to_bytes_per_second(current_rate)
+            )
         return ShapeEvent(byte_count=self.data_payload_ceiling)
 
-    def _make_event_payload(self, event):
+    def _make_event_payload(self, client, event):
         if self.shape_mode == "rate":
-            return self.packet_gen.generate_packet(event.byte_count)
+            return client["packet_gen"].generate_packet(event.byte_count)
         payload = bytes(
             generate_payload(
                 event.byte_count,
                 entropy=self.entropy,
-                rng=self._rng,
+                rng=client["rng"],
                 byte_source=self._byte_source,
             )
         )
         if len(payload) != event.byte_count:
             raise ValueError("byte source returned the wrong event payload length")
-        return self.obfuscator.transform(payload, profile=self.profile)
+        return client["obfuscator"].transform(payload, profile=self.profile)
 
     def _send_fragment(self, addr, client, fragment):
         framed = self._frame_data_for_client(client, fragment)
         limiter = client["rate_limiter"]
-        reservation = limiter.reserve(len(framed)) if limiter else None
-        if reservation and reservation.delay:
-            self._sleep(reservation.delay)
+        client_reservation = limiter.reserve(len(framed)) if limiter else None
+        total_reservation = self.total_rate_limiter.reserve(len(framed))
+        delay = max(
+            client_reservation.delay if client_reservation else 0.0,
+            total_reservation.delay,
+        )
+        if delay:
+            self._sleep(delay)
         sent = 0
         try:
             sent = self.socket.sendto(framed, addr)
             if sent == len(framed):
                 self.stats["bytes_sent"] += sent
                 self.stats["packets_sent"] += 1
+                client["bytes_sent"] += sent
+                client["packets_sent"] += 1
             else:
                 sent = max(0, min(sent, len(framed)))
         except OSError as exc:
             print(f"[!] Send error to client {addr}: {exc}", flush=True)
         finally:
-            if reservation:
-                limiter.commit(reservation, successful_bytes=sent)
+            if client_reservation:
+                limiter.commit(client_reservation, successful_bytes=sent)
+            self.total_rate_limiter.commit(
+                total_reservation, successful_bytes=sent
+            )
 
     def cleanup_loop(self):
         """Remove inactive clients"""
@@ -730,10 +828,10 @@ class MaskingTrafficServer:
             time.sleep(5)
 
     def stats_loop(self):
-        """Print runtime statistics"""
+        """Print total and per-client application-datagram egress rates."""
         while self.running:
-            time.sleep(self.stats_interval)
-            now = time.time()
+            self._sleep(self.stats_interval)
+            now = self._monotonic_clock()
 
             # Calculate instantaneous rates based on delta since last stats
             time_delta = now - self.last_stats["time"]
@@ -746,15 +844,35 @@ class MaskingTrafficServer:
                 pps = packets_delta / time_delta
 
                 pattern_desc = (
-                    f"rate:{self.current_rate_mbps:.2f}Mbps"
+                    "rate:per-client"
+                    if self.shape_mode == "rate" and self.min_mbps is None
+                    else f"floating:{self.min_mbps:.2f}-{self.max_mbps:.2f}Mbps"
                     if self.shape_mode == "rate"
                     else f"experimental-profile:{self.profile.value}"
                 )
+                client_rates = []
+                for addr, client in self.clients.items():
+                    client_bytes = (
+                        client["bytes_sent"] - client["last_bytes_sent"]
+                    )
+                    client_mbps = client_bytes * 8 / (time_delta * 1_000_000)
+                    target = client["current_rate_mbps"]
+                    target_text = (
+                        f",target={target:.2f}Mbps"
+                        if target is not None
+                        else ",native-profile"
+                    )
+                    client_rates.append(
+                        f"{addr[0]}:{addr[1]}={client_mbps:.2f}Mbps{target_text}"
+                    )
+                    client["last_bytes_sent"] = client["bytes_sent"]
+                    client["last_packets_sent"] = client["packets_sent"]
+                per_client = ";".join(client_rates) or "none"
                 print(
                     f"[STATS] Clients: {len(self.clients)} | "
-                    f"Rate: {mbps:.2f} Mbps | "
-                    f"PPS: {pps:.0f} | "
-                    f"Pattern: {pattern_desc}",
+                    f"Total Rate: {mbps:.2f} Mbps | "
+                    f"Total PPS: {pps:.0f} | "
+                    f"Per-client: {per_client} | Pattern: {pattern_desc}",
                     flush=True,
                 )
 
@@ -833,7 +951,7 @@ def main():
     parser.add_argument(
         "--stats-interval",
         type=float,
-        default=5.0,
+        default=_env_default("TRAFFIC_MASKING_STATS_INTERVAL", 5.0),
         help="Stats print interval in seconds",
     )
     auth_group = parser.add_mutually_exclusive_group()

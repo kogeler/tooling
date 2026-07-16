@@ -21,6 +21,7 @@ import os
 import struct
 import random
 import socket
+import threading
 import time
 import math
 from collections.abc import Callable, Iterator, Sequence
@@ -51,6 +52,8 @@ __all__ = [
     "PatternStep",
     "ShapeEvent",
     "Packetizer",
+    "FloatingRate",
+    "RatioBudget",
     "RateLimiter",
     "RateReservation",
     "ProtocolMimicry",
@@ -135,6 +138,171 @@ class Packetizer:
             payload[offset : offset + self.payload_ceiling]
             for offset in range(0, len(payload), self.payload_ceiling)
         )
+
+
+class FloatingRate:
+    """Bounded, slope-limited rate process driven by a monotonic clock."""
+
+    def __init__(
+        self,
+        minimum_mbps,
+        maximum_mbps,
+        clock=None,
+        rng=None,
+        max_slope_mbps_per_second=None,
+        response_time=1.5,
+    ):
+        try:
+            minimum_mbps = float(minimum_mbps)
+            maximum_mbps = float(maximum_mbps)
+            response_time = float(response_time)
+        except (TypeError, ValueError):
+            raise ValueError("floating rate bounds must be finite numbers") from None
+        if (
+            not math.isfinite(minimum_mbps)
+            or not math.isfinite(maximum_mbps)
+            or minimum_mbps <= 0
+            or minimum_mbps >= maximum_mbps
+        ):
+            raise ValueError("floating rate bounds must be positive and ordered")
+        if not math.isfinite(response_time) or response_time <= 0:
+            raise ValueError("floating rate response time must be positive")
+
+        span = maximum_mbps - minimum_mbps
+        if max_slope_mbps_per_second is None:
+            max_slope_mbps_per_second = span / 4
+        try:
+            max_slope_mbps_per_second = float(max_slope_mbps_per_second)
+        except (TypeError, ValueError):
+            raise ValueError("floating rate slope must be positive") from None
+        if (
+            not math.isfinite(max_slope_mbps_per_second)
+            or max_slope_mbps_per_second <= 0
+        ):
+            raise ValueError("floating rate slope must be positive")
+
+        self.minimum_mbps = minimum_mbps
+        self.maximum_mbps = maximum_mbps
+        self.max_slope_mbps_per_second = max_slope_mbps_per_second
+        self.response_time = response_time
+        self._span = span
+        self._midpoint = (minimum_mbps + maximum_mbps) / 2
+        self._clock = clock or time.monotonic
+        self._rng = rng or random.Random()
+        self._updated_at = self._clock()
+        self.value_mbps = self._midpoint
+        self.slope_mbps_per_second = self._rng.uniform(
+            -self.max_slope_mbps_per_second,
+            self.max_slope_mbps_per_second,
+        )
+        minimum_starting_slope = self.max_slope_mbps_per_second * 0.05
+        if abs(self.slope_mbps_per_second) < minimum_starting_slope:
+            self.slope_mbps_per_second = minimum_starting_slope
+
+    def update(self):
+        """Advance to the injected clock and return the current rate in Mbps."""
+        now = self._clock()
+        elapsed = max(0.0, now - self._updated_at)
+        self._updated_at = now
+        if elapsed == 0:
+            return self.value_mbps
+
+        center_slope = (
+            (self._midpoint - self.value_mbps)
+            / self._span
+            * self.max_slope_mbps_per_second
+        )
+        noise_slope = self._rng.uniform(
+            -self.max_slope_mbps_per_second,
+            self.max_slope_mbps_per_second,
+        )
+        desired_slope = center_slope * 0.6 + noise_slope * 0.4
+        blend = min(1.0, elapsed / self.response_time)
+        slope = self.slope_mbps_per_second + (
+            desired_slope - self.slope_mbps_per_second
+        ) * blend
+        slope = max(
+            -self.max_slope_mbps_per_second,
+            min(self.max_slope_mbps_per_second, slope),
+        )
+        candidate = self.value_mbps + slope * elapsed
+
+        # Reflect overshoot into the range and reduce momentum at the edge. The
+        # epsilon keeps samples away from an exact-boundary dwell.
+        epsilon = self._span * 1e-9
+        for _ in range(8):
+            if candidate < self.minimum_mbps:
+                candidate = self.minimum_mbps + (
+                    self.minimum_mbps - candidate
+                ) * 0.5
+                slope = abs(slope) * 0.5
+            elif candidate > self.maximum_mbps:
+                candidate = self.maximum_mbps - (
+                    candidate - self.maximum_mbps
+                ) * 0.5
+                slope = -abs(slope) * 0.5
+            else:
+                break
+        self.value_mbps = min(
+            self.maximum_mbps - epsilon,
+            max(self.minimum_mbps + epsilon, candidate),
+        )
+        self.slope_mbps_per_second = slope
+        return self.value_mbps
+
+
+class RatioBudget:
+    """Track successful uplink bytes against a fraction of downlink bytes."""
+
+    def __init__(self, ratio):
+        try:
+            ratio = float(ratio)
+        except (TypeError, ValueError):
+            raise ValueError("ratio must be in [0.0, 1.0]") from None
+        if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
+            raise ValueError("ratio must be in [0.0, 1.0]")
+        self.ratio = ratio
+        self.downlink_bytes = 0
+        self.uplink_bytes = 0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _validate_byte_count(byte_count):
+        if (
+            isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count < 0
+        ):
+            raise ValueError("byte count must be a non-negative integer")
+        return byte_count
+
+    @property
+    def available_bytes(self):
+        with self._lock:
+            return max(0.0, self.downlink_bytes * self.ratio - self.uplink_bytes)
+
+    @property
+    def observed_ratio(self):
+        with self._lock:
+            if self.downlink_bytes == 0:
+                return 0.0
+            return self.uplink_bytes / self.downlink_bytes
+
+    def record_downlink(self, byte_count):
+        byte_count = self._validate_byte_count(byte_count)
+        with self._lock:
+            self.downlink_bytes += byte_count
+
+    def allows(self, byte_count, allow_debt=False):
+        byte_count = self._validate_byte_count(byte_count)
+        with self._lock:
+            available = self.downlink_bytes * self.ratio - self.uplink_bytes
+            return allow_debt or byte_count <= max(0.0, available)
+
+    def record_uplink(self, byte_count):
+        byte_count = self._validate_byte_count(byte_count)
+        with self._lock:
+            self.uplink_bytes += byte_count
 
 
 @dataclass(frozen=True)

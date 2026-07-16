@@ -5,8 +5,7 @@
 
 Ported from the former standalone test_traffic_masking.py and
 test_realistic_patterns.py runners so nothing runs outside pytest. Bounded to stay
-CI-safe. Durations are dictated by the current hard-coded keepalive/receive
-timeouts; a later stage adds timing knobs to shrink them.
+CI-safe. Reconnection cases use explicit short keepalive/receive/backoff values.
 """
 
 import re
@@ -33,6 +32,16 @@ def _server_args(port, psk_file, lo=2, hi=4):
         "--shape-mode", "profile", "--max-mbps", str(hi),
         "--profile", "mixed", "--stats-interval", "1",
         "--psk-file", str(psk_file),
+    ]
+
+
+def _fast_client_timings():
+    return [
+        "--keepalive-interval", "0.2",
+        "--keepalive-jitter", "0",
+        "--receive-timeout", "0.8",
+        "--reconnect-delay-min", "0.2",
+        "--reconnect-delay-max", "0.5",
     ]
 
 
@@ -73,7 +82,8 @@ def test_reconnection_after_server_restart(spawn, start_server, psk_file):
     client = spawn(
         CLIENT,
         ["--server", "127.0.0.1", "--port", str(port), "--response", "0.3",
-         "--stats-interval", "1", "--psk-file", str(psk_file)],
+         "--stats-interval", "1", "--psk-file", str(psk_file),
+         *_fast_client_timings()],
         "client",
     )
     assert wait_for(client, "Rx:", 10.0), read_log(client)
@@ -81,7 +91,7 @@ def test_reconnection_after_server_restart(spawn, start_server, psk_file):
     # Phase 2: kill the server; the client must detect loss and must NOT falsely
     # report a reconnect while the server is down.
     stop_process(server)
-    assert wait_for(client, "Connection lost", 20.0), read_log(client)
+    assert wait_for(client, "Connection lost", 5.0), read_log(client)
     downtime = read_log(client).split("Connection lost", 1)[1]
     assert "Reconnected successfully" not in downtime, read_log(client)
 
@@ -89,7 +99,7 @@ def test_reconnection_after_server_restart(spawn, start_server, psk_file):
     reconnect_offset = client.mark_log()
     server2, _ = start_server(server_args, "server2", port=port)
     assert wait_for(
-        client, "Reconnected successfully", 25.0, offset=reconnect_offset
+        client, "Reconnected successfully", 8.0, offset=reconnect_offset
     ), read_log(client, offset=reconnect_offset)
     assert server2.process.poll() is None
 
@@ -168,6 +178,45 @@ def test_floating_rate_stays_within_bounds(spawn, start_server, psk_file):
     assert min(rates) >= 0.0
     # Generous slack: this only guards against runaway rate, not shape quality.
     assert max(rates) <= hi * 1.75, rates
+
+
+def test_two_clients_share_total_cap_with_bounded_fairness(
+    spawn, start_server, psk_file
+):
+    cap = 1.5
+    server, port = start_server(
+        lambda selected_port: [
+            "--host", "127.0.0.1", "--port", str(selected_port),
+            "--mbps", "1", "--max-total-mbps", str(cap),
+            "--stats-interval", "1", "--psk-file", str(psk_file),
+        ],
+        "fair-server",
+    )
+    clients = [
+        spawn(
+            CLIENT,
+            [
+                "--server", "127.0.0.1", "--port", str(port),
+                "--stats-interval", "1", "--psk-file", str(psk_file),
+            ],
+            f"fair-client-{index}",
+        )
+        for index in range(2)
+    ]
+    for client in clients:
+        assert wait_for(client, "Authenticated session accepted", 5.0), read_log(
+            client
+        )
+
+    time.sleep(5)
+    client_rates = [
+        last_match(client, r"Rx:\s*([0-9.]+)\s*Mbps") for client in clients
+    ]
+    total_rate = last_match(server, r"Total Rate:\s*([0-9.]+)\s*Mbps")
+    assert all(rate is not None and rate > 0.4 for rate in client_rates)
+    assert total_rate is not None and total_rate <= cap * 1.15
+    assert abs(client_rates[0] - client_rates[1]) <= max(client_rates) * 0.35
+    assert "Per-client:" in read_log(server)
 
 
 def test_raw_probe_gets_only_bounded_challenge(start_server, psk_file):

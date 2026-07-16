@@ -5,6 +5,7 @@
 
 import subprocess
 import sys
+import os
 
 import pytest
 
@@ -59,6 +60,9 @@ def test_server_accepts_valid_floating_config():
         {"stats_interval": float("inf")},
         {"mtu": float("inf")},
         {"mtu": 1200.5},
+        {"keepalive_interval": 0},
+        {"keepalive_interval": 5, "receive_timeout": 6},
+        {"reconnect_delay_min": 3, "reconnect_delay_max": 2},
     ],
 )
 def test_client_rejects_bad_config(kwargs):
@@ -71,12 +75,13 @@ def test_client_default_response_is_download_only():
     assert client.response_ratio == 0.0
 
 
-def _run(script, *args):
+def _run(script, *args, env=None):
     return subprocess.run(
         [sys.executable, script, *args],
         capture_output=True,
         text=True,
         timeout=15,
+        env=env,
     )
 
 
@@ -141,6 +146,22 @@ def _run(script, *args):
             ),
             "stats-interval must be a positive finite number",
         ),
+        (
+            CLIENT,
+            (
+                "--server", "127.0.0.1", "--insecure-diagnostic",
+                "--keepalive-interval", "5", "--receive-timeout", "6",
+            ),
+            "maximum jittered keepalive interval",
+        ),
+        (
+            CLIENT,
+            (
+                "--server", "127.0.0.1", "--insecure-diagnostic",
+                "--reconnect-delay-min", "3", "--reconnect-delay-max", "2",
+            ),
+            "reconnect-delay-min must not exceed",
+        ),
     ],
 )
 def test_invalid_cli_exits_2_with_useful_message(script, args, message):
@@ -155,6 +176,20 @@ def test_cli_requires_psk_unless_diagnostic(script):
     result = _run(script, *args)
     assert result.returncode == 2
     assert "--psk-file is required" in result.stderr
+
+
+def test_timing_environment_defaults_are_validated():
+    env = os.environ.copy()
+    env["TRAFFIC_MASKING_RECEIVE_TIMEOUT"] = "0"
+    result = _run(
+        CLIENT,
+        "--server",
+        "127.0.0.1",
+        "--insecure-diagnostic",
+        env=env,
+    )
+    assert result.returncode == 2
+    assert "receive-timeout must be a positive finite number" in result.stderr
 
 
 def test_server_rejects_limits_below_per_client_rate():
