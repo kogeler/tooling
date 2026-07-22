@@ -9,19 +9,11 @@ import socket
 import pytest
 
 from masking_lib import (
-    DynamicObfuscator,
+    PayloadPadder,
     ProtocolMimicry,
     TrafficProfile,
-    parse_profile,
-    stream_generator,
+    profile_event_generator,
 )
-
-
-def test_parse_profile_known_and_fallback():
-    assert parse_profile("mixed") is TrafficProfile.MIXED
-    assert parse_profile("web") is TrafficProfile.WEB_BROWSING
-    # Unknown strings fall back to MIXED rather than raising.
-    assert parse_profile("bogus") is TrafficProfile.MIXED
 
 
 @pytest.mark.parametrize("profile", list(TrafficProfile))
@@ -30,32 +22,24 @@ def test_for_profile_is_nonempty(profile):
     assert len(steps) > 0
 
 
-def test_obfuscator_produces_fragments():
-    obf = DynamicObfuscator(rng=random.Random(1))
-    fragments, delay = obf.obfuscate(b"test packet data")
-    assert len(fragments) > 0
-    assert delay >= 0
+@pytest.mark.parametrize("strategy", sorted(PayloadPadder.STRATEGIES))
+def test_payload_padder_preserves_payload_and_only_adds_bytes(strategy):
+    payload = b"test packet data"
+    padder = PayloadPadder(strategy=strategy, rng=random.Random(1))
+    transformed = padder.transform(payload)
+
+    assert transformed.startswith(payload)
+    assert len(transformed) >= len(payload)
+    if strategy == "none":
+        assert transformed == payload
 
 
-def test_stream_generator_fixed_rate_yields():
-    gen = stream_generator(
-        TrafficProfile.MIXED, target_mbps=1.0, rng=random.Random(2)
+def test_profile_event_generator_yields_native_shape_event():
+    event = next(
+        profile_event_generator(TrafficProfile.WEB_BROWSING, random.Random(3))
     )
-    fragments, delay = next(gen)
-    assert len(fragments) > 0
-    assert delay > 0
-
-
-def test_stream_generator_floating_rate_yields():
-    gen = stream_generator(
-        TrafficProfile.MIXED,
-        min_mbps=1.0,
-        max_mbps=5.0,
-        rng=random.Random(3),
-    )
-    fragments, delay = next(gen)
-    assert len(fragments) > 0
-    assert delay > 0
+    assert event.byte_count > 0
+    assert event.delay > 0
 
 
 def test_loopback_udp_roundtrip():

@@ -9,7 +9,7 @@ DEPS_STAMP := $(VENV)/.deps-installed
 
 COV := --cov=control_protocol --cov=masking_lib \
        --cov=traffic_masking_server --cov=traffic_masking_client \
-       --cov=enhanced --cov-branch --cov-report=term-missing
+       --cov-branch --cov-report=term-missing
 
 .PHONY: venv test test-fast test-live lint run-server run-client clean
 
@@ -39,8 +39,8 @@ run-server: venv          ## demo server (experimental mixed profile, capped at 
 	$(PYTHON) traffic_masking_server.py --shape-mode profile --profile mixed --max-mbps 8 --insecure-diagnostic
 
 run-client: venv          ## demo client against 127.0.0.1
-	$(PYTHON) traffic_masking_client.py --server 127.0.0.1 --advanced --uplink-profile mixed --insecure-diagnostic
+	$(PYTHON) traffic_masking_client.py --server 127.0.0.1 --insecure-diagnostic
 
 clean:                    ## remove venv and generated artifacts
-	rm -rf $(VENV) __pycache__ enhanced/__pycache__ \
+	rm -rf $(VENV) __pycache__ \
 	       .pytest_cache .ruff_cache .coverage htmlcov *.log

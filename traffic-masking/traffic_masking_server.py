@@ -4,10 +4,7 @@
 # Copyright © 2025 kogeler
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Traffic Masking Server - cover traffic generator
-Creates a variable, realistic-looking stream to mask media traffic patterns from heuristic analysis on encrypted tunnels.
-"""
+"""Authenticated UDP cover-traffic server."""
 
 import argparse
 import hashlib
@@ -19,7 +16,6 @@ import socket
 import struct
 import threading
 import time
-import warnings
 from collections import OrderedDict, deque
 
 from control_protocol import (
@@ -46,9 +42,9 @@ from control_protocol import (
     verify_cookie,
 )
 from masking_lib import (
-    DynamicObfuscator,
     FloatingRate,
     Packetizer,
+    PayloadPadder,
     RateLimiter,
     ShapeEvent,
     TrafficProfile,
@@ -65,16 +61,6 @@ def _positive_finite_float(value, name):
         raise ValueError(f"{name} must be a number") from None
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be a positive finite number")
-    return value
-
-
-def _unit_interval_float(value, name):
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{name} must be a number") from None
-    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-        raise ValueError(f"{name} must be in [0.0, 1.0]")
     return value
 
 
@@ -97,7 +83,7 @@ def _env_default(name, fallback):
 
 
 class PacketGenerator:
-    """Packet generator with variable sizes and pseudo-random payload characteristics"""
+    """Generate opaque rate-mode payloads with variable packet sizes."""
 
     def __init__(self, min_size=28, max_size=1400, rng=None, byte_source=None):
         self.min_size = min_size
@@ -109,7 +95,7 @@ class PacketGenerator:
     def generate_packet(self, target_size=None):
         """Generate a data packet"""
         if target_size is None:
-            # Packet size distribution (simulate realistic traffic)
+            # Keep rate-mode datagram sizes variable within the configured bounds.
             weights = [0.1, 0.15, 0.5, 0.15, 0.1]  # Favor medium packets
             sizes = [
                 self._rng.randint(self.min_size, 200),  # Small
@@ -150,13 +136,10 @@ class MaskingTrafficServer:
         target_mbps=None,
         min_mbps=None,
         max_mbps=None,
-        advanced=False,
         profile=None,
         shape_mode="rate",
-        header="none",
-        padding="random",
+        padding="none",
         mtu=1200,
-        entropy=1.0,
         stats_interval=5.0,
         psk=None,
         insecure_diagnostic=False,
@@ -174,28 +157,6 @@ class MaskingTrafficServer:
         # Validate the offered-load contract before constructing generators.
         if shape_mode not in ("rate", "profile"):
             raise ValueError("shape-mode must be 'rate' or 'profile'")
-        if advanced:
-            warnings.warn(
-                "--advanced is deprecated; use --shape-mode profile",
-                FutureWarning,
-                stacklevel=2,
-            )
-            shape_mode = "profile"
-            profile = profile or "mixed"
-            if min_mbps is not None:
-                if max_mbps is None:
-                    raise ValueError("min-mbps and max-mbps must be given together")
-                warnings.warn(
-                    "--advanced translates the old min/max range to a profile cap",
-                    FutureWarning,
-                    stacklevel=2,
-                )
-                min_mbps = None
-            if target_mbps is not None:
-                if max_mbps is None:
-                    max_mbps = target_mbps
-                target_mbps = None
-
         floating = False
         if shape_mode == "rate":
             if profile is not None:
@@ -223,6 +184,10 @@ class MaskingTrafficServer:
                 raise ValueError("mbps is not valid in profile shape mode")
             if max_mbps is not None:
                 max_mbps = _positive_finite_float(max_mbps, "max-mbps")
+        if padding not in PayloadPadder.STRATEGIES:
+            raise ValueError(f"unknown padding strategy: {padding}")
+        if shape_mode == "rate" and padding != "none":
+            raise ValueError("padding is only valid in profile shape mode")
         mtu = _positive_int(mtu, "mtu")
         if mtu > MAX_DATAGRAM_SIZE:
             raise ValueError(f"mtu must not exceed {MAX_DATAGRAM_SIZE}")
@@ -231,12 +196,6 @@ class MaskingTrafficServer:
                 f"mtu must be at least {MIN_CONTROL_MTU} bytes "
                 "for authenticated control framing"
             )
-        if shape_mode == "profile" and mtu - FRAME_OVERHEAD < 256:
-            raise ValueError(
-                f"mtu must be at least {FRAME_OVERHEAD + 256} bytes "
-                "in profile shape mode"
-            )
-        entropy = _unit_interval_float(entropy, "entropy")
         stats_interval = _positive_finite_float(
             stats_interval, "stats-interval"
         )
@@ -322,7 +281,6 @@ class MaskingTrafficServer:
             "time": stats_started,
         }
         self.stats_interval = stats_interval
-        self.advanced = shape_mode == "profile"  # Compatibility attribute.
         if shape_mode == "profile":
             try:
                 self.profile = (
@@ -332,10 +290,8 @@ class MaskingTrafficServer:
                 raise ValueError(f"unknown traffic profile: {profile}") from None
         else:
             self.profile = None
-        self.header_mode = header
         self.padding_strategy = padding
         self.mtu = mtu
-        self.entropy = entropy
         self.max_clients = max_clients
         self.max_total_mbps = max_total_mbps
         self.max_handshakes_per_second = max_handshakes_per_second
@@ -387,8 +343,7 @@ class MaskingTrafficServer:
             print(f"[*] Target throughput: {self.target_mbps} Mbps", flush=True)
         if self.shape_mode == "profile":
             print(
-                f"[*] Profile transform: header={self.header_mode}, "
-                f"padding={self.padding_strategy}, mtu={self.mtu}",
+                f"[*] Profile padding: {self.padding_strategy} | mtu={self.mtu}",
                 flush=True,
             )
         auth_mode = "INSECURE DIAGNOSTIC" if self.insecure_diagnostic else "PSK"
@@ -572,14 +527,12 @@ class MaskingTrafficServer:
         limiter_mbps = (
             current_rate_mbps if self.shape_mode == "rate" else self.max_mbps
         )
-        obfuscator = None
+        padder = None
         generator = None
         if self.shape_mode == "profile":
-            obfuscator = DynamicObfuscator(
-                padding_strategy=self.padding_strategy,
-                timing_jitter=0.002,
-                mtu=self.data_payload_ceiling,
-                header_mode=self.header_mode,
+            padder = PayloadPadder(
+                strategy=self.padding_strategy,
+                ceiling=self.data_payload_ceiling,
                 rng=client_rng,
                 byte_source=self._byte_source,
             )
@@ -617,7 +570,7 @@ class MaskingTrafficServer:
             "floating_rate": floating_rate,
             "current_rate_mbps": current_rate_mbps,
             "generator": generator,
-            "obfuscator": obfuscator,
+            "padder": padder,
             "pending_fragments": deque(),
             "next_event_at": self._monotonic_clock(),
             "pending_event_delay": 0.0,
@@ -769,17 +722,11 @@ class MaskingTrafficServer:
     def _make_event_payload(self, client, event):
         if self.shape_mode == "rate":
             return client["packet_gen"].generate_packet(event.byte_count)
-        payload = bytes(
-            generate_payload(
-                event.byte_count,
-                entropy=self.entropy,
-                rng=client["rng"],
-                byte_source=self._byte_source,
-            )
+        payload = generate_payload(
+            event.byte_count,
+            byte_source=self._byte_source,
         )
-        if len(payload) != event.byte_count:
-            raise ValueError("byte source returned the wrong event payload length")
-        return client["obfuscator"].transform(payload, profile=self.profile)
+        return client["padder"].transform(payload)
 
     def _send_fragment(self, addr, client, fragment):
         framed = self._frame_data_for_client(client, fragment)
@@ -917,36 +864,19 @@ def main():
         help="Offered-load contract (default: rate)",
     )
     parser.add_argument(
-        "--advanced",
-        action="store_true",
-        help="Deprecated compatibility alias for --shape-mode profile",
-    )
-    parser.add_argument(
         "--profile",
         choices=["web", "video", "voip", "file", "gaming", "mixed"],
         default=None,
         help="Required experimental traffic profile in profile shape mode",
     )
     parser.add_argument(
-        "--header",
-        choices=["none", "rtp", "quic"],
-        default="none",
-        help="Pseudo-header type in profile mode",
-    )
-    parser.add_argument(
         "--padding",
         choices=["random", "fixed_buckets", "progressive", "none"],
-        default="random",
-        help="Padding strategy in profile mode",
+        default="none",
+        help="Observable payload padding in profile mode (default: none)",
     )
     parser.add_argument(
         "--mtu", type=int, default=1200, help="Maximum application UDP datagram size"
-    )
-    parser.add_argument(
-        "--entropy",
-        type=float,
-        default=1.0,
-        help="Payload entropy compatibility setting for profile mode",
     )
     parser.add_argument(
         "--stats-interval",
@@ -993,13 +923,10 @@ def main():
             args.mbps,
             min_mbps=args.min_mbps,
             max_mbps=args.max_mbps,
-            advanced=args.advanced,
             profile=args.profile,
             shape_mode=args.shape_mode,
-            header=args.header,
             padding=args.padding,
             mtu=args.mtu,
-            entropy=args.entropy,
             stats_interval=args.stats_interval,
             psk=psk,
             insecure_diagnostic=args.insecure_diagnostic,

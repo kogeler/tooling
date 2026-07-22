@@ -17,17 +17,13 @@ Environment="PYTHONUNBUFFERED=1"
 # Override SERVER_IP with a drop-in file.
 Environment="SERVER_IP=127.0.0.1"
 
-# Maximum configuration with advanced features
+# Client with an explicit uplink response and observable padding
 ExecStart=/usr/bin/python3 /opt/traffic-masking/traffic_masking_client.py \
     --server ${SERVER_IP} \
     --port 8888 \
     --response 0.3 \
-    --advanced \
-    --uplink-profile mixed \
-    --header rtp \
     --padding random \
     --mtu 1200 \
-    --entropy 1.0 \
     --stats-interval 10 \
     --psk-file /etc/traffic-masking/control.psk
 

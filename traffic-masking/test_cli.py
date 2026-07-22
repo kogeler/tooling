@@ -25,7 +25,6 @@ from traffic_masking_server import MaskingTrafficServer
         {"max_mbps": 8},  # only one of the pair
         {"target_mbps": 5, "mtu": 0},
         {"target_mbps": 5, "mtu": MIN_CONTROL_MTU - 1},
-        {"target_mbps": 5, "entropy": 1.5},
         {"target_mbps": 5, "stats_interval": 0},
         {"target_mbps": float("nan")},
         {"target_mbps": float("inf")},
@@ -52,7 +51,6 @@ def test_server_accepts_valid_floating_config():
     [
         {"response_ratio": 1.5},
         {"response_ratio": -0.1},
-        {"entropy": 2.0},
         {"mtu": 0},
         {"mtu": MIN_CONTROL_MTU - 1},
         {"stats_interval": -1},
@@ -219,10 +217,3 @@ def test_profile_mode_has_native_load_and_optional_cap():
     assert uncapped.target_mbps is None
     assert uncapped.max_mbps is None
     assert capped.configured_max_mbps == 1
-
-
-def test_advanced_warns_and_translates_to_profile_mode():
-    with pytest.warns(FutureWarning, match="shape-mode profile"):
-        server = MaskingTrafficServer(advanced=True, psk=TEST_PSK)
-    assert server.shape_mode == "profile"
-    assert server.profile.value == "mixed"

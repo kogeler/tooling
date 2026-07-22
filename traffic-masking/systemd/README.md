@@ -1,160 +1,91 @@
-# Systemd Service Units
+# Systemd Installation
 
-This directory contains systemd service units for running the Traffic Masking System as system services.
+The unit templates run the authenticated UDP server and client. They do not
+provide encryption or multiplexing; deploy them only within the intended external
+encrypted transport.
 
-## Installation
+## Install Files
 
-1. Copy service files to systemd directory:
 ```bash
-sudo cp traffic-masking-*.service /etc/systemd/system/
+sudo install -d -o root -g root -m 0755 /opt/traffic-masking
+sudo install -m 0755 ../traffic_masking_server.py /opt/traffic-masking/
+sudo install -m 0755 ../traffic_masking_client.py /opt/traffic-masking/
+sudo install -m 0644 ../control_protocol.py /opt/traffic-masking/
+sudo install -m 0644 ../masking_lib.py /opt/traffic-masking/
+
+sudo install -m 0644 traffic-masking-server.service /etc/systemd/system/
+sudo install -m 0644 traffic-masking-client.service /etc/systemd/system/
 ```
 
-2. Create working directory and copy application files:
-```bash
-sudo mkdir -p /opt/traffic-masking
-sudo cp ../*.py /opt/traffic-masking/
-sudo cp -r ../enhanced /opt/traffic-masking/
-sudo chown -R nobody:nogroup /opt/traffic-masking
-```
+The runtime uses only the Python standard library.
 
-3. Install Python dependencies:
-```bash
-sudo python3 -m venv /opt/traffic-masking/venv
-sudo /opt/traffic-masking/venv/bin/pip install numpy
-```
+## Install The Shared Key
 
-4. Generate the shared key on one endpoint and securely transfer the same binary
-   file to the other endpoint:
+Generate the key on one endpoint, transfer the same binary file securely to the
+other endpoint, and restrict it to the service account:
 
 ```bash
-sudo install -d -o root -g root -m 0755 /etc/traffic-masking
 umask 077
-openssl rand 32 > /tmp/control.psk
-sudo install -o nobody -g nogroup -m 0400 /tmp/control.psk \
-    /etc/traffic-masking/control.psk
-rm -f /tmp/control.psk
+openssl rand 32 > control.psk
+sudo install -o nobody -g nogroup -m 0400 control.psk \
+  /etc/traffic-masking/control.psk
 ```
 
-5. Update service files to use venv Python:
-```bash
-sudo sed -i 's|/usr/bin/python3|/opt/traffic-masking/venv/bin/python|g' \
-    /etc/systemd/system/traffic-masking-*.service
-```
+Never place the key value in a unit command or environment variable.
 
-## Configuration
+## Configure
 
-### Server Configuration
+The server template uses the experimental `mixed` native profile with random
+padding and an 80 Mbps aggregate cap.
 
-The server service is configured with authenticated experimental profile shaping:
-- Native mixed-profile offered load capped at 10 Mbps
-- Profile mode (the cap does not increase native offered load)
-- RTP headers and random padding
-- Maximum entropy (1.0)
+Set the client server address with a drop-in:
 
-To modify server settings, create a drop-in override:
-```bash
-sudo systemctl edit traffic-masking-server.service
-```
-
-Example override to change rate:
-```ini
-[Service]
-ExecStart=
-ExecStart=/opt/traffic-masking/venv/bin/python /opt/traffic-masking/traffic_masking_server.py \
-    --shape-mode profile --max-mbps 5 --profile video \
-    --psk-file /etc/traffic-masking/control.psk
-```
-
-### Client Configuration
-
-The client connects to localhost by default. To connect to a remote server:
-
-1. Create drop-in override:
 ```bash
 sudo systemctl edit traffic-masking-client.service
 ```
 
-2. Add server IP:
 ```ini
 [Service]
-Environment="SERVER_IP=192.168.1.100"
+Environment="SERVER_IP=192.0.2.10"
 ```
 
-## Usage
+Rate-mode server override example:
 
-### Start Services
 ```bash
-# Server only
-sudo systemctl start traffic-masking-server.service
-
-# Client only
-sudo systemctl start traffic-masking-client.service
-
-# Both
-sudo systemctl start traffic-masking-server.service traffic-masking-client.service
+sudo systemctl edit traffic-masking-server.service
 ```
 
-### Enable at Boot
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/bin/python3 /opt/traffic-masking/traffic_masking_server.py --host 0.0.0.0 --port 8888 --shape-mode rate --min-mbps 2 --max-mbps 8 --max-total-mbps 40 --psk-file /etc/traffic-masking/control.psk
+```
+
+## Start
+
 ```bash
-sudo systemctl enable traffic-masking-server.service
-sudo systemctl enable traffic-masking-client.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now traffic-masking-server.service
+sudo systemctl enable --now traffic-masking-client.service
 ```
 
-### Check Status
+Use the server unit on the emitting endpoint and the client unit on receiving
+endpoints as appropriate for the deployment.
+
+## Inspect
+
 ```bash
 sudo systemctl status traffic-masking-server.service
 sudo systemctl status traffic-masking-client.service
-```
-
-### View Logs
-```bash
-# Follow server logs
 sudo journalctl -u traffic-masking-server.service -f
-
-# Follow client logs
 sudo journalctl -u traffic-masking-client.service -f
-
-# Last 100 lines
-sudo journalctl -u traffic-masking-server.service -n 100
 ```
 
-### Stop Services
-```bash
-sudo systemctl stop traffic-masking-server.service traffic-masking-client.service
-```
+Server statistics label total and per-client framed application rates. Client
+statistics label client-total receive/transmit rates and the observed uplink
+ratio.
 
-## Security Features
+## Rotate The Key
 
-Both services include security hardening:
-- Run as `nobody:nogroup` user
-- Private /tmp directory
-- Read-only system directories
-- No new privileges
-- Resource limits
-- HMAC-SHA256 authenticated enrollment and session traffic
-- A mode `0400` PSK file that is never exposed in process arguments or logs
-
-### Key Rotation
-
-The protocol does not support overlapping keys. Stop both services, install a
-new mode `0400` key at `/etc/traffic-masking/control.psk` on both endpoints, then
-start both services. A client with an old or incorrect key remains unregistered.
-
-## Troubleshooting
-
-### Service Won't Start
-- Check logs: `sudo journalctl -u traffic-masking-server.service -e`
-- Verify Python path: `which python3`
-- Check permissions: `ls -la /opt/traffic-masking/`
-- Check PSK ownership/mode: `sudo stat /etc/traffic-masking/control.psk`
-
-### High CPU Usage
-- Reduce `--entropy` to 0.5-0.7
-- Use `--padding none`
-- Lower max rate in floating mode
-
-### Connection Issues
-- Check firewall: `sudo ufw status`
-- Verify server is listening: `sudo ss -ulnp | grep 8888`
-- Run an authenticated client and inspect its status output; arbitrary UDP probes
-  are intentionally ignored.
+There is no multi-key grace period. Stop both endpoints, atomically replace the
+key file with the same new value and restrictive mode, then restart both units.

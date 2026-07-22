@@ -4,48 +4,19 @@
 # Copyright © 2025 kogeler
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Enhanced masking library for server and client with advanced obfuscation features
-
-Provides:
-- Protocol mimicry profiles (web, video, voip, file-transfer, gaming, mixed)
-- Dynamic obfuscation (padding, timing jitter, fragmentation, pseudo-headers)
-- Statistical analysis (entropy estimation, periodicity hints)
-- Enhanced features when available (adaptive timing, correlation breaking, ML resistance)
-- Common utilities for server/client
-"""
+"""Traffic shaping, padding, packetization, and pacing primitives."""
 
 from __future__ import annotations
 
 import os
-import struct
+import math
 import random
 import socket
 import threading
 import time
-import math
-from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
-
-
-try:
-    import numpy as np
-except Exception:
-    np = None  # Minimal fallback
-
-# Try to import enhanced modules
-try:
-    from enhanced.timing import AdaptiveTimingModel
-    from enhanced.correlation import CorrelationBreaker
-    from enhanced.ml_resistance import MLResistantGenerator
-    from enhanced.entropy import EntropyEnhancer
-    from enhanced.state_machine import ProtocolStateMachine  # noqa: F401  (availability probe)
-    ENHANCED_AVAILABLE = True
-except ImportError:
-    ENHANCED_AVAILABLE = False
-    # Fallback implementations will be provided
+from typing import List, Optional
 
 __all__ = [
     "TrafficProfile",
@@ -57,15 +28,9 @@ __all__ = [
     "RateLimiter",
     "RateReservation",
     "ProtocolMimicry",
-    "DynamicObfuscator",
-    "StatisticalAnalyzer",
-    "stream_generator",
+    "PayloadPadder",
     "profile_event_generator",
-    "ObfuscationConfig",
-    "parse_profile",
-    "build_obfuscator",
     "init_udp_socket",
-    "send_fragments",
     "mbps_to_bytes_per_second",
     "generate_payload",
 ]
@@ -90,13 +55,13 @@ class TrafficProfile(Enum):
 
 @dataclass(frozen=True)
 class PatternStep:
-    size: int          # bytes (payload before obfuscation)
+    size: int          # logical payload bytes before padding
     delay: float       # seconds (inter-packet delay target)
 
 
 @dataclass(frozen=True)
 class ShapeEvent:
-    """One logical offered-load event before obfuscation and packetization."""
+    """One logical offered-load event before padding and packetization."""
 
     byte_count: int
     delay: float = 0.0
@@ -410,17 +375,6 @@ class RateLimiter:
 class ProtocolMimicry:
     """Generate sequences of PatternStep for different protocol-like behaviors."""
 
-    def __init__(self):
-        """Initialize with enhanced features if available."""
-        self.enhanced = ENHANCED_AVAILABLE
-        if self.enhanced:
-            try:
-                self.correlation_breaker = CorrelationBreaker()
-                self.ml_resistant = MLResistantGenerator()
-                self.timing_model = AdaptiveTimingModel()
-            except Exception:
-                self.enhanced = False
-
     @staticmethod
     def web_browsing_session(rng=None) -> List[PatternStep]:
         rng = rng or random
@@ -529,233 +483,66 @@ class ProtocolMimicry:
         }[profile](rng=rng)
 
 
-class DynamicObfuscator:
-    """
-    Obfuscates packets by:
-    - Padding
-    - Pseudo-headers (RTP/QUIC-like)
-    - Timing jitter
-    - MTU fragmentation
-    """
+class PayloadPadder:
+    """Add observable payload volume before application packetization."""
+
+    STRATEGIES = {"none", "random", "fixed_buckets", "progressive"}
 
     def __init__(
         self,
-        padding_strategy: str = "random",  # random | fixed_buckets | progressive | none
-        timing_jitter: float = 0.002,      # seconds stddev for jitter
-        mtu: int = 1200,
-        header_mode: str = "none",         # none | rtp | quic
-        fixed_buckets: Optional[Sequence[int]] = None,
+        strategy="none",
+        ceiling=1200,
+        fixed_buckets=None,
         rng=None,
         byte_source=None,
     ):
-        self.padding_strategy = padding_strategy
-        self.timing_jitter = max(0.0, float(timing_jitter))
-        self.mtu = int(mtu)
-        if self.mtu <= 0:
-            raise ValueError("mtu must be positive")
-        self.header_mode = header_mode
-        self.fixed_buckets = tuple(fixed_buckets) if fixed_buckets else (128, 256, 512, 1024, 1280, 1400)
+        if strategy not in self.STRATEGIES:
+            raise ValueError(f"unknown padding strategy: {strategy}")
+        if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
+            raise ValueError("padding ceiling must be a positive integer")
+        self.strategy = strategy
+        self.ceiling = ceiling
+        self.fixed_buckets = tuple(
+            fixed_buckets or (128, 256, 512, 1024, 1280, 1400)
+        )
         self._rng = rng or random.Random()
         self._byte_source = byte_source or os.urandom
-        # RTP-like state
-        self._rtp_seq = self._rng.randint(0, 65535)
-        self._rtp_ssrc = self._rng.getrandbits(32)
-        self._rtp_ts_base = self._rng.getrandbits(32)
-        # QUIC-like PN
-        self._quic_pn = self._rng.randint(0, 2**32 - 1)
 
-        # Enhanced features if available
-        self.enhanced = ENHANCED_AVAILABLE
-        if self.enhanced:
-            try:
-                self.timing_model = AdaptiveTimingModel()
-                self.entropy_enhancer = EntropyEnhancer()
-            except Exception:
-                self.enhanced = False
-
-    def obfuscate(self, payload: bytes, profile: Optional[TrafficProfile] = None, base_delay: float = 0.0) -> Tuple[List[bytes], float]:
-        pkt = self.transform(payload, profile)
-        fragments = self._fragment(pkt, self.mtu)
-
-        # Compatibility API: preserve the caller's delay and only add bounded jitter.
-        if base_delay > 0:
-            jitter = self._rng.gauss(
-                0.0, min(self.timing_jitter, base_delay * 0.1)
-            )
-            delay = max(0.0, base_delay + jitter)
-        else:
-            delay = 0.0
-
-        return fragments, delay
-
-    def transform(self, payload, profile=None):
-        """Apply optional pseudo-header and padding without packetizing."""
+    def transform(self, payload):
         if not isinstance(payload, (bytes, bytearray, memoryview)):
             raise ValueError("payload must be bytes")
-        packet = self._apply_header(bytes(payload), profile)
-        return self._apply_padding(packet, profile)
-
-    def _apply_padding(self, packet: bytes, profile: Optional[TrafficProfile]) -> bytes:
-        if self.padding_strategy == "none":
-            return packet
-        if self.padding_strategy == "random":
-            max_pad = max(16, min(120, int(len(packet) * 0.07)))
-            pad_len = self._rng.randint(0, max_pad)
-            return packet + self._byte_source(pad_len)
-        if self.padding_strategy == "progressive":
-            factor = self._rng.uniform(0.0, 0.20)
-            pad_len = int(len(packet) * factor)
-            if pad_len <= 0:
-                return packet
-            return packet + self._byte_source(pad_len)
-        if self.padding_strategy == "fixed_buckets":
-            target = None
-            for b in self.fixed_buckets:
-                if len(packet) <= b:
-                    target = b
-                    break
-            if target is None:
-                target = min(max(self.fixed_buckets), self.mtu)
-            pad_len = max(0, target - len(packet))
-            if pad_len == 0:
-                return packet
-            return packet + self._byte_source(pad_len)
-        return packet
-
-    def _apply_header(self, payload: bytes, profile: Optional[TrafficProfile]) -> bytes:
-        if self.header_mode == "none":
+        payload = bytes(payload)
+        if self.strategy == "none":
             return payload
-        if self.header_mode == "rtp":
-            return self._rtp_like(payload, profile)
-        if self.header_mode == "quic":
-            return self._quic_like(payload)
-        return payload
+        if self.strategy == "random":
+            max_padding = max(16, min(120, int(len(payload) * 0.07)))
+            return self._append(payload, self._rng.randint(0, max_padding))
+        if self.strategy == "progressive":
+            return self._append(payload, int(len(payload) * self._rng.uniform(0, 0.2)))
 
-    def _rtp_like(self, payload: bytes, profile: Optional[TrafficProfile]) -> bytes:
-        # Very rough RTP-like header (12 bytes)
-        version, padding, extension, csrc_count = 2, 0, 0, 0
-        marker = 1 if self._rng.random() < 0.02 else 0
-        payload_type = {
-            TrafficProfile.VOIP_CALL: 111,
-            TrafficProfile.VIDEO_STREAMING: 96,
-        }.get(profile, self._rng.randint(96, 127))
-        b0 = (version << 6) | (padding << 5) | (extension << 4) | (csrc_count & 0x0F)
-        b1 = ((marker & 0x01) << 7) | (payload_type & 0x7F)
-        self._rtp_seq = (self._rtp_seq + 1) & 0xFFFF
-        ts_step = self._rng.randint(800, 2000)
-        self._rtp_ts_base = (self._rtp_ts_base + ts_step) & 0xFFFFFFFF
-        header = struct.pack("!BBHII", b0, b1, self._rtp_seq, self._rtp_ts_base, self._rtp_ssrc)
-        return header + payload
+        target = next(
+            (bucket for bucket in self.fixed_buckets if len(payload) <= bucket),
+            min(max(self.fixed_buckets), self.ceiling),
+        )
+        return self._append(payload, max(0, target - len(payload)))
 
-    def _quic_like(self, payload: bytes) -> bytes:
-        flags = 0xC0 | (self._rng.randint(0, 3) << 4)
-        dcid_len = self._rng.choice([8, 12, 16])
-        scid_len = self._rng.choice([0, 8, 12])
-        dcid = self._byte_source(dcid_len)
-        scid = self._byte_source(scid_len)
-        pn_len = self._rng.choice([1, 2, 3, 4])
-        self._quic_pn = (self._quic_pn + 1) & 0xFFFFFFFF
-        pn_mask = (1 << (pn_len * 8)) - 1
-        pn_val = self._quic_pn & pn_mask
-        pn_bytes = pn_val.to_bytes(pn_len, "big")
-        header = bytes([flags, dcid_len]) + dcid + bytes([scid_len]) + scid + pn_bytes
-        return header + payload
-
-    @staticmethod
-    def fragment(packet: bytes, mtu: int) -> List[bytes]:
-        mtu = int(mtu)
-        if mtu <= 0:
-            raise ValueError("mtu must be positive")
-        frags: List[bytes] = []
-        for i in range(0, len(packet), mtu):
-            frags.append(packet[i : i + mtu])
-        return frags
-
-    def _fragment(self, packet: bytes, mtu: int) -> List[bytes]:
-        return self.fragment(packet, mtu)
+    def _append(self, payload, padding_size):
+        if padding_size <= 0:
+            return payload
+        padding = bytes(self._byte_source(padding_size))
+        if len(padding) != padding_size:
+            raise ValueError("byte source returned the wrong padding length")
+        return payload + padding
 
 
-class StatisticalAnalyzer:
-    """Simple statistical checks: entropy and periodicity hints."""
-
-    @staticmethod
-    def entropy_bits_per_byte(data: bytes) -> float:
-        if not data:
-            return 0.0
-        if np is None:
-            # Crude fallback — return mid-high entropy value
-            return 7.0
-        arr = np.frombuffer(data, dtype=np.uint8)
-        counts = np.bincount(arr, minlength=256)
-        p = counts[counts > 0].astype(np.float64)
-        p /= p.sum()
-        entropy = float(-np.sum(p * np.log2(p)))
-        return max(0.0, min(8.0, entropy))
-
-    @staticmethod
-    def entropy_normalized(data: bytes) -> float:
-        return StatisticalAnalyzer.entropy_bits_per_byte(data) / 8.0
-
-    @staticmethod
-    def detect_periodicity(packet_sizes: Sequence[int], packet_times: Sequence[float]) -> Dict[str, Any]:
-        if np is None or len(packet_sizes) < 5 or len(packet_times) < 5:
-            return {"sizes_cv": None, "intervals_cv": None, "interval_peak_ms": None}
-        sizes = np.array(packet_sizes, dtype=np.float64)
-        intervals = np.diff(np.array(packet_times, dtype=np.float64))
-        intervals = intervals[intervals > 0]
-        result: Dict[str, Any] = {"sizes_cv": None, "intervals_cv": None, "interval_peak_ms": None}
-        if sizes.size > 1:
-            mean_s = float(np.mean(sizes))
-            std_s = float(np.std(sizes))
-            result["sizes_cv"] = None if mean_s == 0 else std_s / mean_s
-        if intervals.size > 1:
-            mean_i = float(np.mean(intervals))
-            std_i = float(np.std(intervals))
-            result["intervals_cv"] = None if mean_i == 0 else std_i / mean_i
-            hist, edges = np.histogram(intervals, bins=20)
-            peak_idx = int(np.argmax(hist))
-            peak_center = (edges[peak_idx] + edges[peak_idx + 1]) / 2.0
-            result["interval_peak_ms"] = peak_center * 1000.0
-        return result
-
-
-def generate_payload(
-    size: int,
-    entropy: float = 1.0,
-    rng=None,
-    byte_source=None,
-) -> bytes:
-    rng = rng or random.Random()
-    byte_source = byte_source or os.urandom
-    size = max(0, int(size))
-    if size == 0:
-        return b""
-
-    # For performance, use simple random generation by default
-    # Enhanced entropy is expensive and should be used sparingly
-    if ENHANCED_AVAILABLE and size > 1000 and rng.random() < 0.1:  # Use enhanced only 10% of time for large packets
-        try:
-            enhancer = EntropyEnhancer()
-            return enhancer.generate_realistic_encrypted_payload(size, content_type='mixed')
-        except Exception:
-            pass
-
-    # Fast path for high entropy (most common case)
-    if entropy >= 0.95:
-        return byte_source(size)
-
-    # Optimized generation for lower entropy
-    if entropy < 0.5:
-        # Low entropy - mostly repeated bytes
-        base_byte = rng.randint(0, 255)
-        data = bytearray([base_byte] * size)
-        # Add some variation
-        for _ in range(int(size * entropy)):
-            data[rng.randint(0, size-1)] = rng.randint(0, 255)
-        return bytes(data)
-    else:
-        # Medium to high entropy - mix of random and patterns
-        return byte_source(size)
+def generate_payload(size, byte_source=None):
+    """Return opaque cover payload bytes from a bulk byte source."""
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise ValueError("payload size must be a non-negative integer")
+    payload = bytes((byte_source or os.urandom)(size))
+    if len(payload) != size:
+        raise ValueError("byte source returned the wrong payload length")
+    return payload
 
 
 def profile_event_generator(profile, rng=None):
@@ -769,98 +556,8 @@ def profile_event_generator(profile, rng=None):
             yield ShapeEvent(byte_count=step.size, delay=step.delay)
 
 
-def stream_generator(
-    profile: TrafficProfile,
-    target_mbps: Optional[float] = None,
-    min_mbps: Optional[float] = None,
-    max_mbps: Optional[float] = None,
-    obfuscator: Optional[DynamicObfuscator] = None,
-    entropy: float = 1.0,
-    rng=None,
-) -> Iterator[Tuple[List[bytes], float]]:
-    """Compatibility iterator built on unmodified logical profile events."""
-    if (min_mbps is None) != (max_mbps is None):
-        raise ValueError("min_mbps and max_mbps must be given together")
-    rng = rng or random.Random()
-    obfuscator = obfuscator or DynamicObfuscator(rng=rng)
-    events = profile_event_generator(profile, rng=rng)
-    rate_controlled = target_mbps is not None or min_mbps is not None
-
-    for event in events:
-        if rate_controlled and event.byte_count == 0:
-            continue
-        payload = generate_payload(
-            event.byte_count, entropy=entropy, rng=rng
-        )
-        fragments, _ = obfuscator.obfuscate(payload, profile=profile)
-        if min_mbps is not None:
-            rate_mbps = rng.uniform(min_mbps, max_mbps)
-        else:
-            rate_mbps = target_mbps
-        if rate_mbps is None:
-            delay = event.delay
-        else:
-            delay = sum(len(fragment) for fragment in fragments) / (
-                mbps_to_bytes_per_second(rate_mbps)
-            )
-        yield fragments, delay
-
-
-# Common utilities for server/client
-
-@dataclass
-class ObfuscationConfig:
-    padding_strategy: str = "random"
-    header_mode: str = "none"
-    mtu: int = 1200
-    entropy: float = 1.0
-    timing_jitter: float = 0.002
-
-
-def parse_profile(profile: Union[str, TrafficProfile, None]) -> TrafficProfile:
-    if isinstance(profile, TrafficProfile):
-        return profile
-    if isinstance(profile, str):
-        try:
-            return TrafficProfile(profile)
-        except Exception:
-            return TrafficProfile.MIXED
-    return TrafficProfile.MIXED
-
-
-def build_obfuscator(cfg: ObfuscationConfig, rng=None, byte_source=None) -> DynamicObfuscator:
-    return DynamicObfuscator(
-        padding_strategy=cfg.padding_strategy,
-        timing_jitter=cfg.timing_jitter,
-        mtu=cfg.mtu,
-        header_mode=cfg.header_mode,
-        rng=rng,
-        byte_source=byte_source,
-    )
-
-
 def init_udp_socket(sock: socket.socket, sndbuf: int = 4 * 1024 * 1024, rcvbuf: int = 4 * 1024 * 1024) -> socket.socket:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(sndbuf))
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(rcvbuf))
     return sock
-
-
-def send_fragments(
-    sock: socket.socket,
-    addrs: Union[Tuple[str, int], List[Tuple[str, int]]],
-    fragments: List[bytes],
-    on_sent: Optional[Callable[[int], None]] = None,
-) -> None:
-    """
-    Send fragments to one or many addresses. on_sent(len_bytes) is called per-fragment per-destination.
-    """
-    if isinstance(addrs, tuple):
-        addrs_list = [addrs]
-    else:
-        addrs_list = list(addrs)
-    for frag in fragments:
-        for addr in addrs_list:
-            sock.sendto(frag, addr)
-            if on_sent:
-                on_sent(len(frag))

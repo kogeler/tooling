@@ -4,10 +4,7 @@
 # Copyright © 2025 kogeler
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Traffic Masking Client - cover traffic client
-Receives and generates reverse traffic to create a bidirectional, realistic stream.
-"""
+"""Authenticated UDP cover-traffic client with optional uplink responses."""
 
 import argparse
 import math
@@ -18,7 +15,6 @@ import struct
 import threading
 import time
 
-import numpy as np
 from control_protocol import (
     CLIENT_TO_SERVER,
     CONTROL_PADDING_MAX,
@@ -41,12 +37,10 @@ from control_protocol import (
     make_padding,
 )
 from masking_lib import (
-    ObfuscationConfig,
     Packetizer,
+    PayloadPadder,
     RatioBudget,
-    build_obfuscator,
     init_udp_socket,
-    parse_profile,
 )
 
 
@@ -62,12 +56,8 @@ class AdaptiveTrafficClient:
         server_host,
         server_port,
         response_ratio=0.0,
-        advanced=False,
-        uplink_profile="mixed",
-        header="none",
-        padding="random",
+        padding="none",
         mtu=1200,
-        entropy=1.0,
         stats_interval=5.0,
         rng=None,
         byte_source=None,
@@ -84,16 +74,13 @@ class AdaptiveTrafficClient:
         # Validate configuration up front; fail fast on invalid inputs.
         try:
             response_ratio = float(response_ratio)
-            entropy = float(entropy)
             stats_interval = float(stats_interval)
         except (TypeError, ValueError):
-            raise ValueError(
-                "response, entropy, and stats-interval must be numbers"
-            ) from None
+            raise ValueError("response and stats-interval must be numbers") from None
         if not math.isfinite(response_ratio) or not 0.0 <= response_ratio <= 1.0:
             raise ValueError("response ratio must be in [0.0, 1.0]")
-        if not math.isfinite(entropy) or not 0.0 <= entropy <= 1.0:
-            raise ValueError("entropy must be in [0.0, 1.0]")
+        if padding not in PayloadPadder.STRATEGIES:
+            raise ValueError(f"unknown padding strategy: {padding}")
         original_mtu = mtu
         if isinstance(original_mtu, bool):
             raise ValueError("mtu must be a positive integer")
@@ -109,11 +96,6 @@ class AdaptiveTrafficClient:
             raise ValueError(
                 f"mtu must be at least {MIN_CONTROL_MTU} bytes "
                 "for authenticated control framing"
-            )
-        if advanced and mtu - FRAME_OVERHEAD < 256:
-            raise ValueError(
-                f"mtu must be at least {FRAME_OVERHEAD + 256} bytes "
-                "in advanced mode"
             )
         if not math.isfinite(stats_interval) or stats_interval <= 0:
             raise ValueError("stats-interval must be a positive finite number")
@@ -212,17 +194,12 @@ class AdaptiveTrafficClient:
         self.handshake_accepted = False
         self.stats_interval = stats_interval
         self.uplink_budget = RatioBudget(response_ratio)
-        # Advanced obfuscation settings
-        self.advanced = bool(advanced)
-        self.obf_cfg = ObfuscationConfig(
-            padding_strategy=padding,
-            header_mode=header,
-            mtu=self.data_payload_ceiling,
-            entropy=entropy,
-            timing_jitter=0.002,
+        self.padder = PayloadPadder(
+            strategy=padding,
+            ceiling=self.data_payload_ceiling,
+            rng=self._rng,
+            byte_source=self._byte_source,
         )
-        self.uplink_profile = parse_profile(uplink_profile)
-        self.obfuscator = None
 
     def _create_socket(self):
         """Create and configure a new UDP socket"""
@@ -472,13 +449,9 @@ class AdaptiveTrafficClient:
         )
         auth_mode = "INSECURE DIAGNOSTIC" if self.insecure_diagnostic else "PSK"
         print(f"[*] Control authentication: {auth_mode}", flush=True)
-        # Initialize obfuscator in advanced mode
-        if self.advanced:
-            self.obfuscator = build_obfuscator(
-                self.obf_cfg, rng=self._rng, byte_source=self._byte_source
-            )
+        if self.padder.strategy != "none":
             print(
-                f"[*] Advanced client mode: uplink_profile={self.uplink_profile.value}, header={self.obf_cfg.header_mode}, padding={self.obf_cfg.padding_strategy}, mtu={self.obf_cfg.mtu}, entropy={self.obf_cfg.entropy}",
+                f"[*] Uplink padding: {self.padder.strategy} | mtu={self.mtu}",
                 flush=True,
             )
 
@@ -523,10 +496,7 @@ class AdaptiveTrafficClient:
         """Send packet to the server"""
         sent_bytes = 0
         try:
-            if self.advanced and self.obfuscator is not None:
-                packet = self.obfuscator.transform(
-                    packet, profile=self.uplink_profile
-                )
+            packet = self.padder.transform(packet)
             for fragment in self.packetizer.packetize(packet):
                 sent = self._send_session_message(MessageType.DATA, fragment)
                 if not sent:
@@ -630,7 +600,11 @@ class AdaptiveTrafficClient:
                 recv_pps = self.stats["packets_received"] / elapsed
                 send_pps = self.stats["packets_sent"] / elapsed
 
-                avg_rate = np.mean(self.rate_window) if self.rate_window else 0
+                avg_rate = (
+                    sum(self.rate_window) / len(self.rate_window)
+                    if self.rate_window
+                    else 0
+                )
                 conn_status = "connected" if self.connected else "disconnected"
 
                 print(
@@ -662,36 +636,13 @@ def main():
         "download-dominant. Non-zero uplink is an explicit choice.",
     )
     parser.add_argument(
-        "--advanced",
-        action="store_true",
-        help="Enable advanced obfuscation for uplink packets",
-    )
-    parser.add_argument(
-        "--uplink-profile",
-        choices=["web", "video", "voip", "file", "gaming", "mixed"],
-        default="mixed",
-        help="Uplink traffic profile for advanced mode",
-    )
-    parser.add_argument(
-        "--header",
-        choices=["none", "rtp", "quic"],
-        default="none",
-        help="Pseudo-header type for advanced mode",
-    )
-    parser.add_argument(
         "--padding",
         choices=["random", "fixed_buckets", "progressive", "none"],
-        default="random",
-        help="Padding strategy for advanced mode",
+        default="none",
+        help="Observable uplink payload padding (default: none)",
     )
     parser.add_argument(
-        "--mtu", type=int, default=1200, help="MTU for fragmentation in advanced mode"
-    )
-    parser.add_argument(
-        "--entropy",
-        type=float,
-        default=1.0,
-        help="Payload entropy (0..1) for advanced mode",
+        "--mtu", type=int, default=1200, help="Maximum application UDP datagram size"
     )
     parser.add_argument(
         "--stats-interval",
@@ -748,12 +699,8 @@ def main():
             args.server,
             args.port,
             args.response,
-            advanced=args.advanced,
-            uplink_profile=args.uplink_profile,
-            header=args.header,
             padding=args.padding,
             mtu=args.mtu,
-            entropy=args.entropy,
             stats_interval=args.stats_interval,
             psk=psk,
             insecure_diagnostic=args.insecure_diagnostic,

@@ -55,7 +55,7 @@ def test_transmission_bidirectional(spawn, start_server, psk_file):
         CLIENT,
         [
             "--server", "127.0.0.1", "--port", str(port),
-            "--response", "0.3", "--advanced", "--uplink-profile", "mixed",
+            "--response", "0.3", "--padding", "random",
             "--stats-interval", "1", "--psk-file", str(psk_file),
         ],
         "client",

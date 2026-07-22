@@ -1,9 +1,11 @@
 # Copyright © 2026 kogeler
 # SPDX-License-Identifier: Apache-2.0
 
-"""Import smoke tests for the core and optional enhanced modules."""
+"""Import smoke tests for the dependency-free runtime modules."""
 
 import importlib
+import subprocess
+import sys
 
 import pytest
 
@@ -14,26 +16,21 @@ CORE_MODULES = [
     "traffic_masking_client",
 ]
 
-ENHANCED_MODULES = [
-    "enhanced.timing",
-    "enhanced.correlation",
-    "enhanced.ml_resistance",
-    "enhanced.entropy",
-    "enhanced.state_machine",
-]
-
-
 @pytest.mark.parametrize("module", CORE_MODULES)
 def test_core_module_imports(module):
     assert importlib.import_module(module) is not None
 
 
-@pytest.mark.parametrize("module", ENHANCED_MODULES)
-def test_enhanced_module_imports(module):
-    # Enhanced modules are optional at runtime; skip only if the runtime itself
-    # could not import them (they are present in this repo, so this should pass).
-    try:
-        mod = importlib.import_module(module)
-    except ImportError as exc:  # pragma: no cover - only if enhanced/ is stripped
-        pytest.skip(f"optional module {module} unavailable: {exc}")
-    assert mod is not None
+def test_runtime_imports_do_not_load_numpy():
+    modules = ", ".join(CORE_MODULES)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import {modules}; import sys; assert 'numpy' not in sys.modules",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr

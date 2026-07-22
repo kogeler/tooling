@@ -453,11 +453,8 @@ def test_authenticated_framing_keeps_up_with_configured_rate():
 
 
 def test_protocol_overhead_is_reserved_from_client_payload_mtu():
-    client = AdaptiveTrafficClient(
-        "server.example", 8888, psk=KEY, advanced=True, mtu=1200
-    )
+    client = AdaptiveTrafficClient("server.example", 8888, psk=KEY, mtu=1200)
     assert client.data_payload_ceiling == 1200 - FRAME_OVERHEAD
-    assert client.obf_cfg.mtu == client.data_payload_ceiling
     assert MIN_CONTROL_MTU == FRAME_OVERHEAD + COOKIE_SIZE + 16
 
 
