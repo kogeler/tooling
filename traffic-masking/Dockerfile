@@ -24,7 +24,7 @@ COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
-COPY control_protocol.py masking_lib.py traffic_masking_server.py traffic_masking_client.py /app/
+COPY control_protocol.py masking_lib.py observer_metrics.py traffic_masking_server.py traffic_masking_client.py /app/
 
 # Copy documentation
 COPY *.md /app/

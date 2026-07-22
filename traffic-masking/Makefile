@@ -7,7 +7,7 @@ PIP        := $(VENV)/bin/pip
 RUFF       := $(VENV)/bin/ruff
 DEPS_STAMP := $(VENV)/.deps-installed
 
-COV := --cov=control_protocol --cov=masking_lib \
+COV := --cov=control_protocol --cov=masking_lib --cov=observer_metrics \
        --cov=traffic_masking_server --cov=traffic_masking_client \
        --cov-branch --cov-report=term-missing
 

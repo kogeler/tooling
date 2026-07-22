@@ -43,6 +43,17 @@ statistically indistinguishable from legitimate traffic.
 - keepalive, health timeout, and exponential reconnect handling;
 - monotonic receive-rate windows and client-total metrics.
 
+`observer_metrics.py` provides:
+
+- a validated external trace event with explicit direction, connection, capture
+  point, outer datagram size, and encapsulation overhead;
+- fixed monotonic windows and idle-gap distributions;
+- outer/inner direction ratios, burst summaries, and size autocorrelation.
+
+The observer module consumes an existing capture. Packet acquisition and mapping
+inner application datagrams to outer transport datagrams remain deployment
+responsibilities.
+
 ## Shaping Modes
 
 In `rate` mode, `--mbps` selects a fixed per-client target. A
@@ -62,6 +73,11 @@ handcrafted experimental inputs, not measured baselines.
 
 Mbps values are decimal application rates. IP, UDP, and enclosing encrypted
 transport overhead require a separate observer measurement.
+
+Both processes expose immutable structured snapshots. Human-readable logs derive
+instantaneous rates from consecutive snapshots rather than cumulative averages.
+Their sockets and session counters are synchronized, and SIGINT/SIGTERM trigger a
+bounded join of non-daemon workers.
 
 ## Security Boundary
 

@@ -12,6 +12,7 @@ import pytest
 CORE_MODULES = [
     "control_protocol",
     "masking_lib",
+    "observer_metrics",
     "traffic_masking_server",
     "traffic_masking_client",
 ]

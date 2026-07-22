@@ -116,8 +116,26 @@ Client health timings are configurable with:
 - `--reconnect-delay-max` / `TRAFFIC_MASKING_RECONNECT_DELAY_MAX`
 
 `--stats-interval` or `TRAFFIC_MASKING_STATS_INTERVAL` controls reporting on
-either endpoint. CLI values override environment defaults. Server logs label
-total and per-client rates separately.
+either endpoint. CLI values override environment defaults. Both endpoints report
+instantaneous monotonic windows. Server logs label total and per-client rates
+separately.
+
+`MaskingTrafficServer.snapshot()` and `AdaptiveTrafficClient.snapshot()` return
+immutable counter/state snapshots for tests and operational integrations. The
+process workers are non-daemon threads; SIGINT and SIGTERM close the active socket
+and join those workers with a bounded timeout.
+
+## Observer Metrics
+
+`observer_metrics.py` defines `ObserverEvent` for captures made at the external
+observer boundary. Every event declares timestamp, direction, outer datagram
+bytes, connection ID, capture point, and encapsulation overhead. Helpers compute
+fixed windows, idle-gap distributions, direction ratios, burst summaries, and
+size autocorrelation using either outer bytes or bytes after declared overhead.
+
+The module analyzes supplied events; it does not capture packets or establish
+that an application datagram maps one-to-one to an outer datagram. Operators must
+collect the trace at the actual enclosing transport boundary.
 
 ## Testing
 

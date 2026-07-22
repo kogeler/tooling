@@ -45,6 +45,10 @@ spike, or guarantee a target aggregate when user traffic already exceeds it.
 - Keep stochastic tests deterministic through injected clocks and RNGs.
 - Preserve the PSK, anti-amplification, sequence, MTU, per-client, and aggregate
   cap tests when changing the data path.
+- Derive runtime rates from consecutive structured snapshots; do not parse logs
+  when a snapshot is available to a test.
+- Treat observer traces as external measurements with explicit capture point,
+  connection ID, direction, byte layer, and encapsulation overhead.
 - Run `make test-fast`, `make lint`, and `make test-live` for changes that affect
   process or network behavior.
 - Runtime code must remain importable with only the standard library.

@@ -8,7 +8,9 @@ test_realistic_patterns.py runners so nothing runs outside pytest. Bounded to st
 CI-safe. Reconnection cases use explicit short keepalive/receive/backoff values.
 """
 
+import os
 import re
+import signal
 import socket
 import time
 
@@ -66,10 +68,15 @@ def test_transmission_bidirectional(spawn, start_server, psk_file):
 
     # Let a few stats windows accumulate, then check real downlink/uplink.
     time.sleep(4)
-    rx = last_match(client, r"Rx:\s*([0-9.]+)\s*Mbps")
-    tx = last_match(client, r"Tx:\s*([0-9.]+)\s*Mbps")
-    assert rx is not None and rx > 0.0, read_log(client)
-    assert tx is not None and tx > 0.0, read_log(client)
+    client_log = read_log(client)
+    rx_windows = [
+        float(value) for value in re.findall(r"Rx:\s*([0-9.]+)\s*Mbps", client_log)
+    ]
+    tx_windows = [
+        float(value) for value in re.findall(r"Tx:\s*([0-9.]+)\s*Mbps", client_log)
+    ]
+    assert any(rate > 0.0 for rate in rx_windows), client_log
+    assert any(rate > 0.0 for rate in tx_windows), client_log
 
 
 def test_reconnection_after_server_restart(spawn, start_server, psk_file):
@@ -102,6 +109,7 @@ def test_reconnection_after_server_restart(spawn, start_server, psk_file):
         client, "Reconnected successfully", 8.0, offset=reconnect_offset
     ), read_log(client, offset=reconnect_offset)
     assert server2.process.poll() is None
+    assert "Receive error" not in read_log(client, offset=reconnect_offset)
 
 
 def test_fixed_rate_is_not_inflated(spawn, start_server, psk_file):
@@ -283,3 +291,28 @@ def test_wrong_psk_client_remains_unregistered(
     assert "New client connected" not in read_log(server)
     assert "Authenticated session accepted" not in read_log(client)
     assert last_match(client, r"Rx:\s*([0-9.]+)\s*Mbps") == 0.0
+
+
+def test_sigterm_stops_both_processes_cleanly(spawn, start_server, psk_file):
+    server, port = start_server(
+        lambda selected_port: [
+            "--host", "127.0.0.1", "--port", str(selected_port),
+            "--mbps", "1", "--stats-interval", "1",
+            "--psk-file", str(psk_file),
+        ],
+        "signal-server",
+    )
+    client = spawn(
+        CLIENT,
+        [
+            "--server", "127.0.0.1", "--port", str(port),
+            "--stats-interval", "1", "--psk-file", str(psk_file),
+        ],
+        "signal-client",
+    )
+    assert wait_for(client, "Authenticated session accepted", 5.0), read_log(client)
+
+    for spawned in (client, server):
+        os.killpg(spawned.process.pid, signal.SIGTERM)
+        assert spawned.process.wait(timeout=5) == 0, read_log(spawned)
+        assert "Traceback" not in read_log(spawned)

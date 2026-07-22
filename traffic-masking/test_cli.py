@@ -6,10 +6,11 @@
 import subprocess
 import sys
 import os
+import shutil
 
 import pytest
 
-from conftest import CLIENT, SERVER, TEST_PSK
+from conftest import BASE_DIR, CLIENT, SERVER, TEST_PSK
 from control_protocol import MIN_CONTROL_MTU
 from traffic_masking_client import AdaptiveTrafficClient
 from traffic_masking_server import MaskingTrafficServer
@@ -217,3 +218,20 @@ def test_profile_mode_has_native_load_and_optional_cap():
     assert uncapped.target_mbps is None
     assert uncapped.max_mbps is None
     assert capped.configured_max_mbps == 1
+
+
+def test_systemd_units_verify_when_analyzer_is_available():
+    analyzer = shutil.which("systemd-analyze")
+    if analyzer is None:
+        pytest.skip("systemd-analyze is not installed")
+    units = [
+        BASE_DIR / "systemd" / "traffic-masking-server.service",
+        BASE_DIR / "systemd" / "traffic-masking-client.service",
+    ]
+    result = subprocess.run(
+        [analyzer, "verify", *(str(unit) for unit in units)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr

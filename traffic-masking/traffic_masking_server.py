@@ -17,6 +17,7 @@ import struct
 import threading
 import time
 from collections import OrderedDict, deque
+from dataclasses import dataclass
 
 from control_protocol import (
     CLIENT_TO_SERVER,
@@ -80,6 +81,29 @@ def _positive_int(value, name):
 
 def _env_default(name, fallback):
     return os.environ.get(name, fallback)
+
+
+@dataclass(frozen=True, slots=True)
+class ServerClientSnapshot:
+    address: tuple[str, int]
+    last_seen: float
+    bytes_received: int
+    packets_received: int
+    bytes_sent: int
+    packets_sent: int
+    current_rate_mbps: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class ServerSnapshot:
+    timestamp: float
+    bytes_sent: int
+    packets_sent: int
+    clients: tuple[ServerClientSnapshot, ...]
+
+    @property
+    def client_count(self):
+        return len(self.clients)
 
 
 class PacketGenerator:
@@ -235,6 +259,7 @@ class MaskingTrafficServer:
         self._clock = clock or time.time
         self._monotonic_clock = monotonic_clock or time.monotonic
         self._sleep = sleep or time.sleep
+        self._sleep_is_injected = sleep is not None
         self._rng = rng or random.Random()
         self._byte_source = byte_source or os.urandom
         self.base_key = psk if psk is not None else INSECURE_DIAGNOSTIC_KEY
@@ -266,19 +291,18 @@ class MaskingTrafficServer:
         )
         self.socket = None
         self.clients = {}  # Only authenticated/validated sessions.
-        self.running = False
+        self._clients_lock = threading.RLock()
+        self._handshake_lock = threading.RLock()
+        self._stats_lock = threading.Lock()
+        self._socket_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._threads = []
         self.packetizer = Packetizer(mtu, FRAME_OVERHEAD)
         self.data_payload_ceiling = self.packetizer.payload_ceiling
-        stats_started = self._monotonic_clock()
         self.stats = {
             "bytes_sent": 0,
             "packets_sent": 0,
-            "start_time": stats_started,
-        }
-        self.last_stats = {
-            "bytes_sent": 0,
-            "packets_sent": 0,
-            "time": stats_started,
         }
         self.stats_interval = stats_interval
         if shape_mode == "profile":
@@ -310,16 +334,39 @@ class MaskingTrafficServer:
         )
 
     def start(self):
-        """Start the server"""
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        # Increase buffers for high throughput
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4194304)  # 4MB
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4194304)  # 4MB
-
-        self.socket.bind((self.host, self.port))
-        self.running = True
+        """Bind the socket and start managed worker threads."""
+        with self._lifecycle_lock:
+            if any(thread.is_alive() for thread in self._threads):
+                raise RuntimeError("server is already running")
+            self._stop_event.clear()
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server_socket.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024
+                )
+                server_socket.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024
+                )
+                server_socket.settimeout(0.5)
+                server_socket.bind((self.host, self.port))
+            except Exception:
+                server_socket.close()
+                raise
+            with self._socket_lock:
+                self.socket = server_socket
+            workers = (
+                ("traffic-masking-server-receive", self.receive_loop),
+                ("traffic-masking-server-send", self.send_loop),
+                ("traffic-masking-server-stats", self.stats_loop),
+                ("traffic-masking-server-cleanup", self.cleanup_loop),
+            )
+            self._threads = [
+                threading.Thread(name=name, target=target, daemon=False)
+                for name, target in workers
+            ]
+            for thread in self._threads:
+                thread.start()
 
         print(
             f"[*] Traffic masking server started on {self.host}:{self.port}", flush=True
@@ -353,58 +400,121 @@ class MaskingTrafficServer:
             flush=True,
         )
 
-        # Start threads
-        threading.Thread(target=self.receive_loop, daemon=True).start()
-        threading.Thread(target=self.send_loop, daemon=True).start()
-        threading.Thread(target=self.stats_loop, daemon=True).start()
-        threading.Thread(target=self.cleanup_loop, daemon=True).start()
+    @property
+    def worker_threads(self):
+        return tuple(self._threads)
+
+    def _current_socket(self):
+        with self._socket_lock:
+            return self.socket
+
+    def _close_socket(self):
+        with self._socket_lock:
+            server_socket = self.socket
+            self.socket = None
+        if server_socket is not None:
+            try:
+                server_socket.close()
+            except OSError:
+                pass
+
+    def _wait_for_pacing(self, delay):
+        if self._sleep_is_injected:
+            self._sleep(delay)
+            return self._stop_event.is_set()
+        return self._stop_event.wait(delay)
 
     def _prune_handshake_state(self, now):
-        while self._handshake_times and self._handshake_times[0] <= now - 1.0:
-            self._handshake_times.popleft()
-        for mapping in (self._prevalidation, self._accepted_auth):
-            expired = [key for key, value in mapping.items() if value["expires"] < now]
-            for key in expired:
-                del mapping[key]
+        with self._handshake_lock:
+            while self._handshake_times and self._handshake_times[0] <= now - 1.0:
+                self._handshake_times.popleft()
+            for mapping in (self._prevalidation, self._accepted_auth):
+                expired = [
+                    key for key, value in mapping.items() if value["expires"] < now
+                ]
+                for key in expired:
+                    del mapping[key]
 
     def _consume_handshake_slot(self, now):
-        self._prune_handshake_state(now)
-        if len(self._handshake_times) >= self.max_handshakes_per_second:
-            return False
-        self._handshake_times.append(now)
-        return True
+        with self._handshake_lock:
+            self._prune_handshake_state(now)
+            if len(self._handshake_times) >= self.max_handshakes_per_second:
+                return False
+            self._handshake_times.append(now)
+            return True
 
     def _record_prevalidation_input(self, addr, byte_count, now):
-        self._prune_handshake_state(now)
-        entry = self._prevalidation.get(addr)
-        if entry is None:
-            if len(self._prevalidation) >= self._handshake_state_limit:
-                return None
-            entry = {"received": 0, "replied": 0, "expires": now + self.cookie_ttl}
-            self._prevalidation[addr] = entry
-        entry["received"] += byte_count
-        entry["expires"] = now + self.cookie_ttl
-        self._prevalidation.move_to_end(addr)
-        return entry
+        with self._handshake_lock:
+            self._prune_handshake_state(now)
+            entry = self._prevalidation.get(addr)
+            if entry is None:
+                if len(self._prevalidation) >= self._handshake_state_limit:
+                    return None
+                entry = {
+                    "received": 0,
+                    "replied": 0,
+                    "expires": now + self.cookie_ttl,
+                }
+                self._prevalidation[addr] = entry
+            entry["received"] += byte_count
+            entry["expires"] = now + self.cookie_ttl
+            self._prevalidation.move_to_end(addr)
+            return entry
 
     def _send_prevalidation(self, addr, datagram, entry):
-        if entry["replied"] + len(datagram) > entry["received"] * 3:
-            return False
-        try:
-            sent = self.socket.sendto(datagram, addr)
-        except OSError:
-            return False
-        if sent != len(datagram):
-            return False
-        entry["replied"] += sent
-        return True
+        with self._handshake_lock:
+            if entry["replied"] + len(datagram) > entry["received"] * 3:
+                return False
+            server_socket = self._current_socket()
+            if server_socket is None:
+                return False
+            try:
+                sent = server_socket.sendto(datagram, addr)
+            except OSError:
+                return False
+            if sent != len(datagram):
+                return False
+            entry["replied"] += sent
+            return True
 
     def prevalidation_totals(self, addr):
         """Return received/replied pre-validation bytes for tests/diagnostics."""
-        entry = self._prevalidation.get(addr)
-        if entry is None:
-            return 0, 0
-        return entry["received"], entry["replied"]
+        with self._handshake_lock:
+            entry = self._prevalidation.get(addr)
+            if entry is None:
+                return 0, 0
+            return entry["received"], entry["replied"]
+
+    def _add_client(self, addr, client):
+        with self._clients_lock:
+            self.clients[addr] = client
+
+    def _get_client(self, addr):
+        with self._clients_lock:
+            return self.clients.get(addr)
+
+    def _client_items(self):
+        with self._clients_lock:
+            return tuple(self.clients.items())
+
+    def _remove_client(self, addr, expected=None):
+        with self._clients_lock:
+            client = self.clients.get(addr)
+            if client is None or (expected is not None and client is not expected):
+                return None
+            return self.clients.pop(addr)
+
+    def _record_client_receive(self, addr, now, byte_count=0):
+        with self._clients_lock:
+            client = self.clients.get(addr)
+            if client is None:
+                return False
+            with client["lock"]:
+                client["last_seen"] = now
+                if byte_count:
+                    client["bytes_received"] += byte_count
+                    client["packets_received"] += 1
+            return True
 
     def _control_padding(self):
         return make_padding(
@@ -465,15 +575,6 @@ class MaskingTrafficServer:
             return False
 
         replay_key = frame.client_nonce + frame.session_nonce
-        self._prune_handshake_state(now)
-        if replay_key in self._accepted_auth:
-            return False
-        prospective_clients = len(self.clients) - (1 if addr in self.clients else 0) + 1
-        if prospective_clients > self.max_clients:
-            return False
-        if len(self._accepted_auth) >= self._handshake_state_limit:
-            return False
-
         receive_key = derive_session_key(
             self.base_key,
             frame.client_nonce,
@@ -494,18 +595,29 @@ class MaskingTrafficServer:
             send_key,
             padding=self._control_padding(),
         )
-        if not self._send_prevalidation(addr, accept, entry):
-            return False
-
-        self._accepted_auth[replay_key] = {
-            "expires": now + self.cookie_ttl
-        }
-        self.clients[addr] = self._new_client_state(
+        client = self._new_client_state(
             frame,
             now,
             receive_key,
             send_key,
         )
+        with self._handshake_lock, self._clients_lock:
+            self._prune_handshake_state(now)
+            if replay_key in self._accepted_auth:
+                return False
+            prospective_clients = (
+                len(self.clients) - (1 if addr in self.clients else 0) + 1
+            )
+            if prospective_clients > self.max_clients:
+                return False
+            if len(self._accepted_auth) >= self._handshake_state_limit:
+                return False
+            if not self._send_prevalidation(addr, accept, entry):
+                return False
+            self._accepted_auth[replay_key] = {
+                "expires": now + self.cookie_ttl
+            }
+            self._add_client(addr, client)
         print(f"[+] New client connected: {addr}", flush=True)
         return True
 
@@ -539,13 +651,12 @@ class MaskingTrafficServer:
             generator = profile_event_generator(self.profile, rng=client_rng)
 
         return {
+            "lock": threading.RLock(),
             "last_seen": now,
             "bytes_received": 0,
             "packets_received": 0,
             "bytes_sent": 0,
             "packets_sent": 0,
-            "last_bytes_sent": 0,
-            "last_packets_sent": 0,
             "client_nonce": frame.client_nonce,
             "session_nonce": frame.session_nonce,
             "receive_key": receive_key,
@@ -578,29 +689,31 @@ class MaskingTrafficServer:
         }
 
     def _handle_session_frame(self, inspected, datagram, addr, now):
-        client = self.clients.get(addr)
-        if client is None:
-            return False
-        if inspected.message_type not in (MessageType.KEEPALIVE, MessageType.DATA):
-            return False
-        if (
-            inspected.client_nonce != client["client_nonce"]
-            or inspected.session_nonce != client["session_nonce"]
-        ):
-            return False
-        try:
-            frame = decode_frame(datagram, client["receive_key"])
-        except ProtocolError:
-            return False
-        if frame.sequence <= client["receive_sequence"]:
-            return False
+        with self._clients_lock:
+            client = self.clients.get(addr)
+            if client is None:
+                return False
+            with client["lock"]:
+                if inspected.message_type not in (
+                    MessageType.KEEPALIVE,
+                    MessageType.DATA,
+                ):
+                    return False
+                if (
+                    inspected.client_nonce != client["client_nonce"]
+                    or inspected.session_nonce != client["session_nonce"]
+                ):
+                    return False
+                try:
+                    frame = decode_frame(datagram, client["receive_key"])
+                except ProtocolError:
+                    return False
+                if frame.sequence <= client["receive_sequence"]:
+                    return False
 
-        client["receive_sequence"] = frame.sequence
-        client["last_seen"] = now
-        if frame.message_type is MessageType.DATA:
-            client["bytes_received"] += len(datagram)
-            client["packets_received"] += 1
-        return True
+                client["receive_sequence"] = frame.sequence
+                byte_count = len(datagram) if frame.message_type is MessageType.DATA else 0
+                return self._record_client_receive(addr, now, byte_count)
 
     def handle_datagram(self, datagram, addr):
         """Validate and dispatch one UDP datagram; return whether it was accepted."""
@@ -614,44 +727,55 @@ class MaskingTrafficServer:
         if inspected.message_type not in (MessageType.HELLO, MessageType.AUTH):
             return False
 
-        entry = self._record_prevalidation_input(addr, len(datagram), now)
-        if entry is None or not self._consume_handshake_slot(now):
-            return False
-        try:
-            frame = decode_frame(datagram, self.base_key)
-        except ProtocolError:
-            return False
-        if frame.message_type is MessageType.HELLO:
-            return self._handle_hello(frame, addr, entry, now)
-        return self._handle_auth(frame, addr, entry, now)
+        with self._handshake_lock:
+            entry = self._record_prevalidation_input(addr, len(datagram), now)
+            if entry is None or not self._consume_handshake_slot(now):
+                return False
+            try:
+                frame = decode_frame(datagram, self.base_key)
+            except ProtocolError:
+                return False
+            if frame.message_type is MessageType.HELLO:
+                return self._handle_hello(frame, addr, entry, now)
+            return self._handle_auth(frame, addr, entry, now)
 
     def receive_loop(self):
         """Receive and authenticate packets from clients."""
-        while self.running:
+        while not self._stop_event.is_set():
+            server_socket = self._current_socket()
+            if server_socket is None:
+                break
             try:
-                data, addr = self.socket.recvfrom(MAX_DATAGRAM_SIZE)
+                data, addr = server_socket.recvfrom(MAX_DATAGRAM_SIZE)
                 self.handle_datagram(data, addr)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if self._stop_event.is_set() or server_socket is not self._current_socket():
+                    continue
+                print(f"[!] Receive error: {exc}", flush=True)
             except Exception as exc:
-                if self.running:
+                if not self._stop_event.is_set():
                     print(f"[!] Receive error: {exc}", flush=True)
 
     def _frame_data_for_client(self, client, payload):
-        client["send_sequence"] += 1
-        return encode_frame(
-            MessageType.DATA,
-            client["client_nonce"],
-            client["session_nonce"],
-            client["send_sequence"],
-            client["send_key"],
-            payload=payload,
-        )
+        with client["lock"]:
+            client["send_sequence"] += 1
+            return encode_frame(
+                MessageType.DATA,
+                client["client_nonce"],
+                client["session_nonce"],
+                client["send_sequence"],
+                client["send_key"],
+                payload=payload,
+            )
 
     def send_loop(self):
         """Serve one datagram per client per round under the aggregate cap."""
-        while self.running:
-            clients = list(self.clients.items())
+        while not self._stop_event.is_set():
+            clients = self._client_items()
             if not clients:
-                self._sleep(0.1)
+                self._stop_event.wait(0.1)
                 continue
 
             sent_any = False
@@ -674,38 +798,40 @@ class MaskingTrafficServer:
                         delay,
                         max(0.0, next_ready_at - self._monotonic_clock()),
                     )
-                self._sleep(delay)
+                self._stop_event.wait(delay)
 
     def _next_client_fragment(self, client):
-        if client["pending_fragments"]:
+        with client["lock"]:
+            if client["pending_fragments"]:
+                fragment = client["pending_fragments"].popleft()
+                if not client["pending_fragments"]:
+                    client["delay_after_send"] = client["pending_event_delay"]
+                return fragment
+            now = self._monotonic_clock()
+            if now < client["next_event_at"]:
+                return None
+
+            event = self._next_shape_event(client)
+            if not event.byte_count:
+                client["next_event_at"] = now + event.delay
+                return None
+            payload = self._make_event_payload(client, event)
+            client["pending_fragments"].extend(self.packetizer.packetize(payload))
+            if not client["pending_fragments"]:
+                return None
+            client["pending_event_delay"] = event.delay
             fragment = client["pending_fragments"].popleft()
             if not client["pending_fragments"]:
-                client["delay_after_send"] = client["pending_event_delay"]
+                client["delay_after_send"] = event.delay
             return fragment
-        now = self._monotonic_clock()
-        if now < client["next_event_at"]:
-            return None
-
-        event = self._next_shape_event(client)
-        if not event.byte_count:
-            client["next_event_at"] = now + event.delay
-            return None
-        payload = self._make_event_payload(client, event)
-        client["pending_fragments"].extend(self.packetizer.packetize(payload))
-        if not client["pending_fragments"]:
-            return None
-        client["pending_event_delay"] = event.delay
-        fragment = client["pending_fragments"].popleft()
-        if not client["pending_fragments"]:
-            client["delay_after_send"] = event.delay
-        return fragment
 
     def _complete_client_fragment(self, client):
-        if client["delay_after_send"] is not None:
-            client["next_event_at"] = (
-                self._monotonic_clock() + client["delay_after_send"]
-            )
-            client["delay_after_send"] = None
+        with client["lock"]:
+            if client["delay_after_send"] is not None:
+                client["next_event_at"] = (
+                    self._monotonic_clock() + client["delay_after_send"]
+                )
+                client["delay_after_send"] = None
 
     def _next_shape_event(self, client):
         if self.shape_mode == "profile":
@@ -737,102 +863,138 @@ class MaskingTrafficServer:
             client_reservation.delay if client_reservation else 0.0,
             total_reservation.delay,
         )
-        if delay:
-            self._sleep(delay)
         sent = 0
         try:
-            sent = self.socket.sendto(framed, addr)
+            if delay and self._wait_for_pacing(delay):
+                return 0
+            server_socket = self._current_socket()
+            if server_socket is None:
+                return 0
+            sent = server_socket.sendto(framed, addr)
             if sent == len(framed):
-                self.stats["bytes_sent"] += sent
-                self.stats["packets_sent"] += 1
-                client["bytes_sent"] += sent
-                client["packets_sent"] += 1
+                with self._stats_lock:
+                    self.stats["bytes_sent"] += sent
+                    self.stats["packets_sent"] += 1
+                    with client["lock"]:
+                        client["bytes_sent"] += sent
+                        client["packets_sent"] += 1
             else:
                 sent = max(0, min(sent, len(framed)))
         except OSError as exc:
-            print(f"[!] Send error to client {addr}: {exc}", flush=True)
+            if not self._stop_event.is_set():
+                print(f"[!] Send error to client {addr}: {exc}", flush=True)
         finally:
             if client_reservation:
                 limiter.commit(client_reservation, successful_bytes=sent)
             self.total_rate_limiter.commit(
                 total_reservation, successful_bytes=sent
             )
+        return sent
+
+    def _remove_inactive_clients(self, now, idle_seconds=30.0):
+        removed = []
+        with self._clients_lock:
+            for addr, client in tuple(self.clients.items()):
+                with client["lock"]:
+                    inactive = now - client["last_seen"] > idle_seconds
+                if inactive and self._remove_client(addr, expected=client) is not None:
+                    removed.append(addr)
+        return tuple(removed)
 
     def cleanup_loop(self):
-        """Remove inactive clients"""
-        while self.running:
-            current_time = time.time()
-            inactive_clients = []
-
-            for addr, info in self.clients.items():
-                if current_time - info["last_seen"] > 30:  # 30 seconds of inactivity
-                    inactive_clients.append(addr)
-
-            for addr in inactive_clients:
+        """Remove inactive clients until shutdown is requested."""
+        while not self._stop_event.wait(5.0):
+            for addr in self._remove_inactive_clients(self._clock()):
                 print(f"[-] Client removed (inactive): {addr}", flush=True)
-                del self.clients[addr]
 
-            time.sleep(5)
+    def snapshot(self, now=None):
+        """Return an immutable, internally consistent runtime snapshot."""
+        clients = []
+        with self._stats_lock, self._clients_lock:
+            timestamp = self._monotonic_clock() if now is None else float(now)
+            bytes_sent = self.stats["bytes_sent"]
+            packets_sent = self.stats["packets_sent"]
+            for addr, client in self.clients.items():
+                with client["lock"]:
+                    clients.append(
+                        ServerClientSnapshot(
+                            address=addr,
+                            last_seen=client["last_seen"],
+                            bytes_received=client["bytes_received"],
+                            packets_received=client["packets_received"],
+                            bytes_sent=client["bytes_sent"],
+                            packets_sent=client["packets_sent"],
+                            current_rate_mbps=client["current_rate_mbps"],
+                        )
+                    )
+        return ServerSnapshot(
+            timestamp=timestamp,
+            bytes_sent=bytes_sent,
+            packets_sent=packets_sent,
+            clients=tuple(sorted(clients, key=lambda item: item.address)),
+        )
 
     def stats_loop(self):
         """Print total and per-client application-datagram egress rates."""
-        while self.running:
-            self._sleep(self.stats_interval)
-            now = self._monotonic_clock()
-
-            # Calculate instantaneous rates based on delta since last stats
-            time_delta = now - self.last_stats["time"]
-            bytes_delta = self.stats["bytes_sent"] - self.last_stats["bytes_sent"]
-            packets_delta = self.stats["packets_sent"] - self.last_stats["packets_sent"]
-
-            if time_delta > 0:
-                # Instantaneous rate (not cumulative average), decimal Mbps
-                mbps = (bytes_delta * 8) / (time_delta * 1_000_000)
-                pps = packets_delta / time_delta
-
-                pattern_desc = (
-                    "rate:per-client"
-                    if self.shape_mode == "rate" and self.min_mbps is None
-                    else f"floating:{self.min_mbps:.2f}-{self.max_mbps:.2f}Mbps"
-                    if self.shape_mode == "rate"
-                    else f"experimental-profile:{self.profile.value}"
+        previous = self.snapshot()
+        while not self._stop_event.wait(self.stats_interval):
+            current = self.snapshot()
+            time_delta = current.timestamp - previous.timestamp
+            if time_delta <= 0:
+                previous = current
+                continue
+            bytes_delta = current.bytes_sent - previous.bytes_sent
+            packets_delta = current.packets_sent - previous.packets_sent
+            mbps = bytes_delta * 8 / (time_delta * 1_000_000)
+            pps = packets_delta / time_delta
+            pattern_desc = (
+                "rate:per-client"
+                if self.shape_mode == "rate" and self.min_mbps is None
+                else f"floating:{self.min_mbps:.2f}-{self.max_mbps:.2f}Mbps"
+                if self.shape_mode == "rate"
+                else f"experimental-profile:{self.profile.value}"
+            )
+            previous_clients = {item.address: item for item in previous.clients}
+            client_rates = []
+            for client in current.clients:
+                prior = previous_clients.get(client.address)
+                prior_bytes = prior.bytes_sent if prior is not None else 0
+                client_mbps = (
+                    (client.bytes_sent - prior_bytes) * 8
+                    / (time_delta * 1_000_000)
                 )
-                client_rates = []
-                for addr, client in self.clients.items():
-                    client_bytes = (
-                        client["bytes_sent"] - client["last_bytes_sent"]
-                    )
-                    client_mbps = client_bytes * 8 / (time_delta * 1_000_000)
-                    target = client["current_rate_mbps"]
-                    target_text = (
-                        f",target={target:.2f}Mbps"
-                        if target is not None
-                        else ",native-profile"
-                    )
-                    client_rates.append(
-                        f"{addr[0]}:{addr[1]}={client_mbps:.2f}Mbps{target_text}"
-                    )
-                    client["last_bytes_sent"] = client["bytes_sent"]
-                    client["last_packets_sent"] = client["packets_sent"]
-                per_client = ";".join(client_rates) or "none"
-                print(
-                    f"[STATS] Clients: {len(self.clients)} | "
-                    f"Total Rate: {mbps:.2f} Mbps | "
-                    f"Total PPS: {pps:.0f} | "
-                    f"Per-client: {per_client} | Pattern: {pattern_desc}",
-                    flush=True,
+                target_text = (
+                    f",target={client.current_rate_mbps:.2f}Mbps"
+                    if client.current_rate_mbps is not None
+                    else ",native-profile"
                 )
+                client_rates.append(
+                    f"{client.address[0]}:{client.address[1]}="
+                    f"{client_mbps:.2f}Mbps{target_text}"
+                )
+            per_client = ";".join(client_rates) or "none"
+            print(
+                f"[STATS] Clients: {current.client_count} | "
+                f"Total Rate: {mbps:.2f} Mbps | "
+                f"Total PPS: {pps:.0f} | "
+                f"Per-client: {per_client} | Pattern: {pattern_desc}",
+                flush=True,
+            )
+            previous = current
 
-            # Update last stats for next iteration
-            self.last_stats["bytes_sent"] = self.stats["bytes_sent"]
-            self.last_stats["packets_sent"] = self.stats["packets_sent"]
-            self.last_stats["time"] = now
-
-    def stop(self):
-        """Stop the server"""
-        self.running = False
-        if self.socket:
-            self.socket.close()
+    def stop(self, join_timeout=2.0):
+        """Request shutdown, close the socket, and join workers once."""
+        with self._lifecycle_lock:
+            self._stop_event.set()
+            self._close_socket()
+            threads = tuple(self._threads)
+        deadline = time.monotonic() + max(0.0, float(join_timeout))
+        current = threading.current_thread()
+        for thread in threads:
+            if thread is current:
+                continue
+            thread.join(max(0.0, deadline - time.monotonic()))
+        return not any(thread.is_alive() for thread in threads if thread is not current)
 
 
 def main():

@@ -41,7 +41,6 @@ def connected_client(clock, response_ratio=0.25):
         rng=random.Random(44),
         byte_source=lambda size: b"u" * size,
         monotonic_clock=clock,
-        sleep=clock.advance,
     )
     client.socket = RecordingSocket()
     client.server_addr = ("192.0.2.10", 8888)
@@ -104,3 +103,23 @@ def test_uncredited_data_cannot_bypass_budget_but_keepalive_can_create_debt():
         MessageType.KEEPALIVE, allow_budget_debt=True
     ) > 0
     assert client.uplink_budget.available_bytes == 0
+
+
+def test_client_snapshot_is_atomic_and_uses_monotonic_timestamp():
+    clock = FakeClock()
+    client = connected_client(clock, response_ratio=0.25)
+    clock.advance(2.0)
+    client._record_received_data(1000)
+    sent = client._send_session_message(
+        MessageType.KEEPALIVE, allow_budget_debt=True
+    )
+
+    snapshot = client.snapshot()
+    assert snapshot.timestamp == 2.0
+    assert snapshot.connected
+    assert snapshot.handshake_accepted
+    assert snapshot.bytes_received == 1000
+    assert snapshot.packets_received == 1
+    assert snapshot.bytes_sent == sent
+    assert snapshot.packets_sent == 1
+    assert snapshot.uplink_ratio == pytest.approx(sent / 1000)
