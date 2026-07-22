@@ -33,8 +33,12 @@ The runtime uses only the Python standard library.
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+python traffic_masking_server.py --help
+python traffic_masking_client.py --help
 ```
+
+`requirements.txt` is the intentionally empty freeze of the runtime environment.
+The canonical release version is stored in `.version`.
 
 Create one binary PSK and install the same file on both endpoints:
 
@@ -103,7 +107,9 @@ payload encryption; confidentiality still depends on the external transport.
 
 `--insecure-diagnostic` uses a public built-in key. It is intended only for
 isolated local diagnostics and remains subject to handshake, client, and rate
-limits.
+limits. `--max-clients` bounds validated sessions,
+`--max-handshakes-per-second` bounds handshake work, and `--max-total-mbps`
+bounds aggregate server egress.
 
 ## Timing And Metrics
 
@@ -155,16 +161,25 @@ replace a capture at the enclosing encrypted transport boundary.
 ## Docker
 
 ```bash
-docker build -t traffic-masking .
+VERSION="$(cat .version)"
+docker build --build-arg VERSION="$VERSION" -t "traffic-masking:$VERSION" .
 docker run --network host \
   --mount type=bind,src="$PWD/traffic-masking.psk",dst=/run/secrets/traffic-masking.psk,readonly \
-  traffic-masking traffic_masking_server.py \
+  "traffic-masking:$VERSION" traffic_masking_server.py \
   --shape-mode rate --min-mbps 2 --max-mbps 8 \
   --psk-file /run/secrets/traffic-masking.psk
 ```
 
 The mounted secret must be readable by container UID 1000 while retaining mode
-`0400` or `0600` and no group/other permission bits.
+`0400` or `0600` and no group/other permission bits. The build fails when its
+version argument differs from `.version`. The image intentionally has no
+healthcheck: process liveness would not prove authenticated data flow, while an
+active protocol probe would create session state.
+
+For rootless Podman, add `--userns=keep-id:uid=1000,gid=1000` to `podman run` so
+the host-owned mode `0600` bind mount maps to the image user. With Docker Engine
+without user-namespace remapping, ensure the mounted file is owned by numeric UID
+1000; other mappings require an equivalent ownership adjustment.
 
 ## Systemd
 

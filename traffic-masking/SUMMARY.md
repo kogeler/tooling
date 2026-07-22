@@ -6,6 +6,9 @@ The project generates an authenticated UDP cover stream. It does not implement
 the encrypted transport that must multiplex cover bytes with user traffic. Raw
 UDP output is separately observable and unencrypted.
 
+The runtime has no third-party Python dependencies. `.version` is the canonical
+release version; container builds reject a different OCI version argument.
+
 No reference dataset currently establishes that the generated aggregate is
 statistically indistinguishable from legitimate traffic.
 

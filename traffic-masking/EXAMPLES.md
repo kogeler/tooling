@@ -98,14 +98,19 @@ of `0.2`.
 ## Docker
 
 ```bash
-docker build -t traffic-masking .
+VERSION="$(cat .version)"
+docker build --build-arg VERSION="$VERSION" -t "traffic-masking:$VERSION" .
 
 docker run --network host \
   --mount type=bind,src="$PWD/traffic-masking.psk",dst=/run/secrets/traffic-masking.psk,readonly \
-  traffic-masking traffic_masking_server.py \
+  "traffic-masking:$VERSION" traffic_masking_server.py \
   --shape-mode profile --profile mixed --max-mbps 8 --padding random \
   --psk-file /run/secrets/traffic-masking.psk
 ```
+
+With rootless Podman, use the same command as `podman run` and add
+`--userns=keep-id:uid=1000,gid=1000` so container UID 1000 can read the
+host-owned mode `0600` PSK.
 
 ## Monitoring
 
@@ -114,4 +119,9 @@ sudo tcpdump -i any -n udp port 8888 -c 100
 grep "Total Rate:" server.log
 grep "Per-client:" server.log
 grep "Uplink ratio:" client.log
+grep '^\[SNAPSHOT\] ' structured.log
 ```
+
+The log commands inspect application counters. The direct UDP capture is useful
+for diagnostics but does not represent an enclosing encrypted transport; capture
+that transport separately at the declared observer boundary.

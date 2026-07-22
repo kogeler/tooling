@@ -3,10 +3,11 @@
 
 """Input validation: bad config raises ValueError; bad CLI exits with code 2."""
 
+import os
+import re
+import shutil
 import subprocess
 import sys
-import os
-import shutil
 
 import pytest
 
@@ -235,3 +236,13 @@ def test_systemd_units_verify_when_analyzer_is_available():
         timeout=10,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_release_version_is_canonical_for_container_metadata():
+    version = (BASE_DIR / ".version").read_text().strip()
+    dockerfile = (BASE_DIR / "Dockerfile").read_text()
+
+    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version)
+    assert "ARG VERSION" in dockerfile
+    assert 'org.opencontainers.image.version="${VERSION}"' in dockerfile
+    assert 'test "${VERSION}" = "$(cat /app/.version)"' in dockerfile

@@ -52,3 +52,5 @@ spike, or guarantee a target aggregate when user traffic already exceeds it.
 - Run `make test-fast`, `make lint`, and `make test-live` for changes that affect
   process or network behavior.
 - Runtime code must remain importable with only the standard library.
+- Treat `.version` as the release source of truth and pass it to container builds;
+  the Dockerfile must reject mismatched image metadata.
