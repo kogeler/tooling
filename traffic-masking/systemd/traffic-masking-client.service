@@ -1,52 +1,59 @@
 [Unit]
-Description=Traffic Masking Client (Maximum Configuration)
-Documentation=https://github.com/traffic-masking/README.md
+Description=Traffic Masking Client
+Documentation=https://github.com/kogeler/tooling/tree/main/traffic-masking
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
-User=nobody
-Group=nogroup
+User=traffic-masking
+Group=traffic-masking
 
-# Working directory
 WorkingDirectory=/opt/traffic-masking
-
-# Environment
 Environment="PYTHONUNBUFFERED=1"
-Environment="SERVER_IP=127.0.0.1"  # Override with drop-in file
+LoadCredential=control.psk:/etc/traffic-masking/control.psk
 
-# Maximum configuration with advanced features
+# Override SERVER_IP with a drop-in file.
+Environment="SERVER_IP=127.0.0.1"
+
+# Client with an explicit uplink response and observable padding
 ExecStart=/usr/bin/python3 /opt/traffic-masking/traffic_masking_client.py \
     --server ${SERVER_IP} \
     --port 8888 \
     --response 0.3 \
-    --advanced \
-    --uplink-profile mixed \
-    --header rtp \
     --padding random \
     --mtu 1200 \
-    --entropy 1.0 \
-    --stats-interval 10
+    --stats-interval 10 \
+    --psk-file %d/control.psk
 
-# Restart policy
-Restart=always
+Restart=on-failure
 RestartSec=10
-StartLimitInterval=60
-StartLimitBurst=3
+TimeoutStopSec=5
 
-# Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/log
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+LimitNOFILE=4096
 
-# Resource limits
-LimitNOFILE=65536
-Nice=-10
-
-# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=traffic-masking-client

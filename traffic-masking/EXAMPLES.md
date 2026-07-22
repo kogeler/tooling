@@ -1,163 +1,127 @@
-# Traffic Masking System - Examples
+# Traffic Masking Examples
 
-## Quick Start
+All examples require the same restrictive PSK file on the server and client:
 
 ```bash
-# Test the system
-python test_traffic_masking.py --quick
-
-# Basic server and client
-python traffic_masking_server.py --mbps 5
-python traffic_masking_client.py --server 127.0.0.1 --response 0.3
-
-# Floating rate (recommended)
-python traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced
-python traffic_masking_client.py --server 127.0.0.1 --response 0.3 --advanced
+umask 077
+openssl rand 32 > traffic-masking.psk
 ```
 
-## Use Cases
+Run these UDP processes only inside the intended external encrypted transport.
+Direct raw-UDP use is suitable for local diagnostics, not confidentiality.
 
-### Mask Video Calls
+## Fixed Rate
+
 ```bash
-# Google Meet / Zoom / Teams
-python traffic_masking_server.py --min-mbps 1 --max-mbps 5 --advanced --profile video
-
-# WhatsApp / Telegram voice calls
-python traffic_masking_server.py --min-mbps 0.5 --max-mbps 1.5 --advanced --profile voip
-```
-
-### Mask Web Browsing
-```bash
-python traffic_masking_server.py --min-mbps 1 --max-mbps 4 --advanced --profile web --header quic
-```
-
-### Maximum Security Configuration
-```bash
-# Server
 python traffic_masking_server.py \
-  --min-mbps 3 --max-mbps 10 \
-  --advanced --profile mixed \
-  --header rtp --padding random \
-  --entropy 1.0
+  --host 0.0.0.0 --port 8888 \
+  --shape-mode rate --mbps 5 \
+  --max-clients 4 --max-total-mbps 20 \
+  --psk-file ./traffic-masking.psk
 
-# Client
 python traffic_masking_client.py \
-  --server SERVER_IP --response 0.4 \
-  --advanced --uplink-profile mixed \
-  --header rtp --padding random
+  --server SERVER_IP --port 8888 \
+  --psk-file ./traffic-masking.psk
 ```
 
-### Performance Optimized
+The 5 Mbps target is per validated client. The server-wide cap is 20 Mbps.
+
+## Floating Rate
+
 ```bash
-# Lower CPU usage, good throughput
 python traffic_masking_server.py \
-  --mbps 8 --advanced --profile web \
-  --header none --padding none --entropy 0.7
+  --shape-mode rate --min-mbps 2 --max-mbps 8 \
+  --max-total-mbps 16 \
+  --psk-file ./traffic-masking.psk
 ```
 
-## Integration
+Each client receives an independent bounded rate sequence.
 
-### WireGuard
-```ini
-# /etc/wireguard/wg0.conf
-[Interface]
-PostUp = systemctl start traffic-masking-server
-PreDown = systemctl stop traffic-masking-server
-```
+## Native Profile With Padding
 
-### Docker
 ```bash
-# Build and run
-docker build -t traffic-masking .
+python traffic_masking_server.py \
+  --shape-mode profile --profile web --max-mbps 4 \
+  --padding fixed_buckets \
+  --psk-file ./traffic-masking.psk
 
-# Server
-docker run -d --name tm-server --network host traffic-masking \
-  traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced
-
-# Client
-docker run -d --name tm-client --network host traffic-masking \
-  traffic_masking_client.py --server SERVER_IP --response 0.3 --advanced
+python traffic_masking_client.py \
+  --server SERVER_IP --response 0.05 --padding random \
+  --psk-file ./traffic-masking.psk
 ```
 
-### Docker Compose
-```yaml
-version: '3.8'
-services:
-  server:
-    build: .
-    network_mode: host
-    command: traffic_masking_server.py --min-mbps 2 --max-mbps 8 --advanced
-    restart: unless-stopped
+Profile timings and event sizes are experimental. The cap only delays offered
+load above 4 Mbps; it does not force the profile to reach 4 Mbps.
 
-  client:
-    build: .
-    network_mode: host
-    command: traffic_masking_client.py --server ${SERVER_IP} --response 0.3 --advanced
-    restart: unless-stopped
-    depends_on:
-      - server
-```
+## Local Diagnostic
 
-## Performance Tuning
-
-### Network Buffers (Linux)
 ```bash
-# Temporary
-sudo sysctl -w net.core.rmem_max=134217728
-sudo sysctl -w net.core.wmem_max=134217728
+python traffic_masking_server.py \
+  --host 127.0.0.1 --mbps 1 --insecure-diagnostic
 
-# Permanent
-echo "net.core.rmem_max=134217728" | sudo tee -a /etc/sysctl.conf
-echo "net.core.wmem_max=134217728" | sudo tee -a /etc/sysctl.conf
-sudo sysctl -p
+python traffic_masking_client.py \
+  --server 127.0.0.1 --insecure-diagnostic
 ```
 
-### Process Priority
+The diagnostic mode uses no secret. Keep it on an isolated local interface.
+
+## Short Timing Values For Testing
+
 ```bash
-# High priority
-sudo nice -n -10 python traffic_masking_server.py --min-mbps 5 --max-mbps 15 --advanced
-
-# CPU affinity (cores 0,1)
-taskset -c 0,1 python traffic_masking_server.py --min-mbps 5 --max-mbps 15 --advanced
+python traffic_masking_client.py \
+  --server 127.0.0.1 \
+  --keepalive-interval 0.5 \
+  --keepalive-jitter 0 \
+  --receive-timeout 2 \
+  --reconnect-delay-min 0.2 \
+  --reconnect-delay-max 1 \
+  --psk-file ./traffic-masking.psk
 ```
 
-### PyPy for Better Performance
+The receive timeout must exceed the maximum jittered keepalive interval.
+
+## Environment Defaults
+
 ```bash
-sudo apt-get install pypy3
-pypy3 -m pip install numpy
-pypy3 traffic_masking_server.py --min-mbps 5 --max-mbps 15 --advanced
+TRAFFIC_MASKING_KEEPALIVE_INTERVAL=2 \
+TRAFFIC_MASKING_RECEIVE_TIMEOUT=8 \
+TRAFFIC_MASKING_RECONNECT_DELAY_MIN=0.5 \
+TRAFFIC_MASKING_RECONNECT_DELAY_MAX=10 \
+TRAFFIC_MASKING_STATS_INTERVAL=2 \
+python traffic_masking_client.py \
+  --server SERVER_IP --psk-file ./traffic-masking.psk
 ```
+
+Set `TRAFFIC_MASKING_KEEPALIVE_JITTER` to override the default fractional jitter
+of `0.2`.
+
+## Docker
+
+```bash
+VERSION="$(cat .version)"
+docker build --build-arg VERSION="$VERSION" -t "traffic-masking:$VERSION" .
+
+docker run --network host \
+  --mount type=bind,src="$PWD/traffic-masking.psk",dst=/run/secrets/traffic-masking.psk,readonly \
+  "traffic-masking:$VERSION" traffic_masking_server.py \
+  --shape-mode profile --profile mixed --max-mbps 8 --padding random \
+  --psk-file /run/secrets/traffic-masking.psk
+```
+
+With rootless Podman, use the same command as `podman run` and add
+`--userns=keep-id:uid=1000,gid=1000` so container UID 1000 can read the
+host-owned mode `0600` PSK.
 
 ## Monitoring
 
 ```bash
-# Traffic analysis
 sudo tcpdump -i any -n udp port 8888 -c 100
-sudo iftop -i eth0 -f "udp port 8888"
-
-# Process monitoring
-htop
-pidstat -p $(pgrep -f traffic_masking_server) 1
-
-# Extract rates from logs
-grep "Rate:" server.log | awk '{print $4}' | sort -n
-
-# Average rate
-grep "Rate:" server.log | awk '{sum+=$4; count++} END {print sum/count}'
+grep "Total Rate:" server.log
+grep "Per-client:" server.log
+grep "Uplink ratio:" client.log
+grep '^\[SNAPSHOT\] ' structured.log
 ```
 
-## Troubleshooting
-
-```bash
-# Test connectivity
-nc -u -v SERVER_IP 8888
-echo "TEST" | nc -u -w1 SERVER_IP 8888
-
-# Debug mode with verbose output
-PYTHONUNBUFFERED=1 python -u traffic_masking_server.py \
-  --mbps 5 --advanced --stats-interval 1 2>&1 | tee server.log
-
-# Network statistics
-netstat -su | grep -A 5 Udp:
-ss -u -a -n | grep 8888
-```
+The log commands inspect application counters. The direct UDP capture is useful
+for diagnostics but does not represent an enclosing encrypted transport; capture
+that transport separately at the declared observer boundary.
