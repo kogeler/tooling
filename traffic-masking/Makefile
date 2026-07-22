@@ -9,7 +9,7 @@ DEPS_STAMP := $(VENV)/.deps-installed
 
 COV := --cov=control_protocol --cov=masking_lib --cov=observer_metrics \
        --cov=traffic_masking_server --cov=traffic_masking_client \
-       --cov-branch --cov-report=term-missing
+       --cov-branch --cov-report=term-missing --cov-fail-under=75
 
 .PHONY: venv test test-fast test-live lint run-server run-client clean
 

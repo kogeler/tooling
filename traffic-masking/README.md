@@ -118,7 +118,8 @@ Client health timings are configurable with:
 `--stats-interval` or `TRAFFIC_MASKING_STATS_INTERVAL` controls reporting on
 either endpoint. CLI values override environment defaults. Both endpoints report
 instantaneous monotonic windows. Server logs label total and per-client rates
-separately.
+separately. `--stats-json` switches periodic output to `[SNAPSHOT]`-prefixed JSON
+with cumulative counters, state, and the current monotonic window.
 
 `MaskingTrafficServer.snapshot()` and `AdaptiveTrafficClient.snapshot()` return
 immutable counter/state snapshots for tests and operational integrations. The
@@ -147,7 +148,9 @@ make test
 ```
 
 The live suite starts real loopback server/client processes and requires local
-UDP sockets and process creation.
+UDP sockets and process creation. On Linux with procfs it also verifies that each
+process owns only its declared UDP socket. This application-level smoke does not
+replace a capture at the enclosing encrypted transport boundary.
 
 ## Docker
 

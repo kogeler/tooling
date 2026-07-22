@@ -74,10 +74,11 @@ handcrafted experimental inputs, not measured baselines.
 Mbps values are decimal application rates. IP, UDP, and enclosing encrypted
 transport overhead require a separate observer measurement.
 
-Both processes expose immutable structured snapshots. Human-readable logs derive
-instantaneous rates from consecutive snapshots rather than cumulative averages.
-Their sockets and session counters are synchronized, and SIGINT/SIGTERM trigger a
-bounded join of non-daemon workers.
+Both processes expose immutable structured snapshots. `--stats-json` emits those
+counters, state, and monotonic windows as machine-readable process output.
+Human-readable logs derive instantaneous rates from consecutive snapshots rather
+than cumulative averages. Their sockets and session counters are synchronized,
+and SIGINT/SIGTERM trigger a bounded join of non-daemon workers.
 
 ## Security Boundary
 

@@ -7,6 +7,7 @@
 """Authenticated UDP cover-traffic client with optional uplink responses."""
 
 import argparse
+import json
 import math
 import os
 import random
@@ -75,6 +76,7 @@ class AdaptiveTrafficClient:
         padding="none",
         mtu=1200,
         stats_interval=5.0,
+        stats_json=False,
         rng=None,
         byte_source=None,
         psk=None,
@@ -210,6 +212,7 @@ class AdaptiveTrafficClient:
         self.control_receive_sequence = -1
         self.handshake_accepted = False
         self.stats_interval = stats_interval
+        self.stats_json = bool(stats_json)
         self.uplink_budget = RatioBudget(response_ratio)
         self.padder = PayloadPadder(
             strategy=padding,
@@ -726,14 +729,47 @@ class AdaptiveTrafficClient:
             ) / elapsed
             send_pps = (current.packets_sent - previous.packets_sent) / elapsed
             conn_status = "connected" if current.connected else "disconnected"
-            print(
-                f"[STATS client window] Rx: {recv_mbps:.2f} Mbps "
-                f"({recv_pps:.0f} pps) | "
-                f"Tx: {send_mbps:.2f} Mbps ({send_pps:.0f} pps) | "
-                f"Uplink ratio: {current.uplink_ratio:.3f} | "
-                f"Status: {conn_status}",
-                flush=True,
-            )
+            if self.stats_json:
+                payload = {
+                    "kind": "client",
+                    "timestamp": current.timestamp,
+                    "connected": current.connected,
+                    "handshake_accepted": current.handshake_accepted,
+                    "server_address": (
+                        list(current.server_address)
+                        if current.server_address is not None
+                        else None
+                    ),
+                    "totals": {
+                        "bytes_received": current.bytes_received,
+                        "bytes_sent": current.bytes_sent,
+                        "packets_received": current.packets_received,
+                        "packets_sent": current.packets_sent,
+                    },
+                    "window": {
+                        "duration_seconds": elapsed,
+                        "rx_mbps": recv_mbps,
+                        "tx_mbps": send_mbps,
+                        "rx_pps": recv_pps,
+                        "tx_pps": send_pps,
+                    },
+                    "received_rate_mbps": current.received_rate_mbps,
+                    "uplink_ratio": current.uplink_ratio,
+                }
+                print(
+                    "[SNAPSHOT] "
+                    + json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[STATS client window] Rx: {recv_mbps:.2f} Mbps "
+                    f"({recv_pps:.0f} pps) | "
+                    f"Tx: {send_mbps:.2f} Mbps ({send_pps:.0f} pps) | "
+                    f"Uplink ratio: {current.uplink_ratio:.3f} | "
+                    f"Status: {conn_status}",
+                    flush=True,
+                )
             previous = current
 
     def stop(self, join_timeout=2.0):
@@ -776,6 +812,11 @@ def main():
         type=float,
         default=_env_default("TRAFFIC_MASKING_STATS_INTERVAL", 5.0),
         help="Stats print interval in seconds",
+    )
+    parser.add_argument(
+        "--stats-json",
+        action="store_true",
+        help="Emit machine-readable runtime snapshots",
     )
     parser.add_argument(
         "--keepalive-interval",
@@ -829,6 +870,7 @@ def main():
             padding=args.padding,
             mtu=args.mtu,
             stats_interval=args.stats_interval,
+            stats_json=args.stats_json,
             psk=psk,
             insecure_diagnostic=args.insecure_diagnostic,
             keepalive_jitter=args.keepalive_jitter,

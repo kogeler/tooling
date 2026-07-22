@@ -8,6 +8,7 @@ the runtime modules directly. The `live` marker is registered here instead of in
 separate pytest.ini.
 """
 
+import json
 import os
 import signal
 import socket
@@ -23,6 +24,7 @@ BASE_DIR = Path(__file__).resolve().parent
 SERVER = str(BASE_DIR / "traffic_masking_server.py")
 CLIENT = str(BASE_DIR / "traffic_masking_client.py")
 TEST_PSK = b"traffic-masking-test-key-material-32"
+SNAPSHOT_PREFIX = "[SNAPSHOT] "
 
 
 @dataclass
@@ -80,6 +82,22 @@ def read_log(log, offset=0):
         return ""
 
 
+def read_snapshots(log, offset=0):
+    """Parse complete machine-readable snapshots from a process log."""
+    snapshots = []
+    for line in read_log(log, offset=offset).splitlines():
+        marker = line.find(SNAPSHOT_PREFIX)
+        if marker < 0:
+            continue
+        try:
+            snapshot = json.loads(line[marker + len(SNAPSHOT_PREFIX) :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(snapshot, dict):
+            snapshots.append(snapshot)
+    return snapshots
+
+
 def _log_tail(log, offset=0, limit=4000):
     contents = read_log(log, offset=offset)
     return contents[-limit:] if contents else "<empty log>"
@@ -93,7 +111,7 @@ def wait_for(log, needle, timeout, offset=0, report_failure=True):
             return True
         if isinstance(log, SpawnedProcess) and log.process.poll() is not None:
             break
-        time.sleep(0.1)
+        time.sleep(0.05)
     if report_failure:
         print(
             f"Timed out waiting for {needle!r} in {_path_from_log(log)}:\n"
@@ -103,33 +121,62 @@ def wait_for(log, needle, timeout, offset=0, report_failure=True):
     return False
 
 
-def last_match(log, pattern, offset=0):
-    """Return the last regex group-1 match in a log as float, or None."""
-    import re
+def wait_for_snapshot(log, predicate, timeout, offset=0, description="snapshot"):
+    """Return the first structured snapshot satisfying ``predicate``."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for snapshot in read_snapshots(log, offset=offset):
+            if predicate(snapshot):
+                return snapshot
+        if isinstance(log, SpawnedProcess) and log.process.poll() is not None:
+            break
+        time.sleep(0.05)
+    print(
+        f"Timed out waiting for {description} in {_path_from_log(log)}:\n"
+        f"{_log_tail(log, offset=offset)}",
+        file=sys.stderr,
+    )
+    return None
 
-    values = re.findall(pattern, read_log(log, offset=offset))
-    return float(values[-1]) if values else None
+
+def process_group_exists(process_group_id):
+    """Return whether a child process group still has any members."""
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def stop_process(spawned, timeout=3):
     """Terminate a spawned process group, escalating to SIGKILL after timeout."""
     process = spawned.process if isinstance(spawned, SpawnedProcess) else spawned
-    if process.poll() is not None:
-        return
-
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-
-    try:
-        process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    if process.poll() is None:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-        process.wait(timeout=timeout)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=timeout)
+
+    if not process_group_exists(process.pid):
+        return process.returncode
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return process.returncode
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not process_group_exists(process.pid):
+            return process.returncode
+        time.sleep(0.05)
+    raise RuntimeError(f"process group {process.pid} survived process teardown")
 
 
 @pytest.fixture

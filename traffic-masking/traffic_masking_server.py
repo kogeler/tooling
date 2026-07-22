@@ -8,6 +8,7 @@
 
 import argparse
 import hashlib
+import json
 import math
 import os
 import random
@@ -165,6 +166,7 @@ class MaskingTrafficServer:
         padding="none",
         mtu=1200,
         stats_interval=5.0,
+        stats_json=False,
         psk=None,
         insecure_diagnostic=False,
         max_clients=16,
@@ -305,6 +307,7 @@ class MaskingTrafficServer:
             "packets_sent": 0,
         }
         self.stats_interval = stats_interval
+        self.stats_json = bool(stats_json)
         if shape_mode == "profile":
             try:
                 self.profile = (
@@ -956,6 +959,7 @@ class MaskingTrafficServer:
             )
             previous_clients = {item.address: item for item in previous.clients}
             client_rates = []
+            client_rates_structured = []
             for client in current.clients:
                 prior = previous_clients.get(client.address)
                 prior_bytes = prior.bytes_sent if prior is not None else 0
@@ -972,14 +976,49 @@ class MaskingTrafficServer:
                     f"{client.address[0]}:{client.address[1]}="
                     f"{client_mbps:.2f}Mbps{target_text}"
                 )
+                client_rates_structured.append((client, client_mbps))
             per_client = ";".join(client_rates) or "none"
-            print(
-                f"[STATS] Clients: {current.client_count} | "
-                f"Total Rate: {mbps:.2f} Mbps | "
-                f"Total PPS: {pps:.0f} | "
-                f"Per-client: {per_client} | Pattern: {pattern_desc}",
-                flush=True,
-            )
+            if self.stats_json:
+                payload = {
+                    "kind": "server",
+                    "timestamp": current.timestamp,
+                    "totals": {
+                        "bytes_sent": current.bytes_sent,
+                        "packets_sent": current.packets_sent,
+                    },
+                    "window": {
+                        "duration_seconds": time_delta,
+                        "mbps": mbps,
+                        "pps": pps,
+                    },
+                    "clients": [
+                        {
+                            "address": list(client.address),
+                            "last_seen": client.last_seen,
+                            "bytes_received": client.bytes_received,
+                            "packets_received": client.packets_received,
+                            "bytes_sent": client.bytes_sent,
+                            "packets_sent": client.packets_sent,
+                            "current_rate_mbps": client.current_rate_mbps,
+                            "window_mbps": client_mbps,
+                        }
+                        for client, client_mbps in client_rates_structured
+                    ],
+                    "pattern": pattern_desc,
+                }
+                print(
+                    "[SNAPSHOT] "
+                    + json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[STATS] Clients: {current.client_count} | "
+                    f"Total Rate: {mbps:.2f} Mbps | "
+                    f"Total PPS: {pps:.0f} | "
+                    f"Per-client: {per_client} | Pattern: {pattern_desc}",
+                    flush=True,
+                )
             previous = current
 
     def stop(self, join_timeout=2.0):
@@ -1046,6 +1085,11 @@ def main():
         default=_env_default("TRAFFIC_MASKING_STATS_INTERVAL", 5.0),
         help="Stats print interval in seconds",
     )
+    parser.add_argument(
+        "--stats-json",
+        action="store_true",
+        help="Emit machine-readable runtime snapshots",
+    )
     auth_group = parser.add_mutually_exclusive_group()
     auth_group.add_argument(
         "--psk-file",
@@ -1090,6 +1134,7 @@ def main():
             padding=args.padding,
             mtu=args.mtu,
             stats_interval=args.stats_interval,
+            stats_json=args.stats_json,
             psk=psk,
             insecure_diagnostic=args.insecure_diagnostic,
             max_clients=args.max_clients,
