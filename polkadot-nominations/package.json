@@ -2,10 +2,13 @@
   "name": "polkadot-nominations",
   "version": "1.0.0",
   "type": "module",
-  "main": "index.js",
+  "main": "dist/index.js",
   "scripts": {
-    "start": "node index.js",
-    "postinstall": "npx papi"
+    "build": "tsc --project tsconfig.json",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "start": "node dist/index.js",
+    "test": "node --test --test-concurrency=1 dist/test/*.test.js dist/test/integration/*.test.js",
+    "test:live": "node --test --test-concurrency=1 dist/test/live/*.test.js"
   },
   "keywords": [],
   "author": "",
@@ -13,7 +16,12 @@
   "description": "Fetch all nominations from Polkadot Asset Hub",
   "dependencies": {
     "@polkadot-api/descriptors": "file:.papi/descriptors",
-    "polkadot-api": "^2.1.7",
+    "polkadot-api": "^2.2.2",
     "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "@types/ws": "^8.18.1",
+    "typescript": "^7.0.2"
   }
 }

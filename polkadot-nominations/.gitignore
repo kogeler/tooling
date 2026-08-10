@@ -1,5 +1,6 @@
 node_modules/
-.papi/descriptors/
-.papi/metadata/
+dist/
+.papi/
 config.json
 nominations.json
+package-lock.json.next
