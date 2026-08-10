@@ -12,3 +12,4 @@ node_modules
 sms-to-telegram/sms-to-telegram
 
 plans
+tmp/

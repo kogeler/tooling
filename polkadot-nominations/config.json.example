@@ -1,6 +1,9 @@
 {
-  "validator": "",
+  "validators": [
+    "1YourValidatorAddressHere________________________"
+  ],
   "percentiles": [0.25, 0.5, 0.75, 0.9],
   "minStakeDot": 1000,
-  "rewardEras": 20
+  "rewardEras": 20,
+  "rpcUrl": "wss://rpc-assethub.novasama-tech.org"
 }

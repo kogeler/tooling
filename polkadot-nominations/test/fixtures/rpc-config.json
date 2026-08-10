@@ -1,0 +1,7 @@
+{
+  "validators": ["selected-dynamically-by-rpc-tests"],
+  "percentiles": [0.25, 0.5, 0.75, 0.9],
+  "minStakeDot": 0,
+  "rewardEras": 3,
+  "rpcUrl": "wss://rpc-assethub.novasama-tech.org"
+}
