@@ -1,5 +1,7 @@
 import type { ChainApi } from "./chain.js";
 import { DOT_PLANCK, planckToDot } from "./constants.js";
+import { directRunner } from "./rpc.js";
+import type { RpcRunner } from "./rpc.js";
 
 const PERBILL = 1_000_000_000n;
 const BELOW_OPTIMUM_STEP = 2_500n * DOT_PLANCK;
@@ -230,6 +232,7 @@ async function fetchEraRewardComputation(
   api: ChainApi,
   validator: string,
   era: number,
+  runner: RpcRunner = directRunner,
 ): Promise<EraRewardComputation> {
   const [
     overview,
@@ -241,14 +244,30 @@ async function fetchEraRewardComputation(
     incentiveWeight,
     totalIncentiveWeight,
   ] = await Promise.all([
-    api.query.Staking.ErasStakersOverview.getValue(era, validator),
-    api.query.Staking.ErasValidatorReward.getValue(era),
-    api.query.Staking.ErasRewardPoints.getValue(era),
-    api.query.Staking.ErasValidatorPrefs.getValue(era, validator),
-    api.query.Staking.ClaimedRewards.getValue(era, validator),
-    api.query.Staking.ErasValidatorIncentiveBudget.getValue(era),
-    api.query.Staking.ErasValidatorIncentiveWeight.getValue(era, validator),
-    api.query.Staking.ErasSumValidatorIncentiveWeight.getValue(era),
+    runner.run(`Staking.ErasStakersOverview.getValue(${era})`, () =>
+      api.query.Staking.ErasStakersOverview.getValue(era, validator),
+    ),
+    runner.run(`Staking.ErasValidatorReward.getValue(${era})`, () =>
+      api.query.Staking.ErasValidatorReward.getValue(era),
+    ),
+    runner.run(`Staking.ErasRewardPoints.getValue(${era})`, () =>
+      api.query.Staking.ErasRewardPoints.getValue(era),
+    ),
+    runner.run(`Staking.ErasValidatorPrefs.getValue(${era})`, () =>
+      api.query.Staking.ErasValidatorPrefs.getValue(era, validator),
+    ),
+    runner.run(`Staking.ClaimedRewards.getValue(${era})`, () =>
+      api.query.Staking.ClaimedRewards.getValue(era, validator),
+    ),
+    runner.run(`Staking.ErasValidatorIncentiveBudget.getValue(${era})`, () =>
+      api.query.Staking.ErasValidatorIncentiveBudget.getValue(era),
+    ),
+    runner.run(`Staking.ErasValidatorIncentiveWeight.getValue(${era})`, () =>
+      api.query.Staking.ErasValidatorIncentiveWeight.getValue(era, validator),
+    ),
+    runner.run(`Staking.ErasSumValidatorIncentiveWeight.getValue(${era})`, () =>
+      api.query.Staking.ErasSumValidatorIncentiveWeight.getValue(era),
+    ),
   ]);
 
   const totalPoints = BigInt(points?.total ?? 0);
@@ -348,8 +367,9 @@ export async function computeEraReward(
   api: ChainApi,
   validator: string,
   era: number,
+  runner: RpcRunner = directRunner,
 ): Promise<EraReward> {
-  return (await fetchEraRewardComputation(api, validator, era)).output;
+  return (await fetchEraRewardComputation(api, validator, era, runner)).output;
 }
 
 function buildValidatorRewards(
@@ -396,10 +416,15 @@ export async function fetchValidatorRewardHistory(
   api: ChainApi,
   validator: string,
   rewardEras: number,
+  runner: RpcRunner = directRunner,
 ): Promise<ValidatorRewardHistory> {
   const [activeEra, currentPreferences] = await Promise.all([
-    api.query.Staking.ActiveEra.getValue(),
-    api.query.Staking.Validators.getValue(validator),
+    runner.run("Staking.ActiveEra.getValue", () =>
+      api.query.Staking.ActiveEra.getValue(),
+    ),
+    runner.run(`Staking.Validators.getValue(${validator})`, () =>
+      api.query.Staking.Validators.getValue(validator),
+    ),
   ]);
   const currentCommissionPct =
     currentPreferences === undefined
@@ -428,7 +453,9 @@ export async function fetchValidatorRewardHistory(
     eraIndices.push(era);
   }
   const computations = await Promise.all(
-    eraIndices.map((era) => fetchEraRewardComputation(api, validator, era)),
+    eraIndices.map((era) =>
+      fetchEraRewardComputation(api, validator, era, runner),
+    ),
   );
 
   return {
@@ -447,19 +474,31 @@ export async function fetchValidatorRewards(
   api: ChainApi,
   validator: string,
   rewardEras: number,
+  runner: RpcRunner = directRunner,
 ): Promise<ValidatorRewards> {
-  return (await fetchValidatorRewardHistory(api, validator, rewardEras)).rewards;
+  return (
+    await fetchValidatorRewardHistory(api, validator, rewardEras, runner)
+  ).rewards;
 }
 
 export async function fetchRewardCurveParameters(
   api: ChainApi,
+  runner: RpcRunner = directRunner,
 ): Promise<RewardCurveParameters> {
   const [minimumSelfStake, optimumSelfStake, hardCapSelfStake, slopeFactor] =
     await Promise.all([
-      api.query.Staking.MinValidatorBond.getValue(),
-      api.query.Staking.OptimumSelfStake.getValue(),
-      api.query.Staking.HardCapSelfStake.getValue(),
-      api.query.Staking.SelfStakeSlopeFactor.getValue(),
+      runner.run("Staking.MinValidatorBond.getValue", () =>
+        api.query.Staking.MinValidatorBond.getValue(),
+      ),
+      runner.run("Staking.OptimumSelfStake.getValue", () =>
+        api.query.Staking.OptimumSelfStake.getValue(),
+      ),
+      runner.run("Staking.HardCapSelfStake.getValue", () =>
+        api.query.Staking.HardCapSelfStake.getValue(),
+      ),
+      runner.run("Staking.SelfStakeSlopeFactor.getValue", () =>
+        api.query.Staking.SelfStakeSlopeFactor.getValue(),
+      ),
     ]);
 
   return {

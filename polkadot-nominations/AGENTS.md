@@ -58,7 +58,9 @@ polkadot-nominations/
     config-schema.ts    Pure unknown-to-Config validation and defaults
     config.ts           Runtime config.json loader
     constants.ts        DOT units and default Asset Hub RPC URL
+    log.ts              Timestamped stderr logging, phase timing, exit reporting
     rewards.ts          Actual personal payouts and self-stake reward projections
+    rpc.ts              Call deadlines, retries, concurrency limit, progress reporting
     stats.ts            Percentile calculation with configurable direction and prefix
   test/
     *.test.ts           Deterministic unit tests with no live chain dependency
@@ -83,7 +85,9 @@ The CLI requires exactly one mode:
    capped to 30,000 rather than excluded.
 3. `--validator-info` emits a validator-address-keyed map with current self-stake,
    historical personal rewards including the validator incentive, and independent
-   higher-self-stake reward scenarios through the live runtime hard cap.
+   higher-self-stake reward scenarios through the live runtime hard cap. Unlike
+   the other two modes it performs no full storage scan: self-stake comes from
+   `Staking.Bonded` plus a direct `Staking.Ledger` lookup per configured stash.
 
 All modes emit JSON to stdout and operational logs to stderr. They fetch only
 the chain datasets needed by the selected mode, with independent queries run in
@@ -117,11 +121,37 @@ parallel via `Promise.all`.
   and `verbatimModuleSyntax` are enabled. Source imports use `.js` extensions as
   required by NodeNext ESM and compile into container-only `dist/`.
 - **Chain**: Polkadot Asset Hub (staking migrated from relay chain as of runtime v2.0.0)
-- **RPC library**: `polkadot-api` (PAPI) `^2.2.2` with generated type descriptors. The ws provider is imported from `polkadot-api/ws`
+- **RPC library**: `polkadot-api` (PAPI) `^3.1.0` with generated type descriptors. The ws provider is imported from `polkadot-api/ws`. The 3.0 breaking changes only affect transaction submission (`sign*` replaced by `create*`, `polkadot-api/signer` renamed to `polkadot-api/tx-creator`), which this read-only tool does not use
 - **WebSocket**: Uses `ws` npm package passed as `websocketClass` to `getWsProvider` (Node 22 has native WebSocket but PAPI needs the class passed explicitly)
 - **Commission format**: Stored on-chain as Perbill (0..1,000,000,000), converted to % with 4 decimal precision
 - **Stake format**: Stored as Planck (`bigint`), converted to DOT with four decimal places without truncating the fractional part
-- **RPC URL**: Read from `config.json.rpcUrl`, defaulting to `wss://rpc-assethub.novasama-tech.org`; `RPC_URL` overrides it
+- **RPC URL**: Read from `config.json.rpcUrl`, defaulting to `wss://asset-hub-polkadot-rpc.n.dwellir.com`; `RPC_URL` overrides it
+- **RPC resilience** (`src/rpc.ts`): every chain call goes through a runner that
+  applies a deadline, a retry budget and a global concurrency semaphore, and
+  keeps counters that `startProgress` prints to stderr on an interval. A tick
+  reporting `(+0)` with calls still in flight marks a stalled endpoint, which is
+  otherwise indistinguishable from slow progress. `connect()` logs socket
+  transitions through `onStatusChanged` and `logger`, and `probeConnection()`
+  fails fast on an endpoint that accepts the socket but never answers. Fetchers
+  take the runner as an optional trailing argument defaulting to `directRunner`,
+  so unit tests keep calling them with a stub api and no runner.
+- **Logging** (`src/log.ts`): every stderr line carries an ISO timestamp and the
+  elapsed time since process start, `phase()` brackets each scan with
+  `START`/`DONE`/`FAIL` and a duration, and `redactUrl()` keeps endpoint
+  credentials out of the log. Anything that explains why the process is ending
+  must use `logSync()`, which writes with `fs.writeSync(2, ...)`: `console.error`
+  is asynchronous on a pipe, so reporting a failure and calling `process.exit`
+  in the same tick discards the message and leaves a bare exit code behind —
+  this already cost one debugging session. `installExitLogging()` always prints
+  an `EXIT code N after <duration>` line and explicitly labels a non-zero exit
+  with no reported error as an exit-path defect. `uncaughtException` is fatal;
+  `unhandledRejection` is only a warning, because a call abandoned by its
+  deadline may still reject afterwards.
+- **Generic RPC wrapper typing**: `RpcRunner.run` is generic over the callback's
+  own return type (`<P>(operation: string, call: () => P) => Promise<Awaited<P>>`).
+  A `call: () => Promise<T>` signature makes TypeScript collapse PAPI storage
+  payloads to `{}` when several wrapped calls share one `Promise.all` array
+  literal, as in `fetchEraRewardComputation`. Do not "simplify" it back.
 - **PAPI codegen**: each Make run executes `npm ci --ignore-scripts`, then the lock-resolved `./node_modules/.bin/papi add ah -w <rpcUrl>` inside container tmpfs. `npm_config_ignore_scripts=true` also applies to npm started internally by PAPI. No `.papi` file is sourced from or written to the host. PAPI's `tsc-prog@2.3.0` is moved under `@polkadot-api/cli/node_modules` before codegen so it resolves the CLI's TypeScript 6 dependency; project builds still use root TypeScript 7.
 - **Host isolation**: project files are copied through a filtered stdin tar stream,
   never through a bind mount. The container is rootless/non-root, has zero Linux
@@ -138,7 +168,12 @@ parallel via `Promise.all`.
   "percentiles": [0.25, 0.5, 0.75, 0.9],
   "minStakeDot": 0,
   "rewardEras": 20,
-  "rpcUrl": "wss://rpc-assethub.novasama-tech.org"
+  "rpcUrl": "wss://asset-hub-polkadot-rpc.n.dwellir.com",
+  "connectTimeoutMs": 20000,
+  "requestTimeoutMs": 120000,
+  "requestRetries": 2,
+  "maxConcurrency": 16,
+  "progressIntervalMs": 10000
 }
 ```
 
@@ -147,6 +182,17 @@ parallel via `Promise.all`.
 - `minStakeDot` — optional, minimum active stake in whole DOT, default `0` (disabled)
 - `rewardEras` — optional, number of most recent completed eras to report validator rewards for, default `20`
 - `rpcUrl` — optional non-empty WebSocket URL; defaults to the current Asset Hub RPC above
+- `connectTimeoutMs` — optional integer >= 1000, default `20000`; WebSocket
+  handshake timeout and the deadline for the startup `Staking.ActiveEra` probe
+- `requestTimeoutMs` — optional integer >= 1000, default `120000`; deadline for a
+  single RPC call. The underlying request cannot be cancelled, only abandoned
+- `requestRetries` — optional integer >= 0, default `2`; retries per call with
+  exponential backoff starting at 500 ms
+- `maxConcurrency` — optional integer >= 1, default `16`; simultaneous in-flight
+  RPC calls. `--validator-info` issues `validators x rewardEras x 8` calls, so an
+  unbounded fan-out silently stalls most public endpoints
+- `progressIntervalMs` — optional integer >= 0, default `10000`; progress line
+  interval on stderr, `0` disables reporting
 
 ### Output Structure
 
@@ -491,7 +537,7 @@ Key distinction per nominator:
 The `predict` command supports **custom overrides** to simulate scenarios. It fetches live chain data first, then applies modifications:
 
 ```bash
-staking-miner --uri wss://rpc-assethub.novasama-tech.org predict \
+staking-miner --uri wss://asset-hub-polkadot-rpc.n.dwellir.com predict \
   --overrides scenario.json \
   --output-dir ./results/scenario1
 ```

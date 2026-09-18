@@ -4,6 +4,7 @@ import {
   fetchActiveValidators,
   fetchCommissions,
   fetchNominators,
+  fetchSelfStakes,
   fetchStakeBalances,
   fetchStakes,
 } from "../src/chain.js";
@@ -61,4 +62,58 @@ test("chain fetchers convert typed storage results", async () => {
     ]),
   });
   assert.deepEqual(await fetchStakes(api), new Map([["validator-a", 12.5]]));
+});
+
+test("fetchSelfStakes resolves stashes through Bonded without a full scan", async () => {
+  const ledgers = new Map<string, bigint>([
+    ["controller-a", 5n * DOT_PLANCK],
+    ["stash-b", 7n * DOT_PLANCK],
+  ]);
+  const scanned: string[] = [];
+  const api = {
+    query: {
+      Staking: {
+        Bonded: {
+          getValue: async (stash: string) =>
+            stash === "stash-a" ? "controller-a" : undefined,
+        },
+        Ledger: {
+          getValue: async (key: string) => {
+            scanned.push(key);
+            const active = ledgers.get(key);
+            return active === undefined ? undefined : { stash: key, active };
+          },
+          getEntries: async () => {
+            throw new Error("fetchSelfStakes must not scan the whole map");
+          },
+        },
+      },
+    },
+  } as unknown as ChainApi;
+
+  const balances = await fetchSelfStakes(api, [
+    "stash-a",
+    "stash-b",
+    "stash-missing",
+  ]);
+
+  assert.deepEqual([...scanned].sort(), [
+    "controller-a",
+    "stash-b",
+    "stash-missing",
+  ]);
+  assert.deepEqual(
+    balances.dots,
+    new Map([
+      ["stash-a", 5],
+      ["stash-b", 7],
+    ]),
+  );
+  assert.deepEqual(
+    balances.planck,
+    new Map([
+      ["stash-a", 5n * DOT_PLANCK],
+      ["stash-b", 7n * DOT_PLANCK],
+    ]),
+  );
 });
