@@ -2,12 +2,23 @@ import { DEFAULT_RPC_URL } from "./constants.js";
 
 const DEFAULT_PERCENTILES = [0.5, 0.75, 0.9] as const;
 
+const DEFAULT_CONNECT_TIMEOUT_MS = 20_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+const DEFAULT_REQUEST_RETRIES = 2;
+const DEFAULT_MAX_CONCURRENCY = 16;
+const DEFAULT_PROGRESS_INTERVAL_MS = 10_000;
+
 export interface Config {
   readonly validators: readonly string[];
   readonly percentiles: readonly number[];
   readonly minStakeDot: number;
   readonly rewardEras: number;
   readonly rpcUrl: string;
+  readonly connectTimeoutMs: number;
+  readonly requestTimeoutMs: number;
+  readonly requestRetries: number;
+  readonly maxConcurrency: number;
+  readonly progressIntervalMs: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -31,6 +42,23 @@ function isPercentileArray(value: unknown): value is number[] {
         typeof item === "number" && Number.isFinite(item) && item >= 0 && item <= 1,
     )
   );
+}
+
+function parseCount(
+  value: unknown,
+  fallback: number,
+  name: string,
+  minimum: number,
+): number {
+  const candidate = value ?? fallback;
+  if (
+    typeof candidate !== "number" ||
+    !Number.isInteger(candidate) ||
+    candidate < minimum
+  ) {
+    throw new Error(`${name} must be an integer of at least ${minimum}`);
+  }
+  return candidate;
 }
 
 export function parseConfig(value: unknown): Config {
@@ -81,5 +109,35 @@ export function parseConfig(value: unknown): Config {
     minStakeDot,
     rewardEras,
     rpcUrl,
+    connectTimeoutMs: parseCount(
+      value.connectTimeoutMs,
+      DEFAULT_CONNECT_TIMEOUT_MS,
+      "connectTimeoutMs",
+      1_000,
+    ),
+    requestTimeoutMs: parseCount(
+      value.requestTimeoutMs,
+      DEFAULT_REQUEST_TIMEOUT_MS,
+      "requestTimeoutMs",
+      1_000,
+    ),
+    requestRetries: parseCount(
+      value.requestRetries,
+      DEFAULT_REQUEST_RETRIES,
+      "requestRetries",
+      0,
+    ),
+    maxConcurrency: parseCount(
+      value.maxConcurrency,
+      DEFAULT_MAX_CONCURRENCY,
+      "maxConcurrency",
+      1,
+    ),
+    progressIntervalMs: parseCount(
+      value.progressIntervalMs,
+      DEFAULT_PROGRESS_INTERVAL_MS,
+      "progressIntervalMs",
+      0,
+    ),
   };
 }

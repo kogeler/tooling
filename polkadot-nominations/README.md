@@ -65,7 +65,7 @@ cp config.json.example config.json
   "percentiles": [0.25, 0.5, 0.75, 0.9],
   "minStakeDot": 1000,
   "rewardEras": 20,
-  "rpcUrl": "wss://rpc-assethub.novasama-tech.org"
+  "rpcUrl": "wss://asset-hub-polkadot-rpc.n.dwellir.com"
 }
 ```
 
@@ -76,6 +76,11 @@ cp config.json.example config.json
 | `minStakeDot` | Minimum nominator stake included by `--nominations` |
 | `rewardEras` | Completed eras included by `--validator-info` |
 | `rpcUrl` | Asset Hub WebSocket RPC; defaults to the URL shown above |
+| `connectTimeoutMs` | WebSocket handshake and startup-probe deadline, default `20000` |
+| `requestTimeoutMs` | Per-RPC-call deadline, default `120000` |
+| `requestRetries` | Retries per failed or timed-out call, default `2` |
+| `maxConcurrency` | Maximum simultaneous RPC calls, default `16` |
+| `progressIntervalMs` | Progress line interval, default `10000`; `0` disables it |
 
 The `RPC_URL` environment variable overrides `rpcUrl` for a single command:
 
@@ -90,6 +95,43 @@ make nominations
 make self-stake-stats
 make validator-info
 ```
+
+### Diagnosing a slow or dead endpoint
+
+Every stderr line carries an ISO timestamp and the elapsed time since start, and
+each scan is bracketed by `START` / `DONE` / `FAIL` with its duration:
+
+```
+2026-09-18T12:31:04.118Z [+41.7s] START scan Staking.Ledger
+2026-09-18T12:33:52.901Z [+3m30s] DONE  scan Staking.Ledger in 2m49s
+```
+
+Endpoint credentials are redacted, so a saved log never leaks the API key in
+`rpcUrl`. The run always ends with an explicit line, including on failure:
+
+```
+2026-09-18T12:34:01.554Z [+3m38s] EXIT code 0 after 3m38s
+```
+
+Every RPC call runs behind a deadline, a retry budget and a concurrency limit,
+and a progress line is printed while work is in flight:
+
+```
+[validator-info] 30s | rpc done 96/1120 (+0) | in flight 16 | queued 1008 | retries 2 | failed 0 (no response since last tick)
+```
+
+`(+N)` is the number of calls answered since the previous line, so `(+0)` plus
+`no response since last tick` means the endpoint stopped responding rather than
+the report being slow. Socket transitions (`CONNECTING`, `CONNECTED`, `CLOSE`,
+`STALE`, `TIMEOUT`) are logged as they happen, a startup probe fails fast on an
+endpoint that accepts the socket but never answers, and a call that exhausts its
+retries aborts the run with the full cause chain instead of hanging.
+
+`--nominations` and `--self-stake-stats` need network-wide data and scan
+`Staking.Validators`, `Staking.Nominators` and `Staking.Ledger` in full; these
+scans are the usual reason a public endpoint stalls. `--validator-info` only
+reads the configured stashes through `Staking.Bonded` and `Staking.Ledger`, so
+it does not scan those maps.
 
 The script writes JSON to stdout and operational logs to stderr. Redirecting a
 report therefore produces a clean JSON file:

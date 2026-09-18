@@ -1,6 +1,16 @@
 import { existsSync } from "node:fs";
 import { parseCliArgs, USAGE } from "./src/cli.js";
 import type { RunnableCommand } from "./src/cli.js";
+import {
+  describeError,
+  installExitLogging,
+  log,
+  phase,
+  redactUrl,
+  reportFatal,
+} from "./src/log.js";
+import { createRpcRunner, startProgress } from "./src/rpc.js";
+import type { RpcRunner } from "./src/rpc.js";
 
 function assertContainerRuntime(): void {
   if (!existsSync("/run/.containerenv") && !existsSync("/.dockerenv")) {
@@ -18,24 +28,58 @@ async function runCommand(command: RunnableCommand): Promise<unknown> {
     import("./src/rewards.js"),
   ]);
 
-  console.error(`Connecting to ${config.rpcUrl}...`);
-  const { client, api } = chain.connect();
+  const runner: RpcRunner = createRpcRunner(
+    {
+      requestTimeoutMs: config.requestTimeoutMs,
+      requestRetries: config.requestRetries,
+      maxConcurrency: config.maxConcurrency,
+    },
+    {
+      onRetry: (operation, attempt, error) => {
+        log(`RETRY ${attempt} for ${operation}: ${describeError(error)}`);
+      },
+    },
+  );
+
+  log(`Mode: --${command} on ${process.version}`);
+  log(`RPC endpoint: ${redactUrl(config.rpcUrl)}`);
+  log(
+    `Limits: connect ${config.connectTimeoutMs} ms, request ${config.requestTimeoutMs} ms,` +
+      ` retries ${config.requestRetries}, max ${config.maxConcurrency} concurrent calls`,
+  );
+  const { client, api } = chain.connect({ log });
+
+  const stopProgress = startProgress({
+    label: command,
+    intervalMs: config.progressIntervalMs,
+    runner,
+    log,
+  });
 
   try {
+    const activeEra = await phase("connect", () =>
+      chain.probeConnection(api, config.connectTimeoutMs),
+    );
+    log(`Active era: ${activeEra ?? "unavailable"}`);
+
     if (command === "nominations") {
-      console.error(
-        `Fetching nominations for ${config.validators.length} configured validator(s)...`,
+      log(
+        `Fetching nominations for ${config.validators.length} configured validator(s)`,
       );
       if (config.minStakeDot > 0) {
-        console.error(`Min nominator stake filter: ${config.minStakeDot} DOT`);
+        log(`Min nominator stake filter: ${config.minStakeDot} DOT`);
       }
 
       const [commissions, nominatorEntries, stakes] = await Promise.all([
-        chain.fetchCommissions(api),
-        chain.fetchNominators(api),
-        chain.fetchStakes(api),
+        phase("scan Staking.Validators", () =>
+          chain.fetchCommissions(api, runner),
+        ),
+        phase("scan Staking.Nominators", () =>
+          chain.fetchNominators(api, runner),
+        ),
+        phase("scan Staking.Ledger", () => chain.fetchStakes(api, runner)),
       ]);
-      console.error(
+      log(
         `Loaded: ${commissions.size} validators, ${nominatorEntries.length} nominators, ${stakes.size} ledgers`,
       );
 
@@ -48,21 +92,23 @@ async function runCommand(command: RunnableCommand): Promise<unknown> {
         percentiles: config.percentiles,
       });
       for (const [validator, report] of Object.entries(output)) {
-        console.error(
-          `Found ${report.total_nominators} nominators for ${validator}`,
-        );
+        log(`Found ${report.total_nominators} nominators for ${validator}`);
       }
       return output;
     }
 
     if (command === "self-stake-stats") {
-      console.error("Fetching network-wide validator self-stake data...");
+      log("Fetching network-wide validator self-stake data");
       const [activeValidators, commissions, stakes] = await Promise.all([
-        chain.fetchActiveValidators(api),
-        chain.fetchCommissions(api),
-        chain.fetchStakes(api),
+        phase("read active set", () =>
+          chain.fetchActiveValidators(api, runner),
+        ),
+        phase("scan Staking.Validators", () =>
+          chain.fetchCommissions(api, runner),
+        ),
+        phase("scan Staking.Ledger", () => chain.fetchStakes(api, runner)),
       ]);
-      console.error(
+      log(
         `Loaded: ${commissions.size} validators (${activeValidators.length} active), ${stakes.size} ledgers`,
       );
 
@@ -74,26 +120,35 @@ async function runCommand(command: RunnableCommand): Promise<unknown> {
       });
     }
 
-    console.error(
-      `Fetching general information for ${config.validators.length} configured validator(s)...`,
+    log(
+      `Fetching general information for ${config.validators.length} configured validator(s)`,
     );
-    console.error(`Reward lookback: last ${config.rewardEras} eras`);
+    log(`Reward lookback: last ${config.rewardEras} eras`);
+
+    // Only the configured stashes are needed here, so this mode deliberately
+    // avoids the full Staking.Ledger scan that the network-wide modes require.
     const [stakeBalances, rewardHistories, rewardCurve] = await Promise.all([
-      chain.fetchStakeBalances(api),
+      phase("read self-stake", () =>
+        chain.fetchSelfStakes(api, config.validators, runner),
+      ),
       Promise.all(
-        config.validators.map(async (validator) =>
-          [
-            validator,
-            await rewards.fetchValidatorRewardHistory(
+        config.validators.map((validator) =>
+          phase(`rewards ${validator}`, async () => {
+            const history = await rewards.fetchValidatorRewardHistory(
               api,
               validator,
               config.rewardEras,
-            ),
-          ] as const,
+              runner,
+            );
+            return [validator, history] as const;
+          }),
         ),
       ),
-      rewards.fetchRewardCurveParameters(api),
+      phase("read reward curve", () =>
+        rewards.fetchRewardCurveParameters(api, runner),
+      ),
     ]);
+    log(`Self-stake resolved for ${stakeBalances.dots.size} stash(es)`);
 
     const detailsByValidator = new Map(
       rewardHistories.map(([validator, history]) => [
@@ -112,23 +167,48 @@ async function runCommand(command: RunnableCommand): Promise<unknown> {
       detailsByValidator,
     );
   } finally {
+    stopProgress();
+    const stats = runner.stats();
+    log(
+      `RPC summary: ${stats.completed} completed, ${stats.retried} retried,` +
+        ` ${stats.failed} failed, ${stats.inFlight} still in flight`,
+    );
     client.destroy();
   }
+}
+
+function writeStdout(text: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    process.stdout.write(text, (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
 }
 
 async function main(): Promise<void> {
   assertContainerRuntime();
   const command = parseCliArgs(process.argv.slice(2));
   if (command === "help") {
-    console.log(USAGE);
+    await writeStdout(`${USAGE}\n`);
     return;
   }
 
   const output = await runCommand(command);
-  console.log(JSON.stringify(output, null, 2));
+  await writeStdout(`${JSON.stringify(output, null, 2)}\n`);
+  log("Report written to stdout");
 }
 
-main().catch((error: unknown) => {
-  console.error("Error:", error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+installExitLogging();
+
+main().then(
+  () => {
+    // A half-open RPC socket can keep the event loop alive after the report is
+    // written, so exit explicitly once stdout has drained.
+    process.exit(0);
+  },
+  (error: unknown) => {
+    reportFatal(error);
+    process.exit(1);
+  },
+);
